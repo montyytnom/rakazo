@@ -28,11 +28,13 @@ NEW_HELPERS = [
     "packages/core/src/irreversible-effect.ts",
     "packages/core/src/secret-result-handle.ts",
     "packages/core/src/completion-artifact.ts",
+    "packages/core/src/runtime-eval-contract.ts",
     "packages/core/src/compaction-provenance.ts",
     "packages/core/src/handoff-delivery.ts",
     "packages/adapters/src/stale-element-recovery.ts",
     "packages/adapters/src/desktop-tool-contract.ts",
     "packages/adapters/src/protected-result.ts",
+    "packages/adapters/src/runtime-eval-backend.ts",
     "packages/adapters/src/model-stream-error.ts",
 ]
 
@@ -211,6 +213,7 @@ def patch_core_index(dest: Path) -> None:
         'export * from "./completion-artifact.js";\n',
         'export * from "./handoff-delivery.js";\n',
         'export * from "./irreversible-effect.js";\n',
+        'export * from "./runtime-eval-contract.js";\n',
         'export * from "./secret-result-handle.js";\n',
     ]
     for line in exports:
@@ -727,18 +730,70 @@ def patch_pi_usage(path: Path) -> None:
     )
 
 
+OLD_STRIP_WRAPPERS = """
+function stripSecretTranscript<T>(messages: T[]): T[] {
+  const secrets = harvestSecretsFromUnknown(messages);
+  if (secrets.length === 0) return messages;
+  return stripSecretsFromUnknown(messages, secrets) as T[];
+}
+
+function stripSecretContext(ctx: Context): Context {
+  const secrets = harvestSecretsFromUnknown(ctx);
+  if (secrets.length === 0) return ctx;
+  return stripSecretsFromUnknown(ctx, secrets) as Context;
+}
+"""
+
+NEW_STRIP_WRAPPERS = """
+function stripSecretTranscript<T>(messages: T[]): T[] {
+  return stripSecretTranscriptMessages(messages) as T[];
+}
+
+function stripSecretContext(ctx: Context): Context {
+  return stripSecretRequestContext(ctx) as Context;
+}
+"""
+
+OLD_STRIP_IMPORT = (
+    "import {\n"
+    "  abortableDelay,\n"
+    "  harvestSecretsFromUnknown,\n"
+    "  MISSING_TOOL_FINAL_RESPONSE_ERROR,\n"
+    "  stripSecretsFromUnknown,\n"
+    '} from "@rakazo/core";\n'
+)
+
+NEW_STRIP_IMPORT = (
+    "import {\n"
+    "  abortableDelay,\n"
+    "  MISSING_TOOL_FINAL_RESPONSE_ERROR,\n"
+    "  stripSecretRequestContext,\n"
+    "  stripSecretTranscriptMessages,\n"
+    '} from "@rakazo/core";\n'
+)
+
+
 def patch_pi_runtime(path: Path) -> None:
-    if "stripSecretTranscript" in path.read_text():
+    text = path.read_text()
+    if "return stripSecretTranscriptMessages(messages)" in text and "return stripSecretRequestContext(ctx)" in text:
         return
+    if OLD_STRIP_WRAPPERS in text:
+        text = text.replace(OLD_STRIP_WRAPPERS, NEW_STRIP_WRAPPERS, 1)
+        if OLD_STRIP_IMPORT in text:
+            text = text.replace(OLD_STRIP_IMPORT, NEW_STRIP_IMPORT, 1)
+        elif "stripSecretTranscriptMessages" not in text:
+            text = text.replace(
+                'import { abortableDelay, MISSING_TOOL_FINAL_RESPONSE_ERROR } from "@rakazo/core";\n',
+                NEW_STRIP_IMPORT,
+                1,
+            )
+        path.write_text(text)
+        return
+    path.write_text(text)
     replace_once(
         path,
         'import { abortableDelay, MISSING_TOOL_FINAL_RESPONSE_ERROR } from "@rakazo/core";\n',
-        "import {\n"
-        "  abortableDelay,\n"
-        "  harvestSecretsFromUnknown,\n"
-        "  MISSING_TOOL_FINAL_RESPONSE_ERROR,\n"
-        "  stripSecretsFromUnknown,\n"
-        '} from "@rakazo/core";\n',
+        NEW_STRIP_IMPORT,
         "pi-runtime secret strip import",
     )
     replace_once(
@@ -789,22 +844,7 @@ def patch_pi_runtime(path: Path) -> None:
         "        return stripSecretContext(prepared);\n",
         "assist shrink secret strip",
     )
-    path.write_text(
-        path.read_text()
-        + """
-function stripSecretTranscript<T>(messages: T[]): T[] {
-  const secrets = harvestSecretsFromUnknown(messages);
-  if (secrets.length === 0) return messages;
-  return stripSecretsFromUnknown(messages, secrets) as T[];
-}
-
-function stripSecretContext(ctx: Context): Context {
-  const secrets = harvestSecretsFromUnknown(ctx);
-  if (secrets.length === 0) return ctx;
-  return stripSecretsFromUnknown(ctx, secrets) as Context;
-}
-"""
-    )
+    path.write_text(path.read_text() + NEW_STRIP_WRAPPERS)
 
 
 def patch_thinkbudget_fetch(path: Path) -> None:

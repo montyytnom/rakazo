@@ -1,15 +1,19 @@
 import { describe, expect, it } from "vitest";
 import {
   extractGeneratedPassword,
+  harvestSecretsFromRequestContext,
   harvestSecretsFromText,
   harvestSecretsFromUnknown,
   issueProtectedResult,
+  looksLikeLabeledSecret,
   looksLikeSecretValue,
   protectedResultNote,
   redactProtectedTree,
   redactThrown,
   secretsFromPriorAssistantText,
   stripSecretEchoes,
+  stripSecretRequestContext,
+  stripSecretTranscriptMessages,
   stripSecretsFromUnknown,
 } from "./secret-result-handle.js";
 
@@ -51,9 +55,9 @@ describe("protected result handles", () => {
     expect(both).toEqual([FIXTURE_OLD, FIXTURE_NEW]);
   });
 
-  it("harvests labelled plaintext from simple, JSON, and markdown forms", () => {
+  it("harvests labelled plaintext from delimited, JSON, and markdown forms", () => {
     const simple = "hunter99";
-    expect(harvestSecretsFromText(`password ${simple}`)).toContain(simple);
+    expect(harvestSecretsFromText(`password ${simple}`)).toEqual([]);
     expect(harvestSecretsFromText(`password is ${simple}`)).toContain(simple);
     expect(harvestSecretsFromUnknown({ password: simple })).toContain(simple);
     expect(harvestSecretsFromText(`{"newPassword":"${FIXTURE_NEW}"}`)).toContain(FIXTURE_NEW);
@@ -87,6 +91,10 @@ describe("protected result handles", () => {
     expect(redactProtectedTree({ item: FIXTURE_NEW })).toEqual({ item: "[withheld]" });
     expect(redactProtectedTree({ password: "item-1" })).toEqual({ password: "[withheld]" });
     expect(harvestSecretsFromUnknown({ password: "item-1" })).toContain("item-1");
+    for (const sku of ["REF-A1b2", "SkuA12B"]) {
+      expect(looksLikeSecretValue(sku), sku).toBe(false);
+      expect(redactProtectedTree({ item: sku })).toEqual({ item: sku });
+    }
   });
 
   it("strips secrets from thrown errors so logs cannot echo plaintext", () => {
@@ -119,4 +127,114 @@ describe("protected result handles", () => {
     expect(stripped).not.toContain(FIXTURE_NEW);
     expect(stripped).toContain("[withheld]");
   });
+
+  it("does not harvest dictionary words after password/secret/pin/otp", () => {
+    expect(harvestSecretsFromText("save the password through the saved-login")).toEqual([]);
+    expect(harvestSecretsFromText("fields values and placeholders for secret values")).toEqual([]);
+    expect(harvestSecretsFromText("Last password change:")).toEqual([]);
+    expect(harvestSecretsFromText("password again?")).toEqual([]);
+    expect(harvestSecretsFromText("You never send secret values in the clear.")).toEqual([]);
+  });
+
+  it("does not reharvest withheld markers after trailing-bracket trim", () => {
+    expect(looksLikeLabeledSecret("[withheld]")).toBe(false);
+    expect(looksLikeLabeledSecret("[withheld")).toBe(false);
+    expect(looksLikeLabeledSecret("[redacted")).toBe(false);
+    expect(harvestSecretsFromText("password [withheld]")).toEqual([]);
+    expect(harvestSecretsFromText("secret [withheld]]")).toEqual([]);
+    const once = redactProtectedTree({ tree: `New password: ${FIXTURE_NEW}` });
+    const twice = redactProtectedTree(once);
+    expect(twice).toEqual(once);
+    expect(JSON.stringify(twice)).not.toMatch(/withheld\]\]/);
+  });
+
+  it("does not harvest system, tool definitions, or turn_context", () => {
+    const request = noSecretProductionShapedRequest();
+    expect(harvestSecretsFromRequestContext(request)).toEqual([]);
+    expect(harvestSecretsFromUnknown(request.systemPrompt)).toEqual([]);
+    expect(harvestSecretsFromUnknown(request.tools)).toEqual([]);
+    const labeledInDefs = {
+      systemPrompt: `password is ${FIXTURE_NEW}`,
+      tools: [{ name: "request_secret", description: `secret is ${FIXTURE_OLD}` }],
+      turn_context: `otp is ${FIXTURE_NEW}`,
+      messages: [{ role: "user", content: "hello" }],
+    };
+    expect(harvestSecretsFromRequestContext(labeledInDefs)).toEqual([]);
+    expect(stripSecretRequestContext(labeledInDefs)).toBe(labeledInDefs);
+  });
+
+  it("no-secret production-shaped request is byte-identical after strip (same reference)", () => {
+    const request = noSecretProductionShapedRequest();
+    const stripped = stripSecretRequestContext(request);
+    expect(stripped).toBe(request);
+    expect(JSON.stringify(stripped)).toBe(JSON.stringify(request));
+    const again = stripSecretRequestContext(stripped);
+    expect(again).toBe(request);
+    expect(JSON.stringify(again)).not.toMatch(/\[withheld/);
+  });
+
+  it("strips a structured secret from messages without rewriting system or tool defs", () => {
+    const request = noSecretProductionShapedRequest();
+    const withSecret = {
+      ...request,
+      messages: [
+        ...request.messages,
+        { role: "tool", content: `New password: ${FIXTURE_NEW}` },
+      ],
+    };
+    const stripped = stripSecretRequestContext(withSecret);
+    expect(JSON.stringify(stripped.systemPrompt)).not.toContain("[withheld]");
+    expect(JSON.stringify(stripped.tools)).toBe(JSON.stringify(request.tools));
+    expect(JSON.stringify(stripped.messages)).not.toContain(FIXTURE_NEW);
+    expect(JSON.stringify(stripped.messages)).toContain("[withheld]");
+    const twice = stripSecretRequestContext(stripped);
+    expect(JSON.stringify(twice)).toBe(JSON.stringify(stripped));
+    expect(JSON.stringify(twice)).not.toMatch(/withheld\]\]/);
+  });
+
+  it("transcript strip is identity when no secrets and skips system-role harvest", () => {
+    const messages = [
+      { role: "system", content: "Save the password through the saved-login." },
+      { role: "user", content: "Reset password successful." },
+    ];
+    expect(stripSecretTranscriptMessages(messages)).toBe(messages);
+  });
 });
+
+function noSecretProductionShapedRequest() {
+  return {
+    systemPrompt:
+      "Save the password through the saved-login when asked. Composio tools follow. You never send secret values in the clear.",
+    tools: [
+      {
+        name: "request_secret",
+        description: "Ask for secret values. Schema fields, values and placeholders stay visible.",
+        inputSchema: {
+          properties: {
+            generate: { description: "Generate a secret value" },
+            fields: {},
+            values: {},
+            placeholders: {},
+          },
+        },
+      },
+      { name: "request_takeover", description: "Take over when secret values are needed." },
+      {
+        name: "search_history",
+        inputSchema: {
+          properties: {
+            after: { description: "messages after" },
+            before: { description: "messages before" },
+          },
+        },
+      },
+      { name: "secret_request", description: "Authenticated request; secret values stay at origin." },
+      { name: "update_bot", description: "Update the bot. Secret values are not returned." },
+    ],
+    turn_context: "Current date and time for this turn.",
+    messages: [
+      { role: "system", content: "Save the password through the saved-login." },
+      { role: "user", content: "Reset password successful. The password field is required." },
+    ],
+  };
+}

@@ -1,28 +1,27 @@
 import { classifyIrreversibleTool } from "./irreversible-effect.js";
 
 const CLAIM_SPLIT = /(?:\. (?=[A-Z])|[;!?\n]| — | – |, but | but )/g;
-const NEGATIVE =
-  /\b(not|n't|never|no new|unable|could ?n.t|failed|hasn't|haven't|isn't|wasn't|pending|blocked|still need|unverified|unconfirmed|waiting|until)\b/i;
-const IDENTITY_CLAIM = /\b(signed in|logged in) as\b/i;
-const LICENSE_CLAIM =
-  /\b(reassigned|license (is )?now|moved the license|assigned (the )?license)\b/i;
-const VERIFIED_CLAIM = /\b(verified|confirmed)\b/i;
-const SEND_CLAIM = /\b(sent|delivered|texted)\b/i;
-const SEND_DENY = /\b(not (yet )?sent|hasn.t been sent|not delivered)\b/i;
-const LIMIT_AS_PAYMENT =
-  /(17,?000(?:\.00)?[^.]{0,40}(?:payment|paid|ACH))|((?:payment|paid|ACH)[^.]{0,40}17,?000)/i;
-const CREDIT_LIMIT = /credit limit/i;
 /**
- * Claim *detection* is English regex. Allowing a success claim is ledger-only.
+ * Claim detection is English regex. Allowing a success claim is ledger-only.
  * Not a multilingual or semantic parser: non-English completions are left as-is.
  */
+const IDENTITY_CLAIM = /\b(signed in|logged in)\s+(as|with|using|via)\b/i;
+const VERIFIED_CLAIM = /\b(verified|confirmed)\b/i;
+const SEND_CLAIM = /\b(sent|delivered|texted|went out)\b/i;
+const SEND_DENY = /\b(not (yet )?sent|hasn.t been sent|not delivered)\b/i;
+/**
+ * Generic completed-action verbs. Not grader L1/M1/V1 phrase lists or amounts.
+ * Bound to a current-intent ledger the same way as Done/All set.
+ */
+const COMPLETED_ACTION = /\b(reassigned|posted|paid)\b/i;
 const SUCCESS_CLAIM =
-  /\b(done|complete|completed|success(?:ful(?:ly)?)?|all set|successfully changed|it is reset|reset (?:is |was )?done)\b/i;
+  /\b(done|complete|completed|finished|success(?:ful(?:ly)?)?|all set|successfully changed|it is reset|reset (?:is |was )?done)\b/i;
 /** Fallback Done concatenated onto the next assistant turn has no separator or word boundary. */
 const GLUED_SUCCESS =
   /^(done|ok|okay|completed?|finished|all done|task complete|it'?s done)(?=[A-Za-z0-9_-])/i;
 const EMAIL = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
 const LOGIN_PAGE = /\b(sign in|log in|login)\b/i;
+const HONEST_UNVERIFIED = "Outcome was not verified.";
 
 export type ToolEvidence = {
   texts: string[];
@@ -49,10 +48,9 @@ export type CompletionLedger = {
 
 export type ClaimViolation =
   | "identity"
-  | "license"
   | "verified"
   | "send-contradiction"
-  | "limit-as-payment"
+  | "send-without-artifact"
   | "success-without-artifact";
 
 export function emptyCompletionLedger(input: {
@@ -81,18 +79,52 @@ export function ledgerAllowsSuccess(ledger: CompletionLedger | undefined): boole
   );
 }
 
+/** Done/All set/finished need task-proof or a delivered send, not a verified-read of an unrelated page. */
+export function ledgerAllowsGenericSuccess(ledger: CompletionLedger | undefined): boolean {
+  return ledgerHasClass(ledger, "task-proof") || ledgerHasClass(ledger, "delivered-send");
+}
+
 export function ledgerHasClass(
   ledger: CompletionLedger | undefined,
   className: OutcomeArtifactClass,
 ): boolean {
-  if (!ledgerAllowsSuccess(ledger)) return false;
-  return ledger!.artifacts.some(
+  if (!ledger?.intentId || !ledger.sourceMessageId || !ledger.runId) return false;
+  return ledger.artifacts.some(
     (artifact) =>
       artifact.class === className &&
-      artifact.intentId === ledger!.intentId &&
-      artifact.sourceMessageId === ledger!.sourceMessageId &&
-      artifact.runId === ledger!.runId,
+      artifact.intentId === ledger.intentId &&
+      artifact.sourceMessageId === ledger.sourceMessageId &&
+      artifact.runId === ledger.runId,
   );
+}
+
+function subjectsOverlap(left: string, right: string): boolean {
+  const a = left.trim().toLowerCase();
+  const b = right.trim().toLowerCase();
+  if (!a || !b) return false;
+  return a === b || a.includes(b) || b.includes(a);
+}
+
+export function ledgerHasBoundClass(
+  ledger: CompletionLedger | undefined,
+  className: OutcomeArtifactClass,
+  claimSubject?: string,
+): boolean {
+  if (!ledgerHasClass(ledger, className)) return false;
+  const hint = claimSubject?.trim();
+  if (!hint) return true;
+  return ledger!.artifacts.some((artifact) => {
+    if (
+      artifact.class !== className ||
+      artifact.intentId !== ledger!.intentId ||
+      artifact.sourceMessageId !== ledger!.sourceMessageId ||
+      artifact.runId !== ledger!.runId
+    ) {
+      return false;
+    }
+    if (!artifact.subject) return false;
+    return subjectsOverlap(artifact.subject, hint);
+  });
 }
 
 /**
@@ -117,7 +149,13 @@ export function bindOutcomeArtifact(input: {
   if (record.outcomeProof === true) {
     if (record.intentId !== intentId || record.sourceMessageId !== sourceMessageId) return null;
     if (typeof record.runId === "string" && record.runId !== runId) return null;
-    return { class: "task-proof", intentId, sourceMessageId, runId };
+    return {
+      class: "task-proof",
+      intentId,
+      sourceMessageId,
+      runId,
+      subject: typeof record.subject === "string" ? record.subject : undefined,
+    };
   }
   if (record.sent === true && irreversible?.class === "send") {
     return {
@@ -129,13 +167,25 @@ export function bindOutcomeArtifact(input: {
     };
   }
   if (record.verified === true && !isInsufficientRead(record)) {
-    return { class: "verified-read", intentId, sourceMessageId, runId };
+    return {
+      class: "verified-read",
+      intentId,
+      sourceMessageId,
+      runId,
+      subject: pageSubject(record),
+    };
   }
   return null;
 }
 
 function pageBlob(record: Record<string, unknown>): string {
   return `${record.tree ?? ""} ${record.header ?? ""} ${record.title ?? ""} ${record.url ?? ""}`;
+}
+
+function pageSubject(record: Record<string, unknown>): string | undefined {
+  const url = typeof record.url === "string" ? record.url.trim() : "";
+  const title = typeof record.title === "string" ? record.title.trim() : "";
+  return url || title || undefined;
 }
 
 function isInsufficientRead(record: Record<string, unknown>): boolean {
@@ -152,8 +202,23 @@ export function clauses(text: string): string[] {
     .filter(Boolean);
 }
 
+/** Negation counts only in the few tokens immediately before the claim, not later in the clause. */
+export function clauseNegatesAt(clause: string, index: number): boolean {
+  const before = clause.slice(Math.max(0, index - 28), index);
+  const tokens = before.trim().split(/\s+/).slice(-3);
+  return tokens.some((token) => {
+    const word = token.replace(/[^A-Za-z']/g, "");
+    return /^(not|never|no)$/i.test(word) || /n['’]t$/i.test(word);
+  });
+}
+
 export function positiveClaims(text: string, pattern: RegExp): string[] {
-  return clauses(text).filter((clause) => pattern.test(clause) && !NEGATIVE.test(clause));
+  return clauses(text).filter((clause) => {
+    const match = clause.match(pattern);
+    if (!match || match.index === undefined) return false;
+    if (clauseNegatesAt(clause, match.index)) return false;
+    return true;
+  });
 }
 
 export function collectToolEvidence(results: readonly unknown[]): ToolEvidence {
@@ -180,31 +245,46 @@ export function unsupportedClaims(
       violations.push("identity");
       break;
     }
-    if (emails.length === 0 && /as [^\s]+@[^\s]+/i.test(claim) && !blob.includes("@")) {
+    const named = claimedIdentitySubject(claim);
+    if (emails.length === 0 && named && !blob.toLowerCase().includes(named.toLowerCase())) {
       violations.push("identity");
       break;
     }
   }
-  if (positiveClaims(finalText, LICENSE_CLAIM).length > 0 && !/license/i.test(blob)) {
-    violations.push("license");
-  }
-  if (positiveClaims(finalText, VERIFIED_CLAIM).length > 0 && !ledgerHasClass(ledger, "verified-read") && !ledgerHasClass(ledger, "task-proof")) {
+  if (
+    positiveClaims(finalText, VERIFIED_CLAIM).length > 0 &&
+    !ledgerHasClass(ledger, "verified-read") &&
+    !ledgerHasClass(ledger, "task-proof")
+  ) {
     violations.push("verified");
   }
   const sendYes = positiveClaims(finalText, SEND_CLAIM).length > 0;
   const sendNo = SEND_DENY.test(finalText);
   if (sendYes && sendNo) violations.push("send-contradiction");
   if (sendYes && evidence.sent === false) violations.push("send-contradiction");
-  if (LIMIT_AS_PAYMENT.test(finalText) && !CREDIT_LIMIT.test(finalText)) {
-    violations.push("limit-as-payment");
+  if (sendYes && !ledgerHasClass(ledger, "delivered-send") && evidence.sent !== false) {
+    violations.push("send-without-artifact");
   }
-  if (
-    !ledgerAllowsSuccess(ledger) &&
-    (positiveClaims(finalText, SUCCESS_CLAIM).length > 0 || hasGluedUnsupportedCompletion(finalText))
-  ) {
+  const successLike =
+    positiveClaims(finalText, SUCCESS_CLAIM).length > 0 ||
+    positiveClaims(finalText, COMPLETED_ACTION).length > 0 ||
+    hasGluedUnsupportedCompletion(finalText);
+  if (!ledgerAllowsGenericSuccess(ledger) && successLike) {
     violations.push("success-without-artifact");
   }
   return [...new Set(violations)];
+}
+
+function claimedIdentitySubject(claim: string): string | undefined {
+  const match = claim.match(/\b(?:signed in|logged in)\s+(?:as|with|using|via)\s+(.+)/i);
+  const rest = match?.[1]?.trim() ?? "";
+  const token =
+    rest
+      .split(/[\s,./]+/)
+      .map((part) => part.replace(/^[@]+/, ""))
+      .find((part) => part.length >= 2 && !/^(the|a|an)$/i.test(part)) ?? "";
+  if (token.length < 2) return undefined;
+  return token;
 }
 
 /** Terminal final after a bare-done follow-up may glue the fallback Done to the next turn. */
@@ -221,48 +301,58 @@ export function sanitizeFinalText(
   evidence: ToolEvidence,
   ledger?: CompletionLedger,
 ): string {
+  const trimmedIn = finalText.trim();
+  if (!trimmedIn) return HONEST_UNVERIFIED;
   const violations = new Set(unsupportedClaims(finalText, evidence, ledger));
   if (violations.size === 0) return finalText;
-  const kept = clauses(finalText).filter((clause) => {
+  let parts = clauses(finalText).filter((clause) => {
     if (violations.has("identity") && IDENTITY_CLAIM.test(clause)) return false;
-    if (violations.has("license") && LICENSE_CLAIM.test(clause)) return false;
-    if (violations.has("verified") && VERIFIED_CLAIM.test(clause) && !NEGATIVE.test(clause)) {
+    if (violations.has("verified") && VERIFIED_CLAIM.test(clause) && !clauseNegatesClaim(clause, VERIFIED_CLAIM)) {
       return false;
     }
-    if (violations.has("limit-as-payment") && LIMIT_AS_PAYMENT.test(clause)) return false;
     return true;
   });
-  let text = kept.join(". ").replace(/\s+/g, " ").trim();
   if (violations.has("send-contradiction")) {
-    if (evidence.sent === true) text = stripSendDenial(text);
+    if (evidence.sent === true) parts = parts.filter((clause) => !SEND_DENY.test(clause));
     else if (evidence.sent === false) {
-      text = stripSendAffirmation(text);
-      if (!text || /\bsent\b/i.test(text)) {
-        text = "Delivery was not verified.";
-      }
-    } else text = `${text} Delivery was not verified.`.trim();
+      parts = parts.filter((clause) => !SEND_CLAIM.test(clause));
+      if (parts.length === 0) return "Delivery was not verified.";
+    } else parts.push("Delivery was not verified.");
   }
-  if (violations.has("license") && !/not (been )?(reassigned|done|verified)/i.test(text)) {
-    text = `${text} License change was not verified.`.trim();
+  if (violations.has("send-without-artifact")) {
+    parts = parts.filter((clause) => !SEND_CLAIM.test(clause));
+    if (parts.length === 0) return "Delivery was not verified.";
   }
-  if (violations.has("identity") && !/not signed in|signed out|guest/i.test(text)) {
-    text = `${text} Sign-in identity was not on the page.`.trim();
+  if (violations.has("identity") && !parts.some((clause) => /not signed in|signed out|guest/i.test(clause))) {
+    parts.push("Sign-in identity was not on the page.");
   }
   if (violations.has("success-without-artifact")) {
-    const keptSuccess = clauses(text).flatMap((clause) => {
+    parts = parts.flatMap((clause) => {
       const unglued = stripGluedSuccessPrefix(clause).trim();
       if (unglued !== clause.trim()) {
         if (!unglued) return [];
-        if (SUCCESS_CLAIM.test(unglued) && !NEGATIVE.test(unglued)) return [];
+        if (actionClaimUnverified(unglued)) return [];
         return [unglued];
       }
-      if (SUCCESS_CLAIM.test(clause) && !NEGATIVE.test(clause)) return [];
+      if (actionClaimUnverified(clause)) return [];
       return [clause];
     });
-    text = keptSuccess.join(". ").replace(/\s+/g, " ").trim();
-    if (!text) text = "Outcome was not verified.";
   }
-  return text.replace(/\s+/g, " ").trim();
+  const text = parts.join(". ").replace(/\s+/g, " ").trim();
+  return text || HONEST_UNVERIFIED;
+}
+
+function actionClaimUnverified(clause: string): boolean {
+  return (
+    (SUCCESS_CLAIM.test(clause) && !clauseNegatesClaim(clause, SUCCESS_CLAIM)) ||
+    (COMPLETED_ACTION.test(clause) && !clauseNegatesClaim(clause, COMPLETED_ACTION))
+  );
+}
+
+function clauseNegatesClaim(clause: string, pattern: RegExp): boolean {
+  const match = clause.match(pattern);
+  if (!match || match.index === undefined) return false;
+  return clauseNegatesAt(clause, match.index);
 }
 
 /** @deprecated Blob `verified`/`sent` is not an intent-bound ledger. Prefer ledgerAllowsSuccess. */
@@ -280,14 +370,3 @@ function resultText(result: unknown): string {
   }
 }
 
-function stripSendDenial(text: string): string {
-  return clauses(text)
-    .filter((clause) => !SEND_DENY.test(clause))
-    .join(". ");
-}
-
-function stripSendAffirmation(text: string): string {
-  return clauses(text)
-    .filter((clause) => !SEND_CLAIM.test(clause))
-    .join(". ");
-}

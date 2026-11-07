@@ -1336,6 +1336,17 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
     );
   });
 
+  it("composed AFTER pi-runtime strips via core request-context helpers, not whole-ctx harvest", () => {
+    if (missing.length) return;
+    const src = readFileSync(afterPiRuntime, "utf8");
+    expect(src).toContain("stripSecretTranscriptMessages");
+    expect(src).toContain("stripSecretRequestContext");
+    expect(src).toContain("return stripSecretTranscriptMessages(messages)");
+    expect(src).toContain("return stripSecretRequestContext(ctx)");
+    expect(src).not.toContain("harvestSecretsFromUnknown(ctx)");
+    expect(src).not.toContain("harvestSecretsFromUnknown(messages)");
+  });
+
   it("composed AFTER pi-runtime has the exact pinned-image bare-done nudge", () => {
     if (missing.length) return;
     const previous = process.env.RAKAZO_ASSIST_HARNESS;
@@ -1358,9 +1369,11 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
       "packages/core/src/completion-artifact.ts",
       "packages/core/src/irreversible-effect.ts",
       "packages/core/src/secret-result-handle.ts",
+      "packages/core/src/runtime-eval-contract.ts",
       "packages/core/src/compaction-provenance.ts",
       "packages/core/src/handoff-delivery.ts",
       "packages/adapters/src/protected-result.ts",
+      "packages/adapters/src/runtime-eval-backend.ts",
       "packages/adapters/src/stale-element-recovery.ts",
       "packages/adapters/src/desktop-tool-contract.ts",
       "packages/adapters/src/model-stream-error.ts",
@@ -1383,6 +1396,7 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
     expect(afterIndex).toContain('export * from "./completion-artifact.js";');
     expect(afterIndex).toContain('export * from "./irreversible-effect.js";');
     expect(afterIndex).toContain('export * from "./secret-result-handle.js";');
+    expect(afterIndex).toContain('export * from "./runtime-eval-contract.js";');
     const afterArtifact = readFileSync(
       path.join(composeOut, "worker/after/packages/core/src/completion-artifact.ts"),
       "utf8",

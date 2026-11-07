@@ -42,11 +42,13 @@ ABSENT = [
     "packages/core/src/irreversible-effect.ts",
     "packages/core/src/secret-result-handle.ts",
     "packages/core/src/completion-artifact.ts",
+    "packages/core/src/runtime-eval-contract.ts",
     "packages/core/src/compaction-provenance.ts",
     "packages/core/src/handoff-delivery.ts",
     "packages/adapters/src/stale-element-recovery.ts",
     "packages/adapters/src/desktop-tool-contract.ts",
     "packages/adapters/src/protected-result.ts",
+    "packages/adapters/src/runtime-eval-backend.ts",
     "packages/adapters/src/model-stream-error.ts",
 ]
 
