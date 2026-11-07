@@ -4,6 +4,7 @@ import { parametersFor } from "./pi-runtime.js";
 import { MODEL_STREAM_IDLE_TIMEOUT_MS, MODEL_STREAM_TIMEOUT_MS } from "./pi-runtime-limits.js";
 
 export const CAPTURE_LABEL = "code-derived-not-captured";
+/** Reconstruction only. Byte baseline is `isolated-capture.ts` (local stub HTTP). */
 
 export type CapturedToolWire = {
   type: "function";

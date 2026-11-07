@@ -1,0 +1,30 @@
+# /run/login-guard/policy.txt SHAPE
+# This is grammar only. It is not a production policy and contains no live origins,
+# saved-login identities, or credentials.
+#
+# Encoding: UTF-8 text, LF or CRLF.
+# Comments: `#` to end of line. Blank lines ignored.
+#
+# Lines, in any order:
+#   mode=<enforce|warn|off>
+#   allow <origin> <path> <kinds>
+#   deny_act <origin>
+#
+# origin: absolute URL; parser keeps URL.origin only (scheme + host + port).
+# path:  must start with `/`; otherwise stored as `/`.
+# kinds: comma-separated from {username, password, new-password, otp}.
+#        passwords/otp/new-password are dropped; only `username` can survive.
+#        an allow line with no surviving kind is stored as kinds=[username].
+#
+# Missing or unreadable file => { mode: "enforce", allow: [], denyAct: [] }
+# (fail closed, no exceptions). Cache is 3s + mtime.
+#
+# Production prerequisite: the worker's live file at /run/login-guard/policy.txt
+# (or RAKAZO_LOGIN_GUARD_POLICY). That file is required for live login-guard
+# semantics. This synthetic fixture is NOT a substitute for that file and is
+# not part of the serializer byte baseline.
+#
+# Example (non-production origins only):
+mode=enforce
+allow https://capture.example.test / username
+deny_act https://capture.example.test

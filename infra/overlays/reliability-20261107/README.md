@@ -38,3 +38,5 @@ Historical plaintext in `external_effects.result`, `messages`, and `events` is *
 See `REPLACEMENT-MANIFEST.md`. Four live mounts are **SKEWED** (worker ≠ api): `executor`, `browser-tools`, `builtin-tools`, `computer-browser`. The first three take HOOKS; `computer-browser.ts` is untouched. Bind-mount the new modules onto **both** api and worker. Do not drop saved-login, Amazon sign-in verify, or `browser_extract`.
 
 A 72-tool code-derived dump is **not** a matched production capture and does not unlock live evals.
+
+Byte baseline is the isolated local-stub harness: `isolated-capture/RUNBOOK.md`. Parent runs it on the deployed image + overlay stack. This branch does not call GX10.
