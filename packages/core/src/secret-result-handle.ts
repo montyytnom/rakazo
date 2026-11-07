@@ -67,13 +67,20 @@ export function protectedResultNote(handle: ProtectedResultHandle): string {
 export function looksLikeSecretValue(value: string): boolean {
   const trimmed = value.trim();
   if (!looksLikeLabeledSecret(trimmed)) return false;
-  const classes = [
-    /[a-z]/.test(trimmed),
-    /[A-Z]/.test(trimmed),
-    /\d/.test(trimmed),
-    /[^A-Za-z0-9]/.test(trimmed),
-  ].filter(Boolean).length;
-  return classes >= 3;
+  // Hyphenated lowercase ids (item-1, group-1, thread-group-1, call-1) share
+  // three character classes with generated passwords. Unlabeled withhold
+  // requires mixed case so structured identifiers stay visible.
+  if (isStructuredIdentifier(trimmed)) return false;
+  const hasLower = /[a-z]/.test(trimmed);
+  const hasUpper = /[A-Z]/.test(trimmed);
+  const hasDigit = /\d/.test(trimmed);
+  const hasSpecial = /[^A-Za-z0-9]/.test(trimmed);
+  return hasLower && hasUpper && (hasDigit || hasSpecial);
+}
+
+/** Run/thread/group/tool ids: lowercase tokens joined by hyphens, optional trailing digits. */
+function isStructuredIdentifier(value: string): boolean {
+  return /^(?:[a-z][a-z0-9]*-)+[a-z0-9]+$/.test(value);
 }
 
 export function looksLikeLabeledSecret(value: string): boolean {

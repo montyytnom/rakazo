@@ -4842,7 +4842,12 @@ export function createRunExecutor(deps: ExecutorDeps) {
               pageRefMemory.lastUrl ?? "",
             );
           }
-          if (irreversible && !turnIntent.authorized) {
+          if (
+            irreversible &&
+            !turnIntent.authorized &&
+            !requiresUnattendedApproval &&
+            !nextApprovedTool
+          ) {
             return {
               error: UNAUTHORIZED_IRREVERSIBLE,
               uncertain: true,

@@ -26,6 +26,7 @@ need "$COMPOSE/api/before/PREIMAGE-HASHES.tsv"
 need "$HERE/apply-to-scratch.sh"
 need "$HERE/rollback-to-preimage.sh"
 need "$HERE/prove-isolated-core.sh"
+need "$HERE/RELEASE-MOUNT-PLAN.md"
 need "$OVERLAY/MOUNT-MAP.tsv"
 need "$ROOT/infra/overlays/reliability-20261107/ROLLBACK.sh"
 
@@ -207,7 +208,25 @@ for service in ("worker", "api"):
 (stage / "PREIMAGE-HASHES.worker.tsv").write_text("\n".join(preimage_lines["worker"]) + "\n")
 (stage / "PREIMAGE-HASHES.api.tsv").write_text("\n".join(preimage_lines["api"]) + "\n")
 (stage / "rollback-backup" / "BEFORE-HASHES.tsv").write_text("\n".join(before_hashes) + "\n")
-print(f"FILE-STATE rows={len(rows)-1}")
+override = [
+    "service\tpath\tdest\taction\tbefore_sha256\tafter_sha256\thost_source"
+]
+for line in rows[1:]:
+    service, rel, state, mounted, before, after, _src = line.split("\t")
+    dest = f"/app/{rel}"
+    host = f"files/{service}/after/{rel}"
+    if mounted == "true":
+        action = "replace-existing-bind"
+    elif before == after:
+        action = "skip-unchanged-image"
+        host = ""
+    elif before == "ABSENT":
+        action = "add-bind-absent-path"
+    else:
+        action = "add-bind-over-image"
+    override.append(f"{service}\t{rel}\t{dest}\t{action}\t{before}\t{after}\t{host}")
+(stage / "COMPOSE-OVERRIDE.tsv").write_text("\n".join(override) + "\n")
+print(f"FILE-STATE rows={len(rows)-1} COMPOSE-OVERRIDE rows={len(override)-1}")
 PY
 
 cp -a "$HERE/apply-to-scratch.sh" "$STAGE/apply-to-scratch.sh"
@@ -215,6 +234,7 @@ cp -a "$HERE/rollback-to-preimage.sh" "$STAGE/rollback-to-preimage.sh"
 cp -a "$HERE/prove-isolated-core.sh" "$STAGE/prove-isolated-core.sh"
 chmod +x "$STAGE/apply-to-scratch.sh" "$STAGE/rollback-to-preimage.sh" "$STAGE/prove-isolated-core.sh"
 cp -a "$HERE/OPERATIONAL-ROLLBACK.md" "$STAGE/OPERATIONAL-ROLLBACK.md"
+cp -a "$HERE/RELEASE-MOUNT-PLAN.md" "$STAGE/RELEASE-MOUNT-PLAN.md"
 cp -a "$ROOT/infra/overlays/reliability-20261107/ROLLBACK.sh" "$STAGE/ROLLBACK.sh"
 chmod +x "$STAGE/ROLLBACK.sh"
 cp -a "$ROOT/infra/overlays/reliability-20261107/HOOKS.md" "$STAGE/HOOKS.md"
@@ -264,6 +284,10 @@ do
     cp -a "/opt/cursor/artifacts/$log" "$STAGE/logs/$log"
   fi
 done
+if [[ -f /home/ubuntu/.cursor/projects/workspace/uploads/live-vs-filestate_7463.tsv ]]; then
+  cp -a /home/ubuntu/.cursor/projects/workspace/uploads/live-vs-filestate_7463.tsv \
+    "$STAGE/logs/live-vs-filestate-636est.tsv"
+fi
 
 cat > "$STAGE/MANIFEST.txt" <<EOF
 candidate overlay secret/completion slice (closed FILE-STATE pack)
@@ -275,7 +299,10 @@ apply-to-scratch.sh refuses /opt/docker /app /run /var/lib/docker /opt/rakazo
 apply-to-scratch.sh requires FILE-STATE preimage or --seed-preimage
 HEAD executor still returns raw tool results to the model
 Releasable files are the composed worker/api AFTER trees in files/
-Claim detection is English regex; allowing success is CompletionLedger-only
+Claim detection is English regex only; not a multilingual or semantic parser. Allowing success is CompletionLedger-only.
+Live hash-only 6:36 AM EST closed c7e5 preimages (22 match, 18 absent, images 47d34235/c500071f). Isolated capture uses COMPOSE-OVERRIDE.tsv: 15 replace-existing-bind, 22 add-bind, 3 skip-unchanged-image. Not production.
+HEAD vitest adapters/core suites label HEAD workspace, not composed trees.
+PiRuntime stub JSON measures HTTP/persist/final; named tests cover in-run handoff and composed compaction separately.
 HISTORICAL_PLAINTEXT_CLEANUP_LOCKED=true
 isolated-capture baseline fixtures unchanged
 no production calls, no model calls, no heldout inspection
@@ -288,6 +315,40 @@ fi
 export REPO_TSX
 "$STAGE/prove-isolated-core.sh" "$STAGE" | tee "$STAGE/logs/candidate-isolated-core.log"
 "$STAGE/apply-to-scratch.sh" --self-test --from "$STAGE" | tee "$STAGE/logs/candidate-apply-rollback-selftest.log"
+
+python3 - "$STAGE" <<'PY'
+from pathlib import Path
+stage = Path(__file__) if False else Path(__import__("sys").argv[1])
+logs = sorted(p.name for p in (stage / "logs").glob("*") if p.is_file())
+index = [
+    "# Pack index",
+    "",
+    "Sat Nov 7, 2026, 6:36 AM EST. Scratch-only. Not production.",
+    "",
+    "## Recipe",
+    "",
+    "- `FILE-STATE.tsv` — 40 rows, live-verified preimages 6:36 AM EST",
+    "- `COMPOSE-OVERRIDE.tsv` — 15 replace-existing-bind, 22 add-bind, 3 skip-unchanged-image",
+    "- `RELEASE-MOUNT-PLAN.md` — isolated capture on images 47d34235 / c500071f; rollback original compose chain",
+    "- `OPERATIONAL-ROLLBACK.md` / `rollback-to-preimage.sh` — scratch file-state only",
+    "- `apply-to-scratch.sh` — refuses production roots; `--seed-preimage` or exact before hashes",
+    "- `prove-isolated-core.sh` — packed source `completion-artifact` → `irreversible-effect`",
+    "- `RUNTIME-LOADING.txt` — tsx + `@rakazo/core` default `./src/index.ts`",
+    "",
+    "## Labels",
+    "",
+    "- HEAD vitest adapters/core = workspace HEAD, not composed trees",
+    "- overlay-orchestration = composed before/after trees",
+    "- PiRuntime JSON measures HTTP/persist/final/handoff; compaction is a named composed-tree test",
+    "- Claim detection is English regex; allowing success is CompletionLedger-only",
+    "",
+    "## Logs in this pack",
+    "",
+]
+index.extend(f"- `logs/{name}`" for name in logs)
+(stage / "INDEX.md").write_text("\n".join(index) + "\n")
+print("INDEX.md", len(logs), "logs")
+PY
 
 (
   cd "$STAGE"

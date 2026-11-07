@@ -151,7 +151,11 @@ function fixture({
     userId: "user-1",
     status: "queued",
     trigger,
-    sourceMessageId: sourceRole ? "source-1" : null,
+    sourceMessageId: sourceRole
+      ? "source-1"
+      : trigger === "user" || trigger === "call_end"
+        ? "source-1"
+        : null,
     leaseFence: 0,
   };
   const externalEffect = {

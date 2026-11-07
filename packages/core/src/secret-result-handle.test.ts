@@ -73,6 +73,22 @@ describe("protected result handles", () => {
     expect(looksLikeSecretValue("op-deadbeef")).toBe(false);
   });
 
+  it("does not treat structured identifiers as unlabeled secrets", () => {
+    for (const id of ["item-1", "group-1", "thread-group-1", "call-1", "run-1", "bot-alpha"]) {
+      expect(looksLikeSecretValue(id), id).toBe(false);
+      expect(harvestSecretsFromUnknown({ id, groupId: id, threadId: id })).toEqual([]);
+      expect(redactProtectedTree({ item: id, groupId: id, threadId: id })).toEqual({
+        item: id,
+        groupId: id,
+        threadId: id,
+      });
+    }
+    expect(looksLikeSecretValue(FIXTURE_NEW)).toBe(true);
+    expect(redactProtectedTree({ item: FIXTURE_NEW })).toEqual({ item: "[withheld]" });
+    expect(redactProtectedTree({ password: "item-1" })).toEqual({ password: "[withheld]" });
+    expect(harvestSecretsFromUnknown({ password: "item-1" })).toContain("item-1");
+  });
+
   it("strips secrets from thrown errors so logs cannot echo plaintext", () => {
     const error = redactThrown(new Error(`vault failed for ${FIXTURE_NEW}`), [FIXTURE_NEW]);
     expect(error.message).not.toContain(FIXTURE_NEW);

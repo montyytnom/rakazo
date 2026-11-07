@@ -36,3 +36,5 @@ Without `--seed-preimage`, apply requires the scratch tree to already match FILE
 - Pretend a git revert unmounts production
 
 Process restart after the file restore is parent-owned.
+
+Live hash-only 6:36 AM EST closed the c7e5 preimage gate (22 matches, 18 absent, images `47d34235` / `c500071f` unchanged). Restart of **existing** binds only covers 15 FILE-STATE rows. Isolated capture needs 22 additive RO binds; rollback drops those binds and restores the 15 host sources. See `RELEASE-MOUNT-PLAN.md` and `COMPOSE-OVERRIDE.tsv`. This pack does not recreate hosts or change live compose. Claim detection is English regex only; allowing success is CompletionLedger-only.

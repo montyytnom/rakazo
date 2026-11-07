@@ -68,6 +68,14 @@ const afterApiExecutor = path.join(
   composeOut,
   "api/after/packages/adapters/src/executor.ts",
 );
+const beforeCompaction = path.join(
+  composeOut,
+  "worker/before/packages/adapters/src/history-compaction.ts",
+);
+const afterCompaction = path.join(
+  composeOut,
+  "worker/after/packages/adapters/src/history-compaction.ts",
+);
 
 const CURRENT_SECRET_SENTINEL = "Cur#Rpr7xQ2mN9kL";
 const STALE_SECRET_SENTINEL = "Old#Stl4pW8vB3yH";
@@ -1230,7 +1238,7 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
     expect(visible.http).toContain(CURRENT_SECRET_SENTINEL);
   });
 
-  it("pass-after: PiRuntime stub HTTP, persist, final, and handoff withhold current and stale sentinels", async () => {
+  it("pass-after: PiRuntime stub HTTP, persist, and final withhold current and stale sentinels", async () => {
     if (missing.length) return;
     const visible = await captureSecretBoundary(afterExecutor, "run-pi-secret-after");
     expect(visible.captureCount, visible.debug).toBeGreaterThan(1);
@@ -1242,6 +1250,52 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
     expect(visible.final).not.toContain(CURRENT_SECRET_SENTINEL);
     expect(visible.final).not.toContain(STALE_SECRET_SENTINEL);
     expect(visible.http).toMatch(/Protected result|\[withheld\]|\[redacted\]/);
+  });
+
+  it("pass-after: PiRuntime in-run protected_result_handoff withholds current and stale sentinels", async () => {
+    if (missing.length) return;
+    const visible = await captureSecretBoundary(afterExecutor, "run-pi-handoff-after");
+    expect(visible.handoff.length, visible.handoff).toBeGreaterThan(2);
+    expect(visible.handoff).not.toContain(CURRENT_SECRET_SENTINEL);
+    expect(visible.handoff).not.toContain(STALE_SECRET_SENTINEL);
+    expect(visible.handoff).toMatch(/delivered|op-|secure card|unknown op_id/i);
+  });
+
+  it("fail-before: composed history-compaction keeps All set without a current-intent ledger", async () => {
+    if (missing.length) return;
+    const summary = await composedCompactSummary(
+      beforeCompaction,
+      "All set. Successfully changed. It is reset.",
+    );
+    expect(summary).toMatch(/\bAll set\b/);
+  });
+
+  it("pass-after: composed history-compaction rewrites All set without a current-intent ledger", async () => {
+    if (missing.length) return;
+    const summary = await composedCompactSummary(
+      afterCompaction,
+      "All set. Successfully changed. It is reset.",
+    );
+    expect(summary).toMatch(/not verified/i);
+    expect(summary).not.toMatch(/\bAll set\b/);
+    expect(summary).not.toMatch(/Successfully changed/);
+    expect(summary).not.toMatch(/\bIt is reset\b/);
+  });
+
+  it("claim detection is English regex; allowing success is ledger-only, not a semantic parser", async () => {
+    if (missing.length) return;
+    const { sanitizeFinalText, collectToolEvidence, emptyCompletionLedger } = await import(
+      `${pathToFileURL(path.join(composeOut, "worker/after/packages/core/src/completion-artifact.ts")).href}?t=${Date.now()}`
+    );
+    const evidence = collectToolEvidence([]);
+    expect(sanitizeFinalText("Done", evidence)).toBe("Outcome was not verified.");
+    expect(sanitizeFinalText("Listo.", evidence)).toBe("Listo.");
+    const ledger = emptyCompletionLedger({
+      intentId: "intent-1",
+      sourceMessageId: "msg-1",
+      runId: "run-1",
+    });
+    expect(sanitizeFinalText("Done", evidence, ledger)).toBe("Outcome was not verified.");
   });
 
   it("compose-before leaves 926710a-absent helpers absent and does not patch core index", () => {
@@ -1386,13 +1440,15 @@ async function captureSecretBoundary(executorFile: string, runId: string) {
     const executeCalls: Array<{ name: string; args: unknown }> = [];
     let hasExecute = false;
     let piError: string | undefined;
+    let handoffResult: unknown;
     const createRunExecutor = await loadExecutor(executorFile);
+    const { EncryptedSecretStore } = await import("./secrets.js");
     const f = harness(createRunExecutor, {
       runId,
       prompt: "Save the generated password",
       sourceMessageId: "msg-1",
       graphical: false,
-      secretStore: opaqueSecretStore(),
+      secretStore: new EncryptedSecretStore("test-only-piruntime-handoff-key"),
       history: [
         {
           id: "msg-prior",
@@ -1410,7 +1466,18 @@ async function captureSecretBoundary(executorFile: string, runId: string) {
           request.executeTool = inner
             ? async (name, args, executionId) => {
                 executeCalls.push({ name, args });
-                return inner(name, args, executionId);
+                const result = await inner(name, args, executionId);
+                if (name === "scratchpad_add") {
+                  const handle = extractProtectedHandle(dump(result));
+                  if (handle) {
+                    handoffResult = await inner(
+                      "protected_result_handoff",
+                      { op_id: handle },
+                      "call-handoff",
+                    );
+                  }
+                }
+                return result;
               }
             : undefined;
           try {
@@ -1435,7 +1502,8 @@ async function captureSecretBoundary(executorFile: string, runId: string) {
     const http = stub.rawBodies.map((body) => body.toString("utf8")).join("\n");
     const persist = dump(f.effects.map((effect) => effect.result));
     const final = dump(f.finalized);
-    const debug = dump({ events: piEvents, error: piError, executeCalls, hasExecute });
+    const handoff = dump(handoffResult ?? null);
+    const debug = dump({ events: piEvents, error: piError, executeCalls, hasExecute, handoff });
     const logPath = process.env.CANDIDATE_PIRUNTIME_LOG;
     if (logPath) {
       const { appendFileSync } = await import("node:fs");
@@ -1457,6 +1525,10 @@ async function captureSecretBoundary(executorFile: string, runId: string) {
           currentSentinelInPersist: persist.includes(CURRENT_SECRET_SENTINEL),
           staleSentinelInPersist: persist.includes(STALE_SECRET_SENTINEL),
           currentSentinelInFinal: final.includes(CURRENT_SECRET_SENTINEL),
+          currentSentinelInHandoff: handoff.includes(CURRENT_SECRET_SENTINEL),
+          staleSentinelInHandoff: handoff.includes(STALE_SECRET_SENTINEL),
+          measured: ["http", "persist", "final", "handoff"],
+          notMeasuredInHttp: ["handoff", "compaction"],
           httpPreview: stub.parsedBodies.map((body) => ({
             roles: Array.isArray(body?.messages)
               ? (body.messages as Array<{ role?: string }>).map((message) => message.role)
@@ -1467,6 +1539,7 @@ async function captureSecretBoundary(executorFile: string, runId: string) {
           })),
           persist,
           final,
+          handoff,
           debug,
         })}\n`,
       );
@@ -1476,6 +1549,7 @@ async function captureSecretBoundary(executorFile: string, runId: string) {
       captureCount: stub.captures.length,
       persist,
       final,
+      handoff,
       results: dump(f.results),
       debug,
     };
@@ -1484,4 +1558,62 @@ async function captureSecretBoundary(executorFile: string, runId: string) {
     if (previous === undefined) delete process.env.RAKAZO_OPENAI_COMPAT_ALLOW_PUBLIC;
     else process.env.RAKAZO_OPENAI_COMPAT_ALLOW_PUBLIC = previous;
   }
+}
+
+function extractProtectedHandle(serialized: string): string | undefined {
+  const quoted = serialized.match(/"handle":"(op-[a-f0-9]{8})"/i);
+  if (quoted?.[1]) return quoted[1];
+  return serialized.match(/\bop-[a-f0-9]{8}\b/i)?.[0];
+}
+
+async function composedCompactSummary(file: string, summaryText: string): Promise<string> {
+  const { compactHistory } = await import(`${pathToFileURL(file).href}?t=${Date.now()}`);
+  const messages = Array.from({ length: 50 }, (_, i) => ({
+    seq: i,
+    role: i % 2 === 0 ? "user" : "bot",
+    blocks: [{ kind: "text", text: `message ${i}` }],
+  }));
+  const thread = {
+    id: "thread-1",
+    botId: "bot-1",
+    spaceId: "workspace-1",
+    userId: "user-1",
+    nextMessageSeq: 50,
+    historyCompactedUpToSeq: null as number | null,
+    historyCompactionSummary: null as string | null,
+    historyCompactionGeneration: 0,
+  };
+  const prisma = {
+    thread: {
+      findUniqueOrThrow: vi.fn(async () => thread),
+      updateMany: vi.fn(async (args: { data: { historyCompactionSummary: string } }) => {
+        thread.historyCompactionSummary = args.data.historyCompactionSummary;
+        return { count: 1 };
+      }),
+    },
+    event: { findFirst: vi.fn(async () => null) },
+    message: {
+      findMany: vi.fn(async () => messages),
+    },
+    deploymentSettings: { findUnique: vi.fn(async () => null) },
+    usageRecord: { createMany: vi.fn(async () => ({ count: 0 })), create: vi.fn() },
+  };
+  const runtime = {
+    describe: () => ({ capabilities: { streaming: true, compaction: true } }),
+    run: vi.fn(async function* () {
+      yield { type: "done", text: summaryText };
+    }),
+  };
+  await compactHistory(
+    {
+      prisma,
+      runtime,
+      jobs: { enqueue: vi.fn(async () => undefined) },
+      memoryProviders: { resolve: vi.fn(async () => null) },
+      deploymentModelKey: "openrouter-key",
+      deploymentModelConfigured: true,
+    },
+    "thread-1",
+  );
+  return thread.historyCompactionSummary ?? "";
 }
