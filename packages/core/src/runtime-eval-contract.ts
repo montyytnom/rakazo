@@ -70,6 +70,12 @@ export const PRODUCTION_FINALIZATION_CALL_GRAPH = [
     records: "assembledRaw in, deliveredFinal out; modelTurns pass-through",
   },
   {
+    id: "evalSink",
+    site: "executor continueRun after delivered text",
+    records:
+      "EvalChannelRecord: rawModelChunks/stops, assembledRaw, deliveredFinal, streamed, persisted, notification, publishedMessages, assistNudge",
+  },
+  {
     id: "finalizeRun",
     site: "deps.events.finalizeRun",
     records: "persisted delivered blocks",
@@ -87,7 +93,8 @@ export const PRODUCTION_FINALIZATION_CALL_GRAPH = [
   {
     id: "protected_result_handoff",
     site: "executor tool name protected_result_handoff",
-    records: "only if the bind offered the schema; 37-scratch does not",
+    records:
+      "HEAD catalog schema only; eval does not claim real-model handoff; write authority not expanded; captured 52-bind and 37-scratch do not offer it",
   },
 ] as const;
 
@@ -100,8 +107,77 @@ export const ADAPTER_RUNTIME_EVAL_ENTRYPOINTS = [
   "redactReplayResult",
   "recoverStaleBrowserAct",
   "assistBareDone",
-  "handoffProtectedResult",
+  "runComposedEvalLoop",
 ] as const;
+
+/**
+ * Sanitized BOX input contract. This repo does not request private prompts,
+ * bodies, or overlay archives. BOX supplies those locally.
+ *
+ * Matched-config offered tools are the captured-service inventory: 52 builtins
+ * plus fleet, computer, and connectors from that service. This HEAD catalog
+ * count (and isolated-capture REVIEWER_EXPECTED_WORKER_BUILTINS) is not that
+ * number. 37-scratch is not matched-config.
+ */
+export const MATCHED_CONFIG_INPUT_CONTRACT = {
+  bodies: "BOX-supplies-locally-do-not-request-private-prompts-or-bodies",
+  overlayArchive: "BOX-local-path-hard-fail-if-missing",
+  capturedService: {
+    expectedOfferedBuiltins: 52,
+    plus: ["fleet", "computer", "connectors"] as const,
+    source: "captured-service-inventory",
+    notThisHeadCatalog: true,
+    not37Scratch: true,
+  },
+  backends: {
+    browser: "pluggable",
+    connector: "pluggable",
+    model: "recording-baseURL-stub-offline-now",
+  },
+  liveEval: "requires-approval-and-attested-window-later",
+  productionChannels: [
+    "final",
+    "notification",
+    "stream",
+    "progress",
+    "takeover",
+    "activity",
+    "message_user",
+    "message_bot",
+    "narration",
+    "loop-guard",
+    "attach",
+  ] as const,
+  evalSinkRecords: "in-process stream strings, not HTTP raw request bytes",
+  volatileFields: [
+    "http.headers.date",
+    "http.headers.host",
+    "http.headers.connection",
+    "requestBody.messages[role=user] current-time sentence",
+    "sse.created",
+  ] as const,
+} as const;
+
+/** Model-visible tool-result shape changes on the persist/replay/protect path. */
+export const MODEL_VISIBLE_TOOL_RESULT_SHAPES = {
+  protectedResultNote:
+    "Protected result {handle} at {createdAt}, {hash}, status {status} — value withheld.",
+  protectedResultObject: "{ ...redactedTree, protectedResult: handle, note }",
+  clickOkTrue: "{ok:true} is a mutation attempt, not outcomeProof or task-proof",
+  withheldMarker: "[withheld] / [redacted]",
+  replayCompleted: "redactReplayResult of the stored result; protectedVaultRef stripped",
+  replayUncertain: "UNAUTHORIZED_IRREVERSIBLE or uncertain:true; no second write",
+  desktopLaunchUnsupported: "Search installed desktop tools (model-visible hint, not a retry)",
+} as const;
+
+/** N1 Continue / N2 timeout-resend effect states. */
+export const IRREVERSIBLE_EFFECT_STATES = {
+  n1Continue:
+    "Continue reuses completed irr:v1 for the same sourceMessageId/intentId; no second write",
+  n2TimeoutResend:
+    "A new sourceMessageId is a new irr:v1 even when the user text matches. Timeout replay of the same sourceMessageId reuses completed. Crash-while-executing is uncertain, not a second write.",
+  unauthorizedNudge: "UNAUTHORIZED_IRREVERSIBLE + uncertain: true",
+} as const;
 
 export type EvalModelTurn = {
   /** Streamed model text pieces for one provider call, in arrival order. */
@@ -135,6 +211,22 @@ export function recordModelTurn(
     rawModelText: assembleRawModelText(chunks),
     callIndex,
   };
+}
+
+export type EvalChannelRecord = {
+  modelTurns: EvalModelTurn[];
+  assembledRaw: string;
+  deliveredFinal: string;
+  streamed: string[];
+  persisted: unknown;
+  notification: string;
+  publishedMessages: string[];
+  assistNudge: boolean;
+};
+
+export function assistNudgeOccurred(turns: readonly EvalModelTurn[]): boolean {
+  if (turns.length < 2) return false;
+  return /^\s*done\.?\s*$/i.test(turns[0]?.rawModelText ?? "");
 }
 
 export function createEvalTurnRecorder(): EvalTurnRecorder {
@@ -190,8 +282,23 @@ export function deliverAssistantFinal(input: {
   toolResults: readonly unknown[];
   ledger?: CompletionLedger;
   secrets?: readonly string[];
+  /** Explicit NO_RESPONSE / silent-allowed empty finals stay empty. */
+  allowEmpty?: boolean;
 }): DeliveredAssistantFinal {
   const assembledRaw = input.assembledRaw ?? input.rawText ?? "";
+  if (input.allowEmpty && !assembledRaw.trim()) {
+    return {
+      assembledRaw,
+      deliveredFinal: "",
+      modelTurns: input.modelTurns
+        ? input.modelTurns.map((turn) => ({
+            ...turn,
+            rawModelChunks: [...turn.rawModelChunks],
+          }))
+        : [],
+      evidence: collectToolEvidence(input.toolResults),
+    };
+  }
   const evidence = collectToolEvidence(input.toolResults);
   let deliveredFinal = sanitizeFinalText(assembledRaw, evidence, input.ledger);
   deliveredFinal = redactLabeledSecretSpans(deliveredFinal);
@@ -212,32 +319,68 @@ export function deliverAssistantFinal(input: {
   };
 }
 
-/** Every user-visible channel (final, stream, message_user, narration) uses this. */
+export type UserVisibleChannel =
+  | "final"
+  | "notification"
+  | "message_user"
+  | "message_bot"
+  | "progress"
+  | "stream"
+  | "takeover"
+  | "activity"
+  | "narration"
+  | "loop-guard"
+  | "attach";
+
+const CLAIM_SANITIZE_CHANNELS: ReadonlySet<UserVisibleChannel> = new Set([
+  "final",
+  "notification",
+  "message_user",
+  "loop-guard",
+]);
+
+/**
+ * Secrets always. Claim sanitizing and the honest-unverified fallback only on
+ * final/notification/message_user/loop-guard. Stream, takeover, activity, and
+ * narration keep operational text (captcha, step progress) intact.
+ */
 export function deliverUserVisibleText(
-  input: Parameters<typeof deliverAssistantFinal>[0],
+  input: Parameters<typeof deliverAssistantFinal>[0] & { channel?: UserVisibleChannel },
 ): string {
+  const channel = input.channel ?? "final";
+  if (!CLAIM_SANITIZE_CHANNELS.has(channel)) {
+    let next = input.assembledRaw ?? input.rawText ?? "";
+    next = redactLabeledSecretSpans(next);
+    if (input.secrets?.length) next = stripSecretEchoes(next, input.secrets).text;
+    return next;
+  }
   return deliverAssistantFinal(input).deliveredFinal;
 }
 
 export const EVAL_SCOPE = {
-  matchedConfigCapture: "not-this-slice",
-  toolBind: "37-scratch-not-run13-fleet",
+  matchedConfigCapture: "sanitized-input-contract-BOX-supplies-bodies-locally",
+  toolBind:
+    "matched-config-is-captured-service-52-plus-fleet-computer-connectors-not-37-scratch-not-this-head-catalog",
   historicalPinnedImage: "12/12-does-not-validate-this-runtime",
   n1: "continue-reuses-completed-irr-v1",
   n2: "new-sourceMessageId-new-irr-v1",
   unauthorizedNudge: "UNAUTHORIZED_IRREVERSIBLE+uncertain",
-  protectedResultHandoff: "offered-on-HEAD-not-on-37-bind-capture",
+  protectedResultHandoff: "eval-does-not-claim-real-model-handoff",
   window: "synthetic-131072-32768-not-live-attested",
-  liveEval: "blocked-until-offline-contract-and-live-window-attestation",
+  liveEval: "blocked-until-offline-contract-attestation-and-approval",
   tuningExposed: ["L1", "M1", "V1"],
   heldout: "sealed",
   g1Invariant:
     "no-harvest AND no-rewrite of defs; do not mine embedded <turn_context> user envelope or untrusted page labels into the known set; structured-field+SecretStore known values echo-strip context-safe, any shape",
   g3Channels:
-    "rawModelChunks+rawModelFinish per provider call; assembledRaw is post-nudge+concat; deliveredFinal is sanitized; deliverAssistantFinal input is assembledRaw not raw model",
+    "evalSink emits in-process rawModelChunks+rawModelFinish, assembledRaw, deliveredFinal, streamed, persisted, notification, publishedMessages, assistNudge; not HTTP raw request bytes",
+  g5: "schema exists on HEAD catalog; captured 52-bind and 37-scratch do not offer it; write authority not expanded; live handoff is not an eval claim",
   a1:
-    "click ok:true is not reset proof; reset claims need outcomeProof+same-subject verified-read; task-proof for A does not license order/license B",
-  a2: "every user-visible channel including stream/message_user/narration/takeover/loop-guard uses deliverUserVisibleText",
+    "click ok:true is not reset proof; reset claims need same-subject reset action AND verified-read; verified post-reset page is the production emitter (action=reset on verified-read); no fictional outcomeProof",
+  a2:
+    "secrets on every channel including message_bot/attach; claim fallback only on final/notification/message_user/loop-guard; stream/takeover/activity/narration/message_bot keep operational text",
+  a5a6:
+    "proof-token identity; send without bindable subject fail-closed; negation is not/never/n't not discourse no; glued is Done+[A-Z] only",
   g6Proof: "identity+subject+action; verified-read A does not license verified B",
   nonEnglish: "excluded-from-eval-explicit",
 } as const;

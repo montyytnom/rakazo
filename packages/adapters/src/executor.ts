@@ -53,7 +53,12 @@ import {
   isAttachmentImageMimeType,
   OPENAI_COMPATIBLE_PROVIDER_ID,
 } from "@rakazo/contracts";
-import type { ActionApprovalRule, ToolCallStreak } from "@rakazo/core";
+import type {
+  ActionApprovalRule,
+  EvalChannelRecord,
+  ToolCallStreak,
+  UserVisibleChannel,
+} from "@rakazo/core";
 import {
   appendTextSegment,
   appendToolCallSegment,
@@ -96,6 +101,7 @@ import {
   resolveTurnIntent,
   sameThreadIrreversibleOwner,
   sandboxCommandTimeoutMs,
+  assistNudgeOccurred,
   createEvalTurnRecorder,
   deliverAssistantFinal,
   deliverUserVisibleText,
@@ -103,6 +109,7 @@ import {
   stripSecretEchoes,
   bindOutcomeArtifact,
   emptyCompletionLedger,
+  harvestSecretsFromTool,
   harvestSecretsFromUnknown,
   TAKEOVER_COMPUTER_PENDING_STATE,
   threadIrreversibleEffectKey,
@@ -2759,6 +2766,11 @@ export interface ExecutorDeps {
   codexCatalog?: CodexLiveCatalog;
   /** Aborted when createApp stop() begins so in-flight continueRun boot waits exit promptly. */
   shutdownSignal?: AbortSignal;
+  /**
+   * Offline eval channel sink. continueRun emits one record after delivered
+   * text is computed. Not a production notification path.
+   */
+  evalSink?: (record: EvalChannelRecord) => void;
 }
 
 function isAuditableToolResult(value: unknown): value is {
@@ -4273,6 +4285,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
         let assembled = "";
         let currentTextSegment = "";
         const evalRecorder = createEvalTurnRecorder();
+        const streamedVisible: string[] = [];
         const turnToolResults: unknown[] = [];
         const turnIntent = resolveTurnIntent(
           { id: run.sourceMessageId, text: task.prompt },
@@ -4286,13 +4299,14 @@ export function createRunExecutor(deps: ExecutorDeps) {
           sourceMessageId: turnIntent.sourceMessageId ?? "",
           runId,
         });
-        const deliverVisible = (text: string) =>
+        const deliverVisible = (text: string, channel: UserVisibleChannel = "final") =>
           deliverUserVisibleText({
             assembledRaw: text,
             modelTurns: evalRecorder.snapshot(),
             toolResults: turnToolResults,
             ledger: turnLedger,
             secrets: runSecrets,
+            channel,
           });
         let messageSegments: MessageBlock[] = [];
         // Terminal subagent rows are published as their own messages (not appended to
@@ -4376,7 +4390,8 @@ export function createRunExecutor(deps: ExecutorDeps) {
         const flushProgress = async (force = false) => {
           if (scripted || !pendingProgress || isBackgroundRunTrigger(run.trigger)) return;
           if (!force && !endsSentence(pendingProgress)) return;
-          const safe = deliverVisible(pendingProgress);
+          const safe = deliverVisible(pendingProgress, "stream");
+          streamedVisible.push(safe);
           await deps.events.append({
             spaceId: run.spaceId,
             threadId: thread.id,
@@ -4395,7 +4410,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
         };
         const publishMidTurnNarration = async () => {
           const extracted = extractNarrationText(messageSegments, currentTextSegment);
-          const narration = clampUserProgressMessage(deliverVisible(extracted.text));
+          const narration = clampUserProgressMessage(deliverVisible(extracted.text, "narration"));
           const canPublish = canPublishDurableNarration();
           if (
             narration &&
@@ -5283,7 +5298,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
                 )
               : Promise.resolve(true);
           const finish = async (result: unknown) => {
-            for (const secret of harvestSecretsFromUnknown([result, args])) {
+            for (const secret of harvestSecretsFromTool(name, args, result)) {
               if (!runSecrets.includes(secret)) runSecrets.push(secret);
             }
             turnToolResults.push(result);
@@ -5593,8 +5608,14 @@ export function createRunExecutor(deps: ExecutorDeps) {
                   filePath,
                   bytes,
                   operationId: executionId,
-                  name: typeof args.name === "string" ? args.name : undefined,
-                  description: typeof args.description === "string" ? args.description : undefined,
+                  name:
+                    typeof args.name === "string"
+                      ? deliverVisible(args.name, "attach")
+                      : undefined,
+                  description:
+                    typeof args.description === "string"
+                      ? deliverVisible(args.description, "attach")
+                      : undefined,
                 },
               );
               await publishMessage(deps, run, "bot", [attached.block]);
@@ -6837,9 +6858,11 @@ export function createRunExecutor(deps: ExecutorDeps) {
               },
               runId,
               spawnKey: effectKey,
-              name: String(args.name ?? ""),
-              title: args.title ? String(args.title) : undefined,
-              description: args.description ? String(args.description) : undefined,
+              name: deliverVisible(String(args.name ?? ""), "attach"),
+              title: args.title ? deliverVisible(String(args.title), "attach") : undefined,
+              description: args.description
+                ? deliverVisible(String(args.description), "attach")
+                : undefined,
               instructions: args.instructions ? String(args.instructions) : undefined,
               prompt: args.prompt ? String(args.prompt) : undefined,
               computerMode,
@@ -6972,7 +6995,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
             });
           }
           if (name === "message_user") {
-            const rawMessage = deliverVisible(String(args.message ?? ""));
+            const rawMessage = deliverVisible(String(args.message ?? ""), "message_user");
             const maxLength = messageUserMaxLength();
             const text = clampUserProgressMessage(rawMessage, maxLength);
             if (!text) return finish({ error: "message is required" });
@@ -7013,7 +7036,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
               {
                 bot_id: args.bot_id ? String(args.bot_id) : undefined,
                 confirm_name: args.confirm_name ? String(args.confirm_name) : undefined,
-                message: redactSecrets(String(args.message ?? ""), runSecrets),
+                message: deliverVisible(String(args.message ?? ""), "message_bot"),
                 intent: args.intent as
                   | "request"
                   | "result"
@@ -7059,7 +7082,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
               { id: bot.id, name: bot.name },
               {
                 address: args.address ? String(args.address) : undefined,
-                message: redactSecrets(String(args.message ?? ""), runSecrets),
+                message: deliverVisible(String(args.message ?? ""), "message_bot"),
                 deliveryKey: effectKey,
               },
             );
@@ -7074,7 +7097,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
             const result = await handoffToGroupBot(deps, run, thread.groupId, {
               bot_id: args.bot_id ? String(args.bot_id) : undefined,
               confirm_name: args.confirm_name ? String(args.confirm_name) : undefined,
-              message: String(args.message ?? ""),
+              message: deliverVisible(String(args.message ?? ""), "message_bot"),
             });
             if ("ok" in result && result.ok) handedOff = true;
             return finish(result);
@@ -7622,7 +7645,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
                 type: "thread.progress",
                 runId,
                 payload: {
-                  text: deliverVisible(event.text),
+                  text: deliverVisible(event.text, "activity"),
                   ...(event.activity ? { activity: true } : {}),
                 },
               });
@@ -7670,12 +7693,12 @@ export function createRunExecutor(deps: ExecutorDeps) {
               if (!(await renewRunLease(deps, runId, workerId, fence))) return;
               // The user takes over the computer's screen, so it must be up before the run waits.
               await runComputer.get();
-              const safeReason = deliverVisible(event.reason);
+              const safeReason = deliverVisible(event.reason, "takeover");
               // Publish pending narration as tagged mid-turn progress so reconciliation
               // does not treat pre-takeover text as the delegated final result.
               await publishMidTurnNarration();
               if (assembled.trim()) {
-                const narration = clampUserProgressMessage(deliverVisible(assembled));
+                const narration = clampUserProgressMessage(deliverVisible(assembled, "narration"));
                 if (narration && canPublishDurableNarration()) {
                   await publishMessage(
                     deps,
@@ -7760,7 +7783,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
                     "bot",
                     redactBlocks(messageSegments, runSecrets).map((block) =>
                       block.kind === "text"
-                        ? { ...block, text: deliverVisible(block.text) }
+                        ? { ...block, text: deliverVisible(block.text, "loop-guard") }
                         : block,
                     ),
                   );
@@ -8022,6 +8045,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
                     toolResults: turnToolResults,
                     ledger: turnLedger,
                     secrets: [...runSecrets, ...priorSecrets],
+                    allowEmpty: allowSilentEmptyRun && !silentReply.assembled.trim(),
                   }).deliveredFinal,
                 };
               });
@@ -8035,11 +8059,28 @@ export function createRunExecutor(deps: ExecutorDeps) {
                     toolResults: turnToolResults,
                     ledger: turnLedger,
                     secrets: [...runSecrets, ...priorSecrets],
+                    allowEmpty: allowSilentEmptyRun && !silentReply.assembled.trim(),
                   }).deliveredFinal,
                   blocks,
                 ),
                 runSecrets,
               );
+          const evalModelTurns = evalRecorder.snapshot();
+          const evalDelivered =
+            blocks
+              .filter((block): block is { kind: "text"; text: string } => block.kind === "text")
+              .map((block) => block.text)
+              .join("\n") || text;
+          deps.evalSink?.({
+            modelTurns: evalModelTurns,
+            assembledRaw: silentReply.assembled,
+            deliveredFinal: evalDelivered,
+            streamed: [...streamedVisible],
+            persisted: blocks,
+            notification: text,
+            publishedMessages: [...midTurnUserTexts],
+            assistNudge: assistNudgeOccurred(evalModelTurns),
+          });
           if (containsSecret(text, runSecrets)) {
             throw new Error("refusing to persist a secret in the thread");
           }

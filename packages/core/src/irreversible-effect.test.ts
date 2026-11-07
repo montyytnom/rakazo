@@ -29,6 +29,27 @@ describe("irreversible intent", () => {
     ).toBe(false);
   });
 
+  it("N2: a new sourceMessageId is a new irr:v1 even when the user text matches", () => {
+    const first = resolveTurnIntent({ id: "msg-1", text: "Text Pat: running late" });
+    const timeoutResend = resolveTurnIntent({ id: "msg-2", text: "Text Pat: running late" });
+    expect(timeoutResend.intentId).not.toBe(first.intentId);
+    expect(
+      threadIrreversibleEffectKey({
+        threadId: "thread-1",
+        intentId: first.intentId,
+        class: "send",
+        subject: "+15550100",
+      }),
+    ).not.toBe(
+      threadIrreversibleEffectKey({
+        threadId: "thread-1",
+        intentId: timeoutResend.intentId,
+        class: "send",
+        subject: "+15550100",
+      }),
+    );
+  });
+
   it("does not authorize irreversible work from a compacted summary", () => {
     const nudge = resolveTurnIntent({ text: "Continue" }, [
       { text: "Reset the fixture user password" },

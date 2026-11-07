@@ -178,6 +178,7 @@ function harness(
     connectorExecute?: () => AsyncGenerator<unknown>;
     effects?: Effect[];
     secretStore?: unknown;
+    secrets?: string[];
     finalText?: string;
     runtime?: {
       describe: () => { capabilities: { scripted: boolean } };
@@ -481,13 +482,14 @@ function harness(
       notify: vi.fn(async () => undefined),
       claimSteering: vi.fn(async () => []),
       pauseRunForInput: vi.fn(async () => true),
+      pauseRunForTakeover: vi.fn(async () => true),
       finalizeRun: vi.fn(async (input: { blocks?: unknown; outcome?: string }) => {
         finalized.push(input);
         return { continuationRunId: null };
       }),
     },
     jobs: { enqueue: vi.fn(async () => undefined) },
-    secrets: [],
+    secrets: options.secrets ?? [],
     secretStore: options.secretStore,
   } as never);
 
@@ -1336,7 +1338,44 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
     expect(src).toContain("deliverUserVisibleText");
     expect(src).toContain("deliverVisible");
     expect(src).toContain("classification: irreversible");
+    expect(src).toContain("deps.evalSink");
+    expect(src).toContain("assistNudgeOccurred");
+    expect(src).toContain("streamedVisible");
     expect(src).not.toMatch(/sanitizeFinalText\(block\.text/);
+  });
+
+  it("pass-after: runComposedEvalLoop drives AFTER continueRun and splits raw/assembled/delivered/nudge", async () => {
+    const { runComposedEvalLoop } = await import("./runtime-eval-loop.js");
+    const stub = await startCaptureStub({
+      modelId: captureRunModel("http://127.0.0.1/v1").id,
+      caseName: "g3-eval-loop",
+      replies: [
+        { kind: "sse", finish: "stop", events: [{ content: "Done" }] },
+        { kind: "sse", finish: "stop", events: [{ content: "The bag is in the cart." }] },
+        ...Array.from({ length: 6 }, (_, index) => ({
+          kind: "sse" as const,
+          finish: "stop" as const,
+          events: [{ content: `synthetic-stop-${index}` }],
+        })),
+      ],
+    });
+    try {
+      const result = await runComposedEvalLoop({
+        modelBaseUrl: stub.baseUrl,
+        prompt: "Put the bag in the cart",
+        runId: "run-g3-eval-loop",
+      });
+      expect(result.record, JSON.stringify(result.record)).not.toBeNull();
+      expect(result.record!.modelTurns.length).toBeGreaterThanOrEqual(1);
+      expect(result.record!.assembledRaw).not.toBe(result.record!.deliveredFinal);
+      expect(Array.isArray(result.record!.streamed)).toBe(true);
+      expect(result.record!.persisted).toBeTruthy();
+      expect(typeof result.record!.notification).toBe("string");
+      expect(Array.isArray(result.record!.publishedMessages)).toBe(true);
+      expect(typeof result.record!.assistNudge).toBe("boolean");
+    } finally {
+      await stub.close();
+    }
   });
 
   it("pass-after: stream and message_user go through deliverUserVisibleText, not raw model text", async () => {
@@ -1370,6 +1409,60 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
     expect(visible, visible).toMatch(/\[withheld\]|not verified/i);
   });
 
+  it("pass-after: takeover reason and activity/stream skip the final-claim fallback", async () => {
+    const createRunExecutor = await loadExecutor(afterExecutor);
+    const f = harness(createRunExecutor, {
+      runId: "run-a2-status-channels",
+      prompt: "Continue the checkout",
+      sourceMessageId: "msg-1",
+      graphical: true,
+      runtime: {
+        describe: () => ({ capabilities: { scripted: false } }),
+        run: async function* () {
+          yield { type: "progress" as const, text: "Sent message to Pat Lee", activity: true };
+          yield { type: "progress" as const, text: "Completed: opened the cart page", activity: true };
+          yield { type: "text" as const, text: "Step 1 done, moving on to step 2. " };
+          yield {
+            type: "takeover" as const,
+            reason: "Please complete the captcha so I can continue.",
+          };
+        },
+      },
+    });
+    await f.runTurn("run-a2-status-channels");
+    const visible = dump({
+      progress: f.progressEvents,
+      published: f.publishedMessages,
+    });
+    expect(visible, visible).toContain("Please complete the captcha so I can continue.");
+    expect(visible, visible).not.toMatch(/Outcome was not verified/);
+    expect(visible, visible).toContain("Sent message to Pat Lee");
+    expect(visible, visible).toContain("Completed: opened the cart page");
+    expect(visible, visible).toContain("Step 1 done, moving on to step 2.");
+  });
+
+  it("pass-after: message_bot strips secrets without the final fallback", async () => {
+    const createRunExecutor = await loadExecutor(afterExecutor);
+    const f = harness(createRunExecutor, {
+      runId: "run-a2-message-bot",
+      prompt: "Tell the sibling bot",
+      sourceMessageId: "msg-1",
+      graphical: false,
+      secrets: ["sunflower"],
+    });
+    f.setCalls([
+      {
+        name: "message_bot",
+        args: { bot_id: "bot-2", confirm_name: "Sibling", message: "Step 1 done. Password is sunflower." },
+        executionId: "mb-a2",
+      },
+    ]);
+    await f.runTurn("run-a2-message-bot");
+    const visible = dump({ results: f.results, published: f.publishedMessages });
+    expect(visible, visible).not.toContain("sunflower");
+    expect(visible, visible).not.toMatch(/Outcome was not verified/);
+  });
+
   it("composed AFTER pi-runtime has the exact pinned-image bare-done nudge", () => {
     const previous = process.env.RAKAZO_ASSIST_HARNESS;
     delete process.env.RAKAZO_ASSIST_HARNESS;
@@ -1395,6 +1488,7 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
       "packages/core/src/handoff-delivery.ts",
       "packages/adapters/src/protected-result.ts",
       "packages/adapters/src/runtime-eval-backend.ts",
+      "packages/adapters/src/runtime-eval-loop.ts",
       "packages/adapters/src/stale-element-recovery.ts",
       "packages/adapters/src/desktop-tool-contract.ts",
       "packages/adapters/src/model-stream-error.ts",

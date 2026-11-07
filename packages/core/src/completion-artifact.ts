@@ -8,7 +8,8 @@ const CLAIM_SPLIT = /(?:\. (?=[A-Z])|[;!?\n]| — | – |, but | but )/g;
  * Claim detection is English regex. Allowing a success claim is ledger-only.
  * Not a multilingual or semantic parser: non-English completions are left as-is.
  */
-const IDENTITY_CLAIM = /\b(signed in|logged in)\s+(as|with|using|via)\b/i;
+const IDENTITY_CLAIM =
+  /\b(?:(?:signed|logged)\s+in\s+(?:as|with|using|via)|(?:using|via)\s+(?:the\s+|your\s+)?[A-Za-z0-9._+-]+(?:\s+account)?)\b/i;
 const VERIFIED_CLAIM = /\b(verified|confirmed)\b/i;
 const SEND_CLAIM = /\b(sent|delivered|texted|went out)\b/i;
 const SEND_DENY = /\b(not (yet )?sent|hasn.t been sent|not delivered)\b/i;
@@ -16,16 +17,64 @@ const SEND_DENY = /\b(not (yet )?sent|hasn.t been sent|not delivered)\b/i;
  * Generic completed-action verbs. Not grader L1/M1/V1 phrase lists or amounts.
  * Bound to a current-intent ledger the same way as Done/All set.
  */
-const COMPLETED_ACTION = /\b(reassigned|posted|paid)\b/i;
-const RESET_CLAIM = /\b(it is reset|reset (?:is |was )?done)\b/i;
+const COMPLETED_ACTION = /\b(reassigned|paid|payment posted)\b/i;
+const RESET_CLAIM =
+  /\b(?:it is reset|reset (?:is |was )?done|(?:has been|have been|was|were) reset|password(?:\s+\w+){0,2}\s+reset)\b/i;
+const OUTCOME_CLAIM =
+  /\b(?:has been|have been|was|were)\s+(changed|updated|transferred|moved)\b/i;
 const SUCCESS_CLAIM =
   /\b(done|complete|completed|finished|success(?:ful(?:ly)?)?|all set|successfully changed|it is reset|reset (?:is |was )?done)\b/i;
-/** Fallback Done concatenated onto the next assistant turn has no separator or word boundary. */
-const GLUED_SUCCESS =
-  /^(done|ok|okay|completed?|finished|all done|task complete|it'?s done)(?=[A-Za-z0-9_-])/i;
+/**
+ * Bare-Done glued onto the next turn. Only `Done`/`Finished` plus a capital
+ * letter — never `ok`/`completed?`, which mangle OKRs and Completely.
+ */
+const GLUED_SUCCESS = /^(done|finished|all done|task complete|it'?s done)(?=[A-Z])/i;
 const EMAIL = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
 const LOGIN_PAGE = /\b(sign in|log in|login)\b/i;
 const HONEST_UNVERIFIED = "Outcome was not verified.";
+/** Function/claim words, not entity names. Used to drop noise from proof-token sets. */
+const PROOF_SKIP = new Set([
+  "this",
+  "that",
+  "been",
+  "have",
+  "from",
+  "with",
+  "page",
+  "result",
+  "outcome",
+  "status",
+  "your",
+  "their",
+  "them",
+  "they",
+  "what",
+  "when",
+  "were",
+  "will",
+  "into",
+  "over",
+  "than",
+  "then",
+  "also",
+  "done",
+  "complete",
+  "completed",
+  "finished",
+  "success",
+  "successful",
+  "successfully",
+  "using",
+  "via",
+  "account",
+  "signed",
+  "logged",
+  "verified",
+  "confirmed",
+  "sent",
+  "delivered",
+  "texted",
+]);
 
 export type ToolEvidence = {
   texts: string[];
@@ -109,11 +158,42 @@ function sameIdentity(
   );
 }
 
+/** Whole-token proof identity. Substring `Sam`/`Sample` and `your` never match. */
+export function proofTokens(value: string): string[] {
+  return value
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((token) => token.length >= 4 && !PROOF_SKIP.has(token));
+}
+
+function pageUrlKey(value: string): string | undefined {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
+    return `${url.origin}${url.pathname}`.replace(/\/$/, "").toLowerCase();
+  } catch {
+    return undefined;
+  }
+}
+
 function subjectsOverlap(left: string, right: string): boolean {
   const a = left.trim().toLowerCase();
   const b = right.trim().toLowerCase();
   if (!a || !b) return false;
-  return a === b || a.includes(b) || b.includes(a);
+  if (a === b) return true;
+  const urlA = pageUrlKey(left);
+  const urlB = pageUrlKey(right);
+  if (urlA && urlB) return urlA === urlB;
+  const leftTokens = proofTokens(left);
+  const rightTokens = proofTokens(right);
+  return leftTokens.some((token) => rightTokens.includes(token));
+}
+
+function evidenceHasExactToken(blob: string, token: string): boolean {
+  const trimmed = token.trim();
+  if (!trimmed) return false;
+  const escaped = trimmed.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|[^A-Za-z0-9])${escaped}([^A-Za-z0-9]|$)`, "i").test(blob);
 }
 
 export function ledgerHasBoundClass(
@@ -146,9 +226,11 @@ export function ledgerHasBoundAction(
 }
 
 /**
- * Structured proof only. Boolean `verified`/`sent`/`outcomeProof` fields on this
- * turn's tool result, bound to the current intent+sourceMessageId+runId.
- * Page text, `{ok:true}`, login snapshots, 404s, and other runs do not count.
+ * Structured proof only. Boolean `verified`/`sent` fields on this turn's tool
+ * result, bound to the current intent+sourceMessageId+runId. Reset proof is a
+ * verified-read of post-reset page copy (action=reset), not a fictional
+ * `outcomeProof` field. Page text, `{ok:true}`, login snapshots, 404s, and
+ * other runs do not count.
  */
 export function bindOutcomeArtifact(input: {
   result: unknown;
@@ -165,25 +247,6 @@ export function bindOutcomeArtifact(input: {
   const record = result as Record<string, unknown>;
   const args = input.args ?? {};
   const irreversible = input.classification ?? classifyIrreversibleTool(toolName, args);
-  if (record.outcomeProof === true) {
-    if (record.intentId !== intentId || record.sourceMessageId !== sourceMessageId) return null;
-    if (typeof record.runId === "string" && record.runId !== runId) return null;
-    const subject =
-      (typeof record.subject === "string" && record.subject.trim()) ||
-      irreversible?.subject ||
-      "";
-    if (!subject) return null;
-    const action: OutcomeAction =
-      record.action === "reset" || irreversible?.class === "password-reset" ? "reset" : "change";
-    return {
-      class: "task-proof",
-      action,
-      intentId,
-      sourceMessageId,
-      runId,
-      subject,
-    };
-  }
   if (record.sent === true && irreversible?.class === "send") {
     return {
       class: "delivered-send",
@@ -200,7 +263,7 @@ export function bindOutcomeArtifact(input: {
     if (!subject || subject.replace(/\s+/g, "").length < 4) return null;
     return {
       class: "verified-read",
-      action: "read",
+      action: isResetSuccessPage(record) ? "reset" : "read",
       intentId,
       sourceMessageId,
       runId,
@@ -227,6 +290,42 @@ function isInsufficientRead(record: Record<string, unknown>): boolean {
   return false;
 }
 
+/** Post-reset page copy. Not a click, not outcomeProof invented on the executor. */
+function isResetSuccessPage(record: Record<string, unknown>): boolean {
+  const blob = pageBlob(record);
+  return /\b(?:password (?:was |has been )?(?:reset|changed|updated)|reset password successful|password reset successful)\b/i.test(
+    blob,
+  );
+}
+
+/**
+ * Reset claims need a reset action and a verified-read of the SAME subject.
+ * Undefined claim hint does not license reset(A)+read(B).
+ */
+export function ledgerHasSameSubjectResetProof(
+  ledger: CompletionLedger | undefined,
+  claimSubject?: string,
+): boolean {
+  if (!ledger?.intentId || !ledger.sourceMessageId || !ledger.runId) return false;
+  const hint = claimSubject?.trim();
+  const resets = ledger.artifacts.filter(
+    (artifact) => artifact.action === "reset" && sameIdentity(artifact, ledger) && artifact.subject,
+  );
+  const reads = ledger.artifacts.filter(
+    (artifact) =>
+      artifact.class === "verified-read" && sameIdentity(artifact, ledger) && artifact.subject,
+  );
+  return resets.some((reset) =>
+    reads.some((read) => {
+      if (!subjectsOverlap(reset.subject, read.subject)) return false;
+      if (hint && !subjectsOverlap(reset.subject, hint) && !subjectsOverlap(read.subject, hint)) {
+        return false;
+      }
+      return true;
+    }),
+  );
+}
+
 export function clauses(text: string): string[] {
   return text
     .split(CLAIM_SPLIT)
@@ -240,7 +339,7 @@ export function clauseNegatesAt(clause: string, index: number): boolean {
   const tokens = before.trim().split(/\s+/).slice(-3);
   return tokens.some((token) => {
     const word = token.replace(/[^A-Za-z']/g, "");
-    return /^(not|never|no)$/i.test(word) || /n['’]t$/i.test(word);
+    return /^(not|never)$/i.test(word) || /n['’]t$/i.test(word);
   });
 }
 
@@ -278,23 +377,16 @@ export function unsupportedClaims(
       break;
     }
     const named = claimedIdentitySubject(claim);
-    if (emails.length === 0 && named && !blob.toLowerCase().includes(named.toLowerCase())) {
+    if (emails.length === 0 && named && !evidenceHasExactToken(blob, named)) {
       violations.push("identity");
       break;
     }
   }
   const verifiedClaims = positiveClaims(finalText, VERIFIED_CLAIM);
   if (verifiedClaims.length > 0) {
-    const licensed = verifiedClaims.every((claim) => {
-      const subject = claimResourceSubject(claim);
-      if (ledgerHasClass(ledger, "task-proof") && !subject) return true;
-      if (!subject) return false;
-      return (
-        ledgerHasBoundClass(ledger, "verified-read", subject) ||
-        ledgerHasBoundAction(ledger, "reset", subject) ||
-        ledgerHasBoundAction(ledger, "change", subject)
-      );
-    });
+    const licensed = verifiedClaims.every((claim) =>
+      claimLicensedByProof(ledger, claim, ["verified-read"], ["reset", "change"]),
+    );
     if (!licensed) violations.push("verified");
   }
   const sendYes = positiveClaims(finalText, SEND_CLAIM);
@@ -304,31 +396,33 @@ export function unsupportedClaims(
   if (sendYes.length > 0 && evidence.sent !== false) {
     const sendLicensed = sendYes.every((claim) => {
       const subject = sendClaimSubject(claim);
+      if (!subject) return false;
       return ledgerHasBoundAction(ledger, "send", subject);
     });
     if (!sendLicensed) violations.push("send-without-artifact");
   }
   const resetClaims = positiveClaims(finalText, RESET_CLAIM);
   const completedClaims = positiveClaims(finalText, COMPLETED_ACTION);
+  const outcomeClaims = positiveClaims(finalText, OUTCOME_CLAIM);
   const successClaims = positiveClaims(finalText, SUCCESS_CLAIM);
-  const genericSuccess = successClaims.length > 0 || hasGluedUnsupportedCompletion(finalText);
+  const genericSuccess =
+    successClaims.length > 0 ||
+    outcomeClaims.length > 0 ||
+    hasGluedUnsupportedCompletion(finalText);
   if (resetClaims.length > 0) {
-    const resetLicensed = resetClaims.every((claim) => {
-      const subject = successNamedSubject(claim);
-      return (
-        ledgerHasBoundAction(ledger, "reset", subject) &&
-        ledgerHasBoundClass(ledger, "verified-read", subject)
-      );
-    });
+    const resetLicensed = resetClaims.every((claim) =>
+      ledgerHasSameSubjectResetProof(ledger, namedProofHint(claim)),
+    );
     if (!resetLicensed) violations.push("success-without-artifact");
   } else if (completedClaims.length > 0) {
-    const changeLicensed = completedClaims.every((claim) =>
-      ledgerHasBoundAction(ledger, "change", successNamedSubject(claim)),
-    );
+    const changeLicensed = completedClaims.every((claim) => {
+      const hint = namedProofHint(claim);
+      return ledgerHasBoundAction(ledger, "change", hint);
+    });
     if (!changeLicensed) violations.push("success-without-artifact");
   } else if (genericSuccess) {
-    const licensed = successClaims.every((claim) => {
-      const named = successNamedSubject(claim);
+    const licensed = [...successClaims, ...outcomeClaims].every((claim) => {
+      const named = namedProofHint(claim);
       if (named) {
         return (
           ledgerHasBoundClass(ledger, "task-proof", named) ||
@@ -344,23 +438,36 @@ export function unsupportedClaims(
   return [...new Set(violations)];
 }
 
-function claimResourceSubject(claim: string): string | undefined {
-  const match = claim.match(/(.{0,48}?)\b(verified|confirmed)\b/i);
-  const before = match?.[1]?.trim() ?? "";
-  const tokens = before
-    .split(/[\s:/?#]+/)
-    .map((token) => token.replace(/[^A-Za-z0-9-]/g, ""))
-    .filter(
-      (token) =>
-        token.length >= 4 &&
-        !/^(this|that|been|have|from|with|page|result|outcome|status|been)$/i.test(token),
-    );
-  return tokens.at(-1);
+function namedProofHint(claim: string): string | undefined {
+  const skip = new Set([
+    "reset",
+    "changed",
+    "updated",
+    "transferred",
+    "moved",
+    "reassigned",
+    "posted",
+    "paid",
+    "placed",
+  ]);
+  return proofTokens(claim).find((token) => !skip.has(token));
 }
 
-function successNamedSubject(claim: string): string | undefined {
-  const match = claim.match(/\b(order|license|cart|billing)\b/i);
-  return match?.[1];
+function claimLicensedByProof(
+  ledger: CompletionLedger | undefined,
+  claim: string,
+  classes: OutcomeArtifactClass[],
+  actions: OutcomeAction[],
+): boolean {
+  if (!ledger?.intentId || !ledger.sourceMessageId || !ledger.runId) return false;
+  const tokens = proofTokens(claim);
+  if (tokens.length === 0) return false;
+  return ledger.artifacts.some((artifact) => {
+    if (!sameIdentity(artifact, ledger)) return false;
+    if (!classes.includes(artifact.class) && !actions.includes(artifact.action)) return false;
+    if (!artifact.subject) return false;
+    return proofTokens(artifact.subject).some((token) => tokens.includes(token));
+  });
 }
 
 function sendClaimSubject(claim: string): string | undefined {
@@ -368,19 +475,26 @@ function sendClaimSubject(claim: string): string | undefined {
   if (phone?.[0]) return phone[0];
   const email = claim.match(EMAIL)?.[0];
   if (email) return email;
-  return undefined;
+  const named = claim.match(
+    /\b(?:to|for)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?|[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+)/,
+  );
+  return named?.[1]?.trim();
 }
 
 function claimedIdentitySubject(claim: string): string | undefined {
-  const match = claim.match(/\b(?:signed in|logged in)\s+(?:as|with|using|via)\s+(.+)/i);
-  const rest = match?.[1]?.trim() ?? "";
-  const token =
-    rest
-      .split(/[\s,./]+/)
-      .map((part) => part.replace(/^[@]+/, ""))
-      .find((part) => part.length >= 2 && !/^(the|a|an)$/i.test(part)) ?? "";
-  if (token.length < 2) return undefined;
-  return token;
+  const signed = claim.match(/\b(?:signed in|logged in)\s+(?:as|with|using|via)\s+(.+)/i);
+  const rest = signed?.[1]?.trim() ?? "";
+  const fromSigned = rest
+    .split(/[\s,./]+/)
+    .map((part) => part.replace(/^[@]+/, ""))
+    .find((part) => part.length >= 2 && !/^(the|a|an|your|my|our)$/i.test(part));
+  if (fromSigned && fromSigned.length >= 2) return fromSigned;
+  const using = claim.match(
+    /\b(?:using|via)\s+(?:the\s+|your\s+)?([A-Za-z0-9._+-]+)(?:\s+account)?/i,
+  );
+  const token = using?.[1]?.trim() ?? "";
+  if (!token || /^(the|a|an|your|my|our)$/i.test(token)) return undefined;
+  return token.length >= 2 ? token : undefined;
 }
 
 /** Terminal final after a bare-done follow-up may glue the fallback Done to the next turn. */
@@ -441,7 +555,9 @@ export function sanitizeFinalText(
 function actionClaimUnverified(clause: string): boolean {
   return (
     (SUCCESS_CLAIM.test(clause) && !clauseNegatesClaim(clause, SUCCESS_CLAIM)) ||
-    (COMPLETED_ACTION.test(clause) && !clauseNegatesClaim(clause, COMPLETED_ACTION))
+    (COMPLETED_ACTION.test(clause) && !clauseNegatesClaim(clause, COMPLETED_ACTION)) ||
+    (RESET_CLAIM.test(clause) && !clauseNegatesClaim(clause, RESET_CLAIM)) ||
+    (OUTCOME_CLAIM.test(clause) && !clauseNegatesClaim(clause, OUTCOME_CLAIM))
   );
 }
 

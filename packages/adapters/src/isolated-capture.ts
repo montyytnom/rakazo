@@ -169,7 +169,13 @@ export const VOLATILE_FIELDS = [
   },
 ] as const;
 
+/**
+ * This HEAD catalog count. Not the captured-service matched-config 52.
+ * Isolated-capture inventory on this tree is not a matched-config claim.
+ */
 export const REVIEWER_EXPECTED_WORKER_BUILTINS = 74;
+/** Captured-service matched-config offered builtins. Not this HEAD catalog. */
+export const CAPTURED_SERVICE_OFFERED_BUILTINS = 52;
 
 /** Synthetic fixtures for real assemblers. Not live directory, skills, or secrets. */
 export const SYNTHETIC_SKILL_CATALOG: SkillCatalogEntry[] = [

@@ -301,7 +301,7 @@ it("redacts restored narration", async () => {
     { trigger: "routine" },
   );
   expect(finalizeRun.mock.calls[0]![0].blocks.filter((block) => block.kind === "text")).toEqual([
-    { kind: "text", text: "The [redacted] is configured." },
+    { kind: "text", text: "The [withheld] is configured." },
   ]);
 });
 

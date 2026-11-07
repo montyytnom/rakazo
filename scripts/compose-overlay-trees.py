@@ -35,6 +35,7 @@ NEW_HELPERS = [
     "packages/adapters/src/desktop-tool-contract.ts",
     "packages/adapters/src/protected-result.ts",
     "packages/adapters/src/runtime-eval-backend.ts",
+    "packages/adapters/src/runtime-eval-loop.ts",
     "packages/adapters/src/model-stream-error.ts",
 ]
 
@@ -249,6 +250,7 @@ def patch_executor(path: Path) -> None:
         "  threadIrreversibleEffectKey,\n"
         "  UNAUTHORIZED_IRREVERSIBLE,\n"
         "  collectToolEvidence,\n"
+        "  assistNudgeOccurred,\n"
         "  createEvalTurnRecorder,\n"
         "  deliverAssistantFinal,\n"
         "  deliverUserVisibleText,\n"
@@ -257,6 +259,7 @@ def patch_executor(path: Path) -> None:
         "  bindOutcomeArtifact,\n"
         "  emptyCompletionLedger,\n"
         "  harvestSecretsFromUnknown,\n"
+        "  harvestSecretsFromTool,\n"
         "} from \"@rakazo/core\";\n",
         "core irreversible imports",
     )
@@ -366,7 +369,7 @@ def patch_executor(path: Path) -> None:
         "              store: protectedResults,\n"
         "              vault: protectedVault,\n"
         "            });\n"
-        "            for (const secret of harvestSecretsFromUnknown([result, args])) {\n"
+        "            for (const secret of harvestSecretsFromTool(name, args, result)) {\n"
         "              if (!runSecrets.includes(secret)) runSecrets.push(secret);\n"
         "            }\n"
         "            turnToolResults.push(protectedPage.model);\n"
@@ -548,6 +551,7 @@ def patch_executor(path: Path) -> None:
         "                    toolResults: turnToolResults,\n"
         "                    ledger: turnLedger,\n"
         "                    secrets: [...runSecrets, ...priorSecrets],\n"
+        "                    allowEmpty: allowSilentEmptyRun && !silentReply.assembled.trim(),\n"
         "                  }).deliveredFinal,\n"
         "                };\n"
         "              });\n"
@@ -561,11 +565,28 @@ def patch_executor(path: Path) -> None:
         "                    toolResults: turnToolResults,\n"
         "                    ledger: turnLedger,\n"
         "                    secrets: [...runSecrets, ...priorSecrets],\n"
+        "                    allowEmpty: allowSilentEmptyRun && !silentReply.assembled.trim(),\n"
         "                  }).deliveredFinal,\n"
         "                  blocks,\n"
         "                ),\n"
         "                runSecrets,\n"
-        "              );\n",
+        "              );\n"
+        "          const evalModelTurns = evalRecorder.snapshot();\n"
+        "          const evalDelivered =\n"
+        "            blocks\n"
+        "              .filter((block) => block.kind === \"text\")\n"
+        "              .map((block) => (block.kind === \"text\" ? block.text : \"\"))\n"
+        "              .join(\"\\n\") || text;\n"
+        "          deps.evalSink?.({\n"
+        "            modelTurns: evalModelTurns,\n"
+        "            assembledRaw: silentReply.assembled,\n"
+        "            deliveredFinal: evalDelivered,\n"
+        "            streamed: [...streamedVisible],\n"
+        "            persisted: blocks,\n"
+        "            notification: text,\n"
+        "            publishedMessages: [...midTurnUserTexts],\n"
+        "            assistNudge: assistNudgeOccurred(evalModelTurns),\n"
+        "          });\n",
         "final reply secret/completion sanitization",
     )
     replace_once(
@@ -590,6 +611,7 @@ def patch_executor(path: Path) -> None:
         "        let assembled = \"\";\n"
         "        let currentTextSegment = \"\";\n"
         "        const evalRecorder = createEvalTurnRecorder();\n"
+        "        const streamedVisible: string[] = [];\n"
         "        const turnToolResults: unknown[] = [];\n"
         "        const turnIntent = resolveTurnIntent(\n"
         "          { id: run.sourceMessageId, text: task.prompt },\n"
@@ -603,13 +625,14 @@ def patch_executor(path: Path) -> None:
         "          sourceMessageId: turnIntent.sourceMessageId ?? \"\",\n"
         "          runId,\n"
         "        });\n"
-        "        const deliverVisible = (text: string) =>\n"
+        "        const deliverVisible = (text: string, channel: \"final\" | \"notification\" | \"message_user\" | \"message_bot\" | \"progress\" | \"stream\" | \"takeover\" | \"activity\" | \"narration\" | \"loop-guard\" | \"attach\" = \"final\") =>\n"
         "          deliverUserVisibleText({\n"
         "            assembledRaw: text,\n"
         "            modelTurns: evalRecorder.snapshot(),\n"
         "            toolResults: turnToolResults,\n"
         "            ledger: turnLedger,\n"
         "            secrets: runSecrets,\n"
+        "            channel,\n"
         "          });\n",
         "eval turn recorder",
     )
@@ -659,7 +682,8 @@ def patch_executor(path: Path) -> None:
         "        const flushProgress = async (force = false) => {\n"
         "          if (scripted || !pendingProgress || isBackgroundRunTrigger(run.trigger)) return;\n"
         "          if (!force && !endsSentence(pendingProgress)) return;\n"
-        "          const safe = deliverVisible(pendingProgress);\n"
+        "          const safe = deliverVisible(pendingProgress, \"stream\");\n"
+        "          streamedVisible.push(safe);\n"
         "          await deps.events.append({\n"
         "            spaceId: run.spaceId,\n"
         "            threadId: thread.id,\n"
@@ -679,25 +703,25 @@ def patch_executor(path: Path) -> None:
         "          if (name === \"message_user\") {\n"
         "            const rawMessage = redactSecrets(String(args.message ?? \"\"), runSecrets);\n",
         "          if (name === \"message_user\") {\n"
-        "            const rawMessage = deliverVisible(String(args.message ?? \"\"));\n",
+        "            const rawMessage = deliverVisible(String(args.message ?? \"\"), \"message_user\");\n",
         "message_user deliverVisible",
     )
     replace_once(
         path,
         "          const narration = clampUserProgressMessage(redactSecrets(extracted.text, runSecrets));\n",
-        "          const narration = clampUserProgressMessage(deliverVisible(extracted.text));\n",
+        "          const narration = clampUserProgressMessage(deliverVisible(extracted.text, \"narration\"));\n",
         "midturn deliverVisible",
     )
     replace_once(
         path,
         "              const safeReason = redactSecrets(event.reason, runSecrets);\n",
-        "              const safeReason = deliverVisible(event.reason);\n",
+        "              const safeReason = deliverVisible(event.reason, \"takeover\");\n",
         "takeover deliverVisible",
     )
     replace_once(
         path,
         "                const narration = clampUserProgressMessage(redactSecrets(assembled, runSecrets));\n",
-        "                const narration = clampUserProgressMessage(deliverVisible(assembled));\n",
+        "                const narration = clampUserProgressMessage(deliverVisible(assembled, \"narration\"));\n",
         "takeover narration deliverVisible",
     )
     replace_once(
@@ -747,12 +771,36 @@ def patch_executor(path: Path) -> None:
         "                    \"bot\",\n"
         "                    redactBlocks(messageSegments, runSecrets).map((block) =>\n"
         "                      block.kind === \"text\"\n"
-        "                        ? { ...block, text: deliverVisible(block.text) }\n"
+        "                        ? { ...block, text: deliverVisible(block.text, \"loop-guard\") }\n"
         "                        : block,\n"
         "                    ),\n"
         "                  );\n"
         "                }\n",
         "loop-guard deliverVisible",
+    )
+    replace_once(
+        path,
+        "                payload: {\n"
+        "                  text: redactSecrets(event.text, runSecrets),\n"
+        "                  ...(event.activity ? { activity: true } : {}),\n"
+        "                },\n",
+        "                payload: {\n"
+        "                  text: deliverVisible(event.text, \"activity\"),\n"
+        "                  ...(event.activity ? { activity: true } : {}),\n"
+        "                },\n",
+        "activity deliverVisible",
+    )
+    replace_once(
+        path,
+        "                message: redactSecrets(\n"
+        "                  await assistHandoffMessage(deps.prisma, thread.id, args),\n"
+        "                  runSecrets,\n"
+        "                ),\n",
+        "                message: deliverVisible(\n"
+        "                  await assistHandoffMessage(deps.prisma, thread.id, args),\n"
+        "                  \"message_bot\",\n"
+        "                ),\n",
+        "message_bot deliverVisible",
     )
 
 

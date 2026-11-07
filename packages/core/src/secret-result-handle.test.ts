@@ -3,6 +3,7 @@ import {
   extractGeneratedPassword,
   harvestSecretsFromRequestContext,
   harvestSecretsFromText,
+  harvestSecretsFromTool,
   harvestSecretsFromUnknown,
   issueProtectedResult,
   looksLikeLabeledSecret,
@@ -233,6 +234,7 @@ describe("protected result handles", () => {
     expect(stripped.systemPrompt).toBe(request.systemPrompt);
     expect(stripped.tools).toBe(request.tools);
     expect(stripped.systemPrompt).toContain(secret);
+    expect(stripped.messages[0]!.content).toContain(secret);
   });
 
   it("untrusted page labelled password is not a known secret and does not rewrite defs", () => {
@@ -322,6 +324,56 @@ describe("protected result handles", () => {
       { role: "user", content: "Reset password successful." },
     ];
     expect(stripSecretTranscriptMessages(messages)).toBe(messages);
+  });
+
+  it("browser_act fill_secret secret is a login name; add_mcp_server.secret is a token", () => {
+    const args = {
+      actions: [{ kind: "fill_secret", secret: "shop-login", field: "password" }],
+    };
+    expect(harvestSecretsFromTool("browser_act", args, { ok: true, tree: "(filled from shop-login)" })).not.toContain(
+      "shop-login",
+    );
+    expect(redactProtectedTree(args)).toEqual(args);
+    expect(
+      harvestSecretsFromTool("list_secrets", {}, { secrets: [{ name: "shop-login" }] }),
+    ).not.toContain("shop-login");
+    expect(harvestSecretsFromTool("add_mcp_server", { secret: "mcpTok#9f" }, { ok: true })).toContain(
+      "mcpTok#9f",
+    );
+  });
+
+  it("serialized tool-result page text does not poison other refs", () => {
+    const sku = "REF-A1b2C3";
+    const serialized = [{ type: "text", text: JSON.stringify({ tree: `new password: ${sku}` }) }];
+    expect(harvestSecretsFromUnknown(serialized)).not.toContain(sku);
+    const tree = redactProtectedTree({
+      serialized,
+      other: `Your order ref is ${sku}.`,
+    });
+    expect(JSON.stringify(tree)).toContain(`Your order ref is ${sku}.`);
+  });
+
+  it("numeric structured pins do not erase dates", () => {
+    expect(redactProtectedTree({ pin: "2026", note: "See you Nov 7, 2026." })).toEqual({
+      pin: "[withheld]",
+      note: "See you Nov 7, 2026.",
+    });
+    expect(stripSecretEchoes("See you Nov 7, 2026.", ["2026"]).text).toBe("See you Nov 7, 2026.");
+    expect(stripSecretEchoes("Order 482913 ships Tuesday", ["482913"]).text).toBe(
+      "Order 482913 ships Tuesday",
+    );
+    expect(stripSecretEchoes("Jordan's code is 482913", ["482913"]).text).toContain("[withheld]");
+  });
+
+  it("dictionary structured secrets stay span-bounded and do not erase ordinary words", () => {
+    expect(redactProtectedTree({ password: "sunflower", note: "The sunflowers need water." })).toEqual({
+      password: "[withheld]",
+      note: "The sunflowers need water.",
+    });
+    expect(stripSecretEchoes("The sunflowers need water.", ["sunflower"]).text).toBe(
+      "The sunflowers need water.",
+    );
+    expect(stripSecretEchoes("Use sunflower to log in", ["sunflower"]).text).toContain("[withheld]");
   });
 });
 

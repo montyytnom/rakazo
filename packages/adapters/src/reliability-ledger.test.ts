@@ -85,6 +85,38 @@ describe("cross-run irreversible ledger", () => {
     expect(f.stored.size).toBe(1);
   });
 
+  it("N1 Continue reuses completed irr:v1; N2 new sourceMessageId does not", () => {
+    const first = resolveTurnIntent({ id: "msg-1", text: "Text Pat: running late" });
+    const cont = resolveTurnIntent({ id: "msg-2", text: "Continue" }, [
+      { id: "msg-1", text: "Text Pat: running late" },
+    ]);
+    const resend = resolveTurnIntent({ id: "msg-3", text: "Text Pat: running late" });
+    expect(cont.intentId).toBe(first.intentId);
+    expect(resend.intentId).not.toBe(first.intentId);
+    const firstKey = threadIrreversibleEffectKey({
+      threadId: "thread-1",
+      intentId: first.intentId,
+      class: "send",
+      subject: "+15550100",
+    });
+    expect(
+      threadIrreversibleEffectKey({
+        threadId: "thread-1",
+        intentId: cont.intentId,
+        class: "send",
+        subject: "+15550100",
+      }),
+    ).toBe(firstKey);
+    expect(
+      threadIrreversibleEffectKey({
+        threadId: "thread-1",
+        intentId: resend.intentId,
+        class: "send",
+        subject: "+15550100",
+      }),
+    ).not.toBe(firstKey);
+  });
+
   it("does not reuse a password reset across a new user intent", async () => {
     const firstIntent = resolveTurnIntent({
       id: "msg-1",
