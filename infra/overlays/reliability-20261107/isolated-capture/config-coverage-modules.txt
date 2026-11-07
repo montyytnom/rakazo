@@ -1,0 +1,11 @@
+# role	live basename under packages/adapters/src	optional excerpt (bundle-relative)
+promptbuilder,toolbuilder	executor.ts	config-coverage-overlay-excerpts/executor.env.ts
+toolbuilder	builtin-tools.ts	config-coverage-overlay-excerpts/builtin-tools.env.ts
+serializer	pi-openai-compatible-provider.ts	config-coverage-overlay-excerpts/provider.env.ts
+serializer	fast-thinking.ts	config-coverage-overlay-excerpts/fast-thinking.env.ts
+parser_guard	pi-runtime.ts	config-coverage-overlay-excerpts/pi-runtime.env.ts
+parser_guard	pi-runtime-limits.ts	config-coverage-overlay-excerpts/pi-runtime-limits.env.ts
+parser_guard	pi-tool-call-guard.ts
+promptbuilder	botdir.ts	config-coverage-overlay-excerpts/botdir.env.ts
+compaction	history-compaction.ts	config-coverage-overlay-excerpts/history-compaction.env.ts
+compaction	ctxmem.ts	config-coverage-overlay-excerpts/ctxmem.env.ts

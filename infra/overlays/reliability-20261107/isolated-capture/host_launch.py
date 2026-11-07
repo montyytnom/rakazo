@@ -25,8 +25,11 @@ STATE_COMPONENTS = frozenset({"appdata", "postgres", "postgresql", "redis"})
 MODEL_LIST_RE = re.compile(r"^[A-Za-z0-9._,+-]+$")
 INT_RE = re.compile(r"^-?\d{1,12}$")
 BOOL_VALUES = {"0": "0", "1": "1", "true": "true", "false": "false"}
-MODEL_JSON_KEYS = frozenset({"enable_thinking", "thinking_budget"})
-NEVER_FORWARD = frozenset({"RAKAZO_ASSIST_PROMPT", "RAKAZO_ASSIST_STABLE_PREFIX"})
+# Observed chat_template_kwargs keys are booleans. thinking_budget is a top-level env/body field.
+MODEL_JSON_KEYS = frozenset({"enable_thinking", "medium_effort"})
+NEVER_FORWARD = frozenset()
+ZERO_ONE_KINDS = frozenset({"off_when_0", "on_when_1", "present_not_0"})
+DEFAULT_ON_KILL_SWITCH = frozenset({"0", "1", "true", "false", "off", "no", "on", "yes"})
 CPU_LIMIT = "2"
 MEMORY_LIMIT = "2g"
 PIDS_LIMIT = "256"
@@ -124,11 +127,19 @@ def parse_typed_value(kind: str, value: str) -> tuple[bool, str | None]:
         if INT_RE.fullmatch(text):
             return True, text
         return False, None
-    if kind == "bool":
+    if kind in ZERO_ONE_KINDS:
+        if text in ("0", "1"):
+            return True, text
+        return False, None
+    if kind in ("bool", "botdir_switch"):
         mapped = BOOL_VALUES.get(text.lower())
         if mapped is None:
             return False, None
         return True, mapped
+    if kind == "default_on_kill_switch":
+        if text.lower() in DEFAULT_ON_KILL_SWITCH:
+            return True, text
+        return False, None
     if kind == "model_list":
         if MODEL_LIST_RE.fullmatch(text) and len(text) <= 200:
             return True, text
@@ -145,13 +156,11 @@ def parse_typed_value(kind: str, value: str) -> tuple[bool, str | None]:
             return False, None
         if not isinstance(parsed, dict) or len(parsed) > 8:
             return False, None
-        cleaned: dict[str, bool | int] = {}
+        cleaned: dict[str, bool] = {}
         for key, item in parsed.items():
             if key not in MODEL_JSON_KEYS:
                 return False, None
             if isinstance(item, bool):
-                cleaned[key] = item
-            elif isinstance(item, int) and not isinstance(item, bool) and abs(item) < 10_000_000:
                 cleaned[key] = item
             else:
                 return False, None
@@ -197,15 +206,15 @@ def classify_env(env: dict[str, str], policy: dict[str, str]) -> dict[str, objec
     return {
         "observed": observed,
         "forwarded": forwarded,
-        "syntheticAssist": {
-            "RAKAZO_ASSIST_PROMPT": None,
-            "RAKAZO_ASSIST_STABLE_PREFIX": None,
-            "note": "synthetic unset; overlay module defaults apply. Live values hashed, not copied to argv, manifest values, or capture output.",
+        "typedAssistSwitches": {
+            "RAKAZO_ASSIST_PROMPT": "off_when_0",
+            "RAKAZO_ASSIST_STABLE_PREFIX": "off_when_0",
+            "note": "source compares === \"0\"; live both-services value 1 is forwarded literally. Freeform text is rejected, not treated as prompt.",
         },
         "normalization": [
-            "RAKAZO_ASSIST_PROMPT and RAKAZO_ASSIST_STABLE_PREFIX are never forwarded",
-            "only typed known-safe scalars (ints, bools, model id list, model JSON known keys, NODE_ENV) may be forwarded",
-            "limitation: capture does not replay live assist prompt text",
+            "RAKAZO_ASSIST_PROMPT and RAKAZO_ASSIST_STABLE_PREFIX are boolean 0/1 switches (source === \"0\"), forwarded literally when 0 or 1",
+            "chat_template_kwargs known boolean fields: enable_thinking, medium_effort",
+            "only typed known-safe scalars may be forwarded; unexplained consumed env blocks preflight",
         ],
     }
 
@@ -293,7 +302,7 @@ def inspect_container(name: str, policy: dict[str, str]) -> dict | None:
         "envPrivacy": {
             "observed": classified["observed"],
             "forwardedKeys": sorted(classified["forwarded"]),
-            "syntheticAssist": classified["syntheticAssist"],
+            "typedAssistSwitches": classified["typedAssistSwitches"],
             "normalization": classified["normalization"],
         },
         "forwardedEnv": classified["forwarded"],
@@ -305,24 +314,8 @@ def inspect_container(name: str, policy: dict[str, str]) -> dict | None:
 
 
 def redact_docker_run(cmd: list[str]) -> list[str]:
-    """Replace -e values with key=redacted for never-forward keys if present."""
-    redacted = []
-    skip_value = False
-    for item in cmd:
-        if skip_value:
-            skip_value = False
-            if item.startswith("RAKAZO_ASSIST_PROMPT=") or item.startswith("RAKAZO_ASSIST_STABLE_PREFIX="):
-                key = item.split("=", 1)[0]
-                redacted.append(f"{key}=synthetic-unset")
-            else:
-                redacted.append(item)
-            continue
-        if item == "-e":
-            redacted.append(item)
-            skip_value = True
-            continue
-        redacted.append(item)
-    return redacted
+    """Keep typed 0/1 assist switches visible; never echo rejected freeform values."""
+    return list(cmd)
 
 
 def plan_service(
@@ -400,7 +393,7 @@ def prefix_name(service: str) -> str:
     return f"{PREFIX}-{service}-{os.getpid()}"
 
 
-def build_manifest(worker: dict, api: dict, execute: bool) -> dict:
+def build_manifest(worker: dict, api: dict, execute: bool, coverage: dict | None = None) -> dict:
     return {
         "kind": "isolated-capture-ephemeral",
         "gateMet": False,
@@ -416,6 +409,7 @@ def build_manifest(worker: dict, api: dict, execute: bool) -> dict:
         "productionUntouched": True,
         "noEnvCopy": True,
         "noAssistPromptCopy": True,
+        "assistSwitchesForwarded": "off_when_0 literal 0/1",
         "noLoginGuardPolicyMount": True,
         "createdAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "execute": execute,
@@ -424,7 +418,13 @@ def build_manifest(worker: dict, api: dict, execute: bool) -> dict:
             {k: v for k, v in api.items() if k != "dockerRunRawForExecute"},
         ],
         "volatileFieldsNote": "byte-diff full body after declared volatile fields",
-        "assistNormalization": "live RAKAZO_ASSIST_PROMPT / RAKAZO_ASSIST_STABLE_PREFIX hashed and replaced with synthetic unset",
+        "assistNormalization": "RAKAZO_ASSIST_PROMPT / RAKAZO_ASSIST_STABLE_PREFIX are source === \"0\" switches; live 1 is forwarded. Freeform text is rejected.",
+        "chatTemplateKwargsKnownFields": sorted(MODEL_JSON_KEYS),
+        "configCoverage": {
+            "ok": bool(coverage and coverage.get("ok")),
+            "unexplained": (coverage or {}).get("unexplained") or [],
+            "explicitOmitted": (coverage or {}).get("explicitOmitted") or [],
+        },
     }
 
 
@@ -433,6 +433,18 @@ def main(argv: list[str]) -> int:
     out = Path(argv[1]).resolve()
     execute = argv[2] == "1"
     out.mkdir(parents=True, exist_ok=True)
+    import config_coverage
+
+    coverage = config_coverage.preflight(
+        bundle,
+        model_json_keys=MODEL_JSON_KEYS,
+        never_forward=NEVER_FORWARD,
+    )
+    (out / "config-coverage-preflight.json").write_text(json.dumps(coverage, indent=2) + "\n")
+    if not coverage["ok"]:
+        print("config-coverage preflight blocked", file=sys.stderr)
+        print(json.dumps(coverage, indent=2), file=sys.stderr)
+        return 2
     policy = load_env_policy(bundle)
     worker = plan_service(
         "worker",
@@ -450,7 +462,7 @@ def main(argv: list[str]) -> int:
         out,
         policy,
     )
-    manifest = build_manifest(worker, api, execute)
+    manifest = build_manifest(worker, api, execute, coverage)
     (out / "dry-run-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(out / "dry-run-manifest.json")
     if not execute:

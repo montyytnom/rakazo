@@ -6,7 +6,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 FLAT_PARENT="${1:-/tmp}"
 OUT_TGZ="${2:-/opt/cursor/artifacts/isolated-capture-bundle.tgz}"
 cd "$HERE"
-python3 -m unittest host_launch_test dependency_closure_test -v
+python3 -m unittest host_launch_test dependency_closure_test config_coverage_test -v
+python3 config_coverage.py >/dev/null
 rm -rf "$HERE/__pycache__"
 STAGE="$FLAT_PARENT/isolated-capture-bundle"
 rm -rf "$STAGE"

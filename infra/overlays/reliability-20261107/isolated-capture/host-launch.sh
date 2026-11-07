@@ -3,7 +3,8 @@
 # Default is dry-run. Pass --execute under approval to start containers.
 # Never pulls/builds, never execs/patches/restarts production, never copies .env
 # or /run/login-guard policy. Overlay source files such as login-guard.ts and
-# page-browser-session.ts are retained. Assist prompt strings are never copied.
+# page-browser-session.ts are retained. Assist 0/1 switches are forwarded;
+# freeform assist text is rejected. Config-coverage preflight must pass.
 set -euo pipefail
 BUNDLE="$(cd "$(dirname "$0")" && pwd)"
 EXECUTE=0

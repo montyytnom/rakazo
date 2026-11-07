@@ -98,14 +98,15 @@ describe("isolated capture harness", () => {
     expect(result.clipped12k).toBe(true);
   }, 60_000);
 
-  it("records one synthetic compaction pass without leaving the stub", async () => {
+  it("records compaction as unmet rather than matching an inlined summarizer", async () => {
     const result = await captureCompactionPass("this-tree");
-    expect(result.model.baseUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/v1$/);
-    expect(result.input.prompt).toContain("synthetic capture transcript");
-    expect(result.input.instructions).toContain("Produce a complete replacement summary");
-    expect(result.stubOutput).toContain("synthetic compacted summary");
-    expect(result.capture?.rawSha256).toMatch(/^[a-f0-9]{64}$/);
-  }, 30_000);
+    expect(result.gate).toBe("unmet");
+    expect(result.matched).toBe(false);
+    expect(result.deployedBoundary).toBe("compactHistory");
+    expect(result.reason).toMatch(/compactHistory/);
+    expect(result).not.toHaveProperty("input");
+    expect(result).not.toHaveProperty("capture");
+  });
 
   it("feeds stub responses through the real parser and tool-call guard", async () => {
     const result = await captureParserGuardCases("this-tree");
@@ -137,9 +138,22 @@ describe("isolated capture harness", () => {
     expect(result.hashManifest["phases/first-0.bin"]).toMatch(/^[a-f0-9]{64}$/);
     const summary = JSON.parse(readFileSync(join(outDir, "phases-summary.json"), "utf8")) as {
       gateMet: boolean;
+      compactionGate?: { gate: string; matched: boolean };
       blocks: Array<{ name: string; sha256: string | null }>;
     };
+    expect(summary.compactionGate?.gate).toBe("unmet");
+    expect(summary.compactionGate?.matched).toBe(false);
     expect(summary.gateMet).toBe(false);
+    const compactionRecord = JSON.parse(readFileSync(join(outDir, "compaction/unmet.json"), "utf8")) as {
+      gate: string;
+      matched: boolean;
+      deployedBoundary: string;
+    };
+    expect(compactionRecord.gate).toBe("unmet");
+    expect(compactionRecord.matched).toBe(false);
+    expect(compactionRecord.deployedBoundary).toBe("compactHistory");
+    expect(manifest).toContain("compaction/unmet.json");
+    expect(manifest).not.toContain("compaction/pass.bin");
     expect(summary.blocks.map((block) => block.name)).toEqual([
       "baseComputerInstruction",
       "renderBotCapabilityDirectory",
@@ -162,14 +176,14 @@ describe("isolated capture harness", () => {
     expect(manifest).toContain("tools-inventory.json");
   }, 120_000);
 
-  it("keeps overlay source mounts and hashes assist env instead of copying it", () => {
+  it("keeps overlay source mounts and forwards typed assist switches", () => {
     const overlay = join(
       dirname(fileURLToPath(import.meta.url)),
       "../../../infra/overlays/reliability-20261107/isolated-capture",
     );
     const result = spawnSync(
       "python3",
-      ["-m", "unittest", "host_launch_test", "dependency_closure_test"],
+      ["-m", "unittest", "host_launch_test", "dependency_closure_test", "config_coverage_test"],
       { cwd: overlay, encoding: "utf8" },
     );
     const output = `${result.stdout}${result.stderr}`;
@@ -177,6 +191,5 @@ describe("isolated capture harness", () => {
       throw new Error(output);
     }
     expect(result.status).toBe(0);
-    expect(output).toContain("Ran 7 tests");
   });
 });

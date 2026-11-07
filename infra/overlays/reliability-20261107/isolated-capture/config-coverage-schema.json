@@ -1,0 +1,265 @@
+{
+  "version": 1,
+  "note": "Semantics from source comparisons in promptbuilder/toolbuilder/serializer/parser_guard/compaction. Not inferred from env names. Unexplained consumed names block preflight. Do not forward arbitrary env or realcontext.",
+  "modelJsonKnownFields": {
+    "enable_thinking": "boolean",
+    "medium_effort": "boolean"
+  },
+  "fields": {
+    "RAKAZO_ASSIST_PROMPT": {
+      "consumedBy": ["promptbuilder"],
+      "source": "executor.ts assistOperatingRules / assistSplitInstructions / longWorkProgressGuidance / history-retrieval clause",
+      "semantics": "off when === \"0\"; otherwise on (including unset). Boolean 0/1 switch, not prompt text.",
+      "kind": "off_when_0",
+      "disposition": "forward"
+    },
+    "RAKAZO_ASSIST_STABLE_PREFIX": {
+      "consumedBy": ["promptbuilder"],
+      "source": "executor.ts assistSplitInstructions",
+      "semantics": "off when === \"0\" (skip turn_context split); otherwise on. Boolean 0/1 switch, not prefix text.",
+      "kind": "off_when_0",
+      "disposition": "forward"
+    },
+    "RAKAZO_ASSIST_DEFAULT_DISABLED_TOOLS": {
+      "consumedBy": ["toolbuilder"],
+      "source": "executor.ts assistDisabledTools split(/,/)",
+      "semantics": "comma-separated builtin tool names merged into the bot disabled list.",
+      "kind": "comma_tool_names",
+      "disposition": "omit",
+      "omitReason": "freeform tool-name list is not a typed 0/1 switch; capture assembler sets disabledBuiltinTools=[] rather than replaying a live default-off list"
+    },
+    "RAKAZO_ASSIST_SCHEDULE_GUARD": {
+      "consumedBy": ["promptbuilder"],
+      "source": "executor.ts schedule-guard helpers === \"0\"",
+      "semantics": "off when === \"0\". Schedule-instruction path.",
+      "kind": "off_when_0",
+      "disposition": "omit",
+      "omitReason": "schedule path; not used by the three chat/completions serializer cases"
+    },
+    "RAKAZO_DEFAULT_TIMEZONE": {
+      "consumedBy": ["promptbuilder", "compaction"],
+      "source": "executor.ts schedule timezone; ctxmem.ts todayIn fallback",
+      "semantics": "freeform IANA timezone string.",
+      "kind": "timezone_string",
+      "disposition": "omit",
+      "omitReason": "not a typed 0/1 switch or model-json field; forwarding would copy live tz text; capture pins ISOLATED_CAPTURE_NOW"
+    },
+    "RAKAZO_ALWAYS_OVERRIDE": {
+      "consumedBy": ["promptbuilder"],
+      "source": "executor.ts === \"0\" skips override rules",
+      "semantics": "off when trim() === \"0\". Approval/override path.",
+      "kind": "off_when_0",
+      "disposition": "omit",
+      "omitReason": "approval override path; not the three serializer cases"
+    },
+    "RAKAZO_APPROVAL_RACE_FIX": {
+      "consumedBy": ["promptbuilder"],
+      "source": "executor.ts trim() !== \"0\"",
+      "semantics": "on unless trim() === \"0\". Approval race path.",
+      "kind": "off_when_0",
+      "disposition": "omit",
+      "omitReason": "approval path; not the three serializer cases"
+    },
+    "RAKAZO_DEDUPE_FINAL_POSTS": {
+      "consumedBy": ["promptbuilder"],
+      "source": "executor.ts RAKAZO_DEDUPE_FINAL_POSTS trim",
+      "semantics": "posting/dedupe path.",
+      "kind": "untyped_scalar",
+      "disposition": "omit",
+      "omitReason": "final-post dedupe; not the three serializer cases"
+    },
+    "RAKAZO_ASSIST_HARNESS": {
+      "consumedBy": ["promptbuilder", "parser_guard"],
+      "source": "executor.ts and pi-runtime.ts === \"0\" disables assist harness",
+      "semantics": "off when === \"0\"; otherwise on. Boolean 0/1 switch.",
+      "kind": "off_when_0",
+      "disposition": "forward"
+    },
+    "RAKAZO_ASSIST_PROVIDER_RETRIES": {
+      "consumedBy": ["parser_guard"],
+      "source": "pi-runtime.ts Number(RAKAZO_ASSIST_PROVIDER_RETRIES ?? \"2\")",
+      "semantics": "integer retry count, default 2.",
+      "kind": "int",
+      "disposition": "forward"
+    },
+    "RAKAZO_ASSIST_SAME_ERROR_WARN": {
+      "consumedBy": ["parser_guard"],
+      "source": "pi-runtime.ts Number(RAKAZO_ASSIST_SAME_ERROR_WARN ?? \"3\")",
+      "semantics": "integer warn-at count, default 3.",
+      "kind": "int",
+      "disposition": "forward"
+    },
+    "RAKAZO_COORD_SCALE": {
+      "consumedBy": ["toolbuilder"],
+      "source": "builtin-tools.ts Number(RAKAZO_COORD_SCALE ?? \"\") IIFE at module load",
+      "semantics": "positive number rewrites computer_act coordinate notes in tool JSON; unset/0 leaves pixel coords.",
+      "kind": "int",
+      "disposition": "forward"
+    },
+    "RAKAZO_BOT_ASK_WAIT": {
+      "consumedBy": ["toolbuilder", "promptbuilder"],
+      "source": "builtin-tools.ts truthy && !== \"0\" appends wait_for_reply text; botdir.ts botdirSwitch",
+      "semantics": "on when set, non-empty, and not \"0\".",
+      "kind": "present_not_0",
+      "disposition": "forward"
+    },
+    "RAKAZO_BOT_DIRECTORY_CARDS": {
+      "consumedBy": ["promptbuilder"],
+      "source": "botdir.ts botdirSwitch: set, non-empty, not \"0\", not \"false\"",
+      "semantics": "enables compact capability cards.",
+      "kind": "botdir_switch",
+      "disposition": "forward"
+    },
+    "RAKAZO_BOT_DIRECTORY_MAX_CHARS": {
+      "consumedBy": ["promptbuilder"],
+      "source": "botdir.ts botdirNumber fallback 3000",
+      "semantics": "positive int card budget.",
+      "kind": "int",
+      "disposition": "forward"
+    },
+    "RAKAZO_BOT_ASK_WAIT_MAX_S": {
+      "consumedBy": ["toolbuilder"],
+      "source": "botdir.ts botdirNumber fallback 600",
+      "semantics": "positive int seconds.",
+      "kind": "int",
+      "disposition": "forward"
+    },
+    "RAKAZO_BOT_ASK_WAIT_DEFAULT_S": {
+      "consumedBy": ["toolbuilder"],
+      "source": "botdir.ts botdirNumber fallback 240",
+      "semantics": "positive int seconds.",
+      "kind": "int",
+      "disposition": "forward"
+    },
+    "RAKAZO_BOT_ASK_WAIT_MAX_HOP": {
+      "consumedBy": ["toolbuilder"],
+      "source": "botdir.ts env.RAKAZO_BOT_ASK_WAIT_MAX_HOP integer >= 0, default 1",
+      "semantics": "non-negative int hop cap.",
+      "kind": "int",
+      "disposition": "forward"
+    },
+    "RAKAZO_OPENAI_COMPAT_CHAT_TEMPLATE_KWARGS": {
+      "consumedBy": ["serializer"],
+      "source": "pi-openai-compatible-provider.ts withChatTemplateKwargs JSON.parse merge into body.chat_template_kwargs; fast-thinking.ts applyThinkingPolicy may delete medium_effort only when thinking is off",
+      "semantics": "JSON object. Observed keys enable_thinking and medium_effort, both boolean. Unknown keys are unexplained affected fields.",
+      "kind": "model_json",
+      "disposition": "forward"
+    },
+    "RAKAZO_FAST_COMPUTER_STEPS": {
+      "consumedBy": ["serializer"],
+      "source": "fast-thinking.ts applyThinkingPolicy env.RAKAZO_FAST_COMPUTER_STEPS === \"1\"",
+      "semantics": "on when === \"1\"; otherwise off. When on and last step is computer/browser tool results, sets enable_thinking=false and deletes medium_effort.",
+      "kind": "on_when_1",
+      "disposition": "forward"
+    },
+    "RAKAZO_THINKING_BUDGET": {
+      "consumedBy": ["serializer"],
+      "source": "fast-thinking.ts applyThinkingBudget /^[1-9][0-9]{0,5}$/ sets top-level body.thinking_budget, never kwargs",
+      "semantics": "positive int 1..999999. Top-level HTTP field, not a chat_template_kwargs key.",
+      "kind": "int",
+      "disposition": "forward"
+    },
+    "RAKAZO_THINKING_BUDGET_MODELS": {
+      "consumedBy": ["serializer"],
+      "source": "fast-thinking.ts comma-separated exact model id match",
+      "semantics": "comma-separated model ids.",
+      "kind": "model_list",
+      "disposition": "forward"
+    },
+    "RAKAZO_MODEL_STREAM_TIMEOUT_MS": {
+      "consumedBy": ["parser_guard"],
+      "source": "pi-runtime-limits.ts Number, min 10000 else 120000, IIFE at module load",
+      "semantics": "integer milliseconds.",
+      "kind": "int",
+      "disposition": "forward"
+    },
+    "RAKAZO_MODEL_STREAM_IDLE_TIMEOUT_MS": {
+      "consumedBy": ["parser_guard"],
+      "source": "pi-runtime-limits.ts Number, min 10000 else 180000, IIFE at module load",
+      "semantics": "integer milliseconds.",
+      "kind": "int",
+      "disposition": "forward"
+    },
+    "MODEL_STREAM_MAX_RETRIES": {
+      "consumedBy": ["parser_guard"],
+      "source": "pi-runtime-limits.ts modelStreamMaxRetries integer 0..5",
+      "semantics": "integer retry cap.",
+      "kind": "int",
+      "disposition": "forward"
+    },
+    "MAX_TOOL_CALLS_PER_TURN": {
+      "consumedBy": ["parser_guard"],
+      "source": "pi-runtime.ts maxToolCallsPerTurn env.MAX_TOOL_CALLS_PER_TURN; unset/empty/0 = unlimited",
+      "semantics": "positive int or unset.",
+      "kind": "int",
+      "disposition": "forward"
+    },
+    "PI_DEFAULT_MODEL": {
+      "consumedBy": ["parser_guard"],
+      "source": "pi-runtime.ts envDefaultModel trim",
+      "semantics": "live model id string.",
+      "kind": "model_id",
+      "disposition": "omit",
+      "omitReason": "capture injects a synthetic stub model; do not forward live model identifiers"
+    },
+    "PI_DEFAULT_PROVIDER": {
+      "consumedBy": ["parser_guard"],
+      "source": "pi-runtime.ts envDefaultProvider trim default openrouter",
+      "semantics": "provider name string.",
+      "kind": "provider_id",
+      "disposition": "omit",
+      "omitReason": "capture injects a synthetic stub model; do not forward live provider names"
+    },
+    "OPENROUTER_API_KEY": {
+      "consumedBy": ["parser_guard"],
+      "source": "pi-runtime.ts OpenRouter credential lookup",
+      "semantics": "secret.",
+      "kind": "secret",
+      "disposition": "omit",
+      "omitReason": "secret; never forward"
+    },
+    "RAKAZO_CTXMEM": {
+      "consumedBy": ["compaction", "promptbuilder", "toolbuilder"],
+      "source": "ctxmem.ts === \"1\"; executor.ts ctxmemEnabled/ctxmemFactsEnabled for rolling summary and set_fact tools",
+      "semantics": "on when === \"1\"; otherwise off.",
+      "kind": "on_when_1",
+      "disposition": "forward"
+    },
+    "RAKAZO_CTXMEM_FACTS": {
+      "consumedBy": ["compaction", "promptbuilder", "toolbuilder"],
+      "source": "ctxmem.ts ctxmemEnabled() && !== \"0\"",
+      "semantics": "off when === \"0\" while ctxmem is on; otherwise on if ctxmem is on.",
+      "kind": "off_when_0",
+      "disposition": "forward"
+    },
+    "RAKAZO_SUBAGENT_STEERING": {
+      "consumedBy": ["parser_guard"],
+      "source": "pi-runtime.ts subagentSteeringEnabled trim.toLowerCase() === \"1\"|\"true\"|\"yes\"",
+      "semantics": "on when 1/true/yes; unset is off. Nested subagent user-message injection.",
+      "kind": "on_when_1_true_yes",
+      "disposition": "omit",
+      "omitReason": "subagent nested-run steering; the three serializer cases and parser-guard stub do not spawn a subagent"
+    },
+    "RAKAZO_GUARD_FINAL_SUMMARY": {
+      "consumedBy": ["parser_guard"],
+      "source": "pi-runtime.ts runtidyGuardSummaryEnabled: set, non-empty, not \"0\", not \"false\"",
+      "semantics": "enables a forced final-summary model call after a guard stop.",
+      "kind": "botdir_switch",
+      "disposition": "forward"
+    },
+    "RAKAZO_GUARD_SUMMARY_TIMEOUT_MS": {
+      "consumedBy": ["parser_guard"],
+      "source": "pi-runtime.ts runtidyGuardSummaryTimeoutMs Number default 90000, min 5000",
+      "semantics": "integer milliseconds for the guard-summary call.",
+      "kind": "int",
+      "disposition": "forward"
+    },
+    "STREAMRETRY_ENABLED": {
+      "consumedBy": ["parser_guard"],
+      "source": "pi-runtime.ts streamRetryEnabled: off when trim.toLowerCase() is 0/false/off/no; unset defaults on",
+      "semantics": "kill switch for one retry of a dropped stream before any tool call.",
+      "kind": "default_on_kill_switch",
+      "disposition": "forward"
+    }
+  }
+}

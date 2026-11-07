@@ -1,28 +1,35 @@
-# Typed known-safe scalars only. Never secrets, never freeform prompt strings.
-# Integers
+# Typed known-safe scalars only. Kinds match config-coverage-schema.json.
+# Source comparisons, not env-name guessing. Secrets and freeform strings are omitted there.
 RAKAZO_THINKING_BUDGET	int
-RAKAZO_FAST_COMPUTER_STEPS	int
 RAKAZO_MODEL_STREAM_TIMEOUT_MS	int
 RAKAZO_MODEL_STREAM_IDLE_TIMEOUT_MS	int
 MAX_TOOL_CALLS_PER_TURN	int
 MODEL_STREAM_MAX_RETRIES	int
 RAKAZO_BOT_DIRECTORY_MAX_CHARS	int
-# Model id list
+RAKAZO_BOT_ASK_WAIT_MAX_S	int
+RAKAZO_BOT_ASK_WAIT_DEFAULT_S	int
+RAKAZO_BOT_ASK_WAIT_MAX_HOP	int
+RAKAZO_COORD_SCALE	int
+RAKAZO_ASSIST_PROVIDER_RETRIES	int
+RAKAZO_ASSIST_SAME_ERROR_WARN	int
 RAKAZO_THINKING_BUDGET_MODELS	model_list
-# Model config JSON (known keys only)
 RAKAZO_OPENAI_COMPAT_CHAT_TEMPLATE_KWARGS	model_json
-# Booleans / overlay switches (0/1/true/false)
-RAKAZO_BOT_DIRECTORY_CARDS	bool
-RAKAZO_CTXMEM	bool
-RAKAZO_CTXMEM_FACTS	bool
-RAKAZO_RELIABILITY_LEDGER	bool
-RAKAZO_PROTECTED_RESULTS	bool
-RAKAZO_TICKET_BOARD	bool
-RAKAZO_PHONE_CALLS	bool
-RAKAZO_SEMANTIC_MEMORY	bool
-RAKAZO_CLOUD_AGENT	bool
-# Enum
+RAKAZO_ASSIST_PROMPT	off_when_0
+RAKAZO_ASSIST_STABLE_PREFIX	off_when_0
+RAKAZO_ASSIST_HARNESS	off_when_0
+RAKAZO_CTXMEM_FACTS	off_when_0
+RAKAZO_FAST_COMPUTER_STEPS	on_when_1
+RAKAZO_CTXMEM	on_when_1
+RAKAZO_BOT_ASK_WAIT	present_not_0
+RAKAZO_BOT_DIRECTORY_CARDS	botdir_switch
+RAKAZO_GUARD_FINAL_SUMMARY	botdir_switch
+RAKAZO_GUARD_SUMMARY_TIMEOUT_MS	int
+STREAMRETRY_ENABLED	default_on_kill_switch
+# Assembler flags used by isolated-capture deriveAssemblerInputs (not the five-module scan).
+RAKAZO_TICKET_BOARD	off_when_0
+RAKAZO_PHONE_CALLS	off_when_0
+RAKAZO_SEMANTIC_MEMORY	off_when_0
+RAKAZO_CLOUD_AGENT	off_when_0
+RAKAZO_RELIABILITY_LEDGER	off_when_0
+RAKAZO_PROTECTED_RESULTS	off_when_0
 NODE_ENV	enum:production,development,test
-# Observed, hashed, never forwarded (synthetic unset)
-RAKAZO_ASSIST_PROMPT	never
-RAKAZO_ASSIST_STABLE_PREFIX	never
