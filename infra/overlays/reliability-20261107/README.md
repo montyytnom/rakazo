@@ -39,4 +39,4 @@ See `REPLACEMENT-MANIFEST.md`. Four live mounts are **SKEWED** (worker ≠ api):
 
 A 72-tool code-derived dump is **not** a matched production capture and does not unlock live evals.
 
-Byte baseline is the isolated local-stub harness: `isolated-capture/RUNBOOK.md`. Parent runs it on the deployed image + overlay stack. This branch does not call GX10.
+Byte baseline is the isolated local-stub harness: `isolated-capture/RUNBOOK.md` and `isolated-capture/host-launch.sh`. Parent runs the packed tarball (no git checkout) on the deployed image + overlay stack. This branch does not call GX10. The capture gate stays unmet until byte acceptance.

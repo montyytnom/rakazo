@@ -7,11 +7,17 @@ import type { AddressInfo } from "node:net";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Message } from "@earendil-works/pi-ai";
-import type { ConnectorTool } from "@rakazo/adapter-kit";
+import type { AdapterContext, ConnectorTool } from "@rakazo/adapter-kit";
+import { formatSkillsCatalogInstruction, type SkillCatalogEntry } from "@rakazo/core";
 import { builtinAgentTools } from "./builtin-tools.js";
 import { captureCallLimits } from "./capture-harness.js";
+import { ConnectorRegistry } from "./composio-connector.js";
 import { formatCurrentTimeInstruction } from "./current-time.js";
+import { DestinationEmulator } from "./destination-emulator.js";
+import * as executorApi from "./executor.js";
 import {
+  longWorkProgressGuidance,
+  offeredFleetTools,
   persistentComputerInstruction,
   selectBuiltinToolsForRun,
   userTurnInstructions,
@@ -23,6 +29,7 @@ import {
 import { PiAgentRuntime } from "./pi-runtime.js";
 import { TOOL_RESULT_TEXT_LIMIT } from "./pi-runtime-limits.js";
 import { withoutNamelessToolCalls } from "./pi-tool-call-guard.js";
+import { TASK_CATALOG_GUIDANCE } from "./task-catalog.js";
 
 const require = createRequire(import.meta.url);
 
@@ -32,7 +39,7 @@ export const STALE_PAGE_STATE_NOTE =
 export const OVERSIZED_PAGE_CHARS = 40_000;
 export const CAPTURE_CLOCK_DEFAULT = "2026-11-07T00:00:00.000Z";
 
-/** Volatile fields the byte-diff replay may exclude. Anything else must byte-match. */
+/** Volatile fields the byte-diff replay may exclude. The rest of the body must match. */
 export const VOLATILE_FIELDS = [
   {
     path: "http.headers.date",
@@ -56,12 +63,66 @@ export const VOLATILE_FIELDS = [
   },
 ] as const;
 
-export const RUNTIME_ONLY_PROMPT_BLOCKS = {
-  groupContext: "Group context: synthetic-capture-group.",
-  messagingContext: "Messaging context: synthetic-capture-channel.",
-  redactedMemoryContext: "Memory: synthetic-capture-memory-block.",
-  redactedScratchpadContext: "Scratchpad: synthetic-capture-scratchpad-block.",
-} as const;
+export const REVIEWER_EXPECTED_WORKER_BUILTINS = 74;
+
+/** Synthetic fixtures for real assemblers. Not live directory, skills, or secrets. */
+export const SYNTHETIC_SKILL_CATALOG: SkillCatalogEntry[] = [
+  {
+    name: "synthetic-capture-skill",
+    description: "Synthetic capture fixture skill. No live account.",
+    source: "user",
+    readOnly: false,
+  },
+];
+
+export const SYNTHETIC_BOTDIR_SELF_ID = "bot-synthetic-capture";
+export const SYNTHETIC_BOTDIR_PEERS = [
+  {
+    id: SYNTHETIC_BOTDIR_SELF_ID,
+    name: "synthetic-self",
+    title: "",
+    description: "Synthetic capture bot. No live account.",
+    mcpServers: [] as { server: { slug: string; name: string; enabled: boolean } }[],
+    botSecrets: [] as { name: string; origin: string }[],
+  },
+  {
+    id: "bot-synthetic-peer",
+    name: "synthetic-peer",
+    title: "",
+    description: "Synthetic peer bot for the directory renderer. No live account.",
+    mcpServers: [] as { server: { slug: string; name: string; enabled: boolean } }[],
+    botSecrets: [] as { name: string; origin: string }[],
+  },
+];
+
+export type NamedBlock = {
+  name: string;
+  required: boolean;
+  present: boolean;
+  sha256: string | null;
+  charLength: number;
+  source: string;
+};
+
+function hashText(
+  text: string | undefined | null,
+): Pick<NamedBlock, "present" | "sha256" | "charLength"> {
+  if (text == null || text.length === 0) {
+    return { present: false, sha256: null, charLength: 0 };
+  }
+  return {
+    present: true,
+    sha256: createHash("sha256").update(text).digest("hex"),
+    charLength: text.length,
+  };
+}
+
+function envFlag(name: string): boolean | undefined {
+  const raw = process.env[name]?.trim();
+  if (raw === undefined || raw === "") return undefined;
+  if (raw === "0" || raw.toLowerCase() === "false") return false;
+  return true;
+}
 
 export const SAMPLING_KEYS = [
   "temperature",
@@ -107,52 +168,310 @@ export function captureClock(): Date {
   return date;
 }
 
-export function offeredToolsForSyntheticCapture(): ConnectorTool[] {
-  return selectBuiltinToolsForRun({
-    ticketBoardEnabled: true,
-    phoneCallsEnabled: false,
-    historyRetrievalEnabled: true,
+export function deriveAssemblerInputs() {
+  return {
+    trigger: "user" as const,
+    groupId: null as string | null,
+    graphical: true,
     graphicalToolsAllowed: true,
     pageBrowserAllowed: true,
-    groupId: null,
-    trigger: "message",
-    semanticMemoryEnabled: true,
-    cloudAgentEnabled: false,
+    heldForTakeover: false,
+    historyRetrievalEnabled: true,
+    ticketBoardEnabled: envFlag("RAKAZO_TICKET_BOARD") ?? false,
+    phoneCallsEnabled: envFlag("RAKAZO_PHONE_CALLS") ?? false,
+    semanticMemoryEnabled: envFlag("RAKAZO_SEMANTIC_MEMORY") ?? false,
+    cloudAgentEnabled: envFlag("RAKAZO_CLOUD_AGENT") ?? false,
     mediaImagesEnabled: false,
     mediaVideoEnabled: false,
     messagingChannelRun: false,
     voiceCall: false,
     fleetManagement: false,
     followUpFromUser: true,
-  });
+    disabledBuiltinTools: [] as string[],
+    connectorRegistry: "empty" as const,
+  };
 }
 
-export function syntheticTurnInstructions(): string {
-  return userTurnInstructions({
+function syntheticAdapterContext(): AdapterContext {
+  return {
+    operationId: "run-synthetic-capture",
+    traceId: "run-synthetic-capture",
+    spaceId: "space-synthetic-capture",
+    userId: "user-synthetic-capture",
+    botId: SYNTHETIC_BOTDIR_SELF_ID,
+    runId: "run-synthetic-capture",
+    signal: AbortSignal.timeout(5_000),
+  };
+}
+
+/** Empty connector registry through ConnectorRegistry.discoverTools. Network-off. */
+export async function discoverEmptyConnectorTools(): Promise<{
+  tools: ConnectorTool[];
+  source: string;
+  missingConnectors: string[];
+}> {
+  const destination = new DestinationEmulator();
+  destination.discoverTools = async () => [];
+  const registry = new ConnectorRegistry(destination, []);
+  const tools = await registry.discoverTools(syntheticAdapterContext());
+  return {
+    tools,
+    source: "ConnectorRegistry.discoverTools",
+    missingConnectors: [
+      "composio (not constructed, network-off)",
+      "pipedream (not constructed, network-off)",
+      "mcp (not constructed, network-off)",
+      "installed capabilityInstall rows (empty registry, network-off)",
+    ],
+  };
+}
+
+export async function offeredToolsFromDeployedBuilder(): Promise<{
+  tools: ConnectorTool[];
+  builtinCatalogNames: string[];
+  builtinCatalogCount: number;
+  offeredBuiltinNames: string[];
+  offeredBuiltinCount: number;
+  withheldBuiltinNames: string[];
+  connectorTools: ConnectorTool[];
+  reviewerExpectedWorkerBuiltins: number;
+  reviewerCountMatch: boolean;
+  missingConnectors: string[];
+  missingDynamicResolution: string[];
+  assemblerInputs: ReturnType<typeof deriveAssemblerInputs>;
+}> {
+  const assemblerInputs = deriveAssemblerInputs();
+  const builtins = selectBuiltinToolsForRun({
+    ticketBoardEnabled: assemblerInputs.ticketBoardEnabled,
+    phoneCallsEnabled: assemblerInputs.phoneCallsEnabled,
+    historyRetrievalEnabled: assemblerInputs.historyRetrievalEnabled,
+    graphicalToolsAllowed: assemblerInputs.graphicalToolsAllowed,
+    pageBrowserAllowed: assemblerInputs.pageBrowserAllowed,
+    groupId: assemblerInputs.groupId,
+    trigger: assemblerInputs.trigger,
+    semanticMemoryEnabled: assemblerInputs.semanticMemoryEnabled,
+    cloudAgentEnabled: assemblerInputs.cloudAgentEnabled,
+    mediaImagesEnabled: assemblerInputs.mediaImagesEnabled,
+    mediaVideoEnabled: assemblerInputs.mediaVideoEnabled,
+    messagingChannelRun: assemblerInputs.messagingChannelRun,
+    voiceCall: assemblerInputs.voiceCall,
+    fleetManagement: assemblerInputs.fleetManagement,
+    followUpFromUser: assemblerInputs.followUpFromUser,
+    disabledBuiltinTools: assemblerInputs.disabledBuiltinTools,
+  });
+  const connector = await discoverEmptyConnectorTools();
+  const builtinNames = new Set(builtinAgentTools.map((tool) => tool.name));
+  const exposedConnectorTools = connector.tools.filter((tool) => !builtinNames.has(tool.name));
+  const tools = [...builtins, ...exposedConnectorTools];
+  const offeredBuiltinNames = builtins.map((tool) => tool.name);
+  const offeredSet = new Set(offeredBuiltinNames);
+  return {
+    tools,
+    builtinCatalogNames: builtinAgentTools.map((tool) => tool.name),
+    builtinCatalogCount: builtinAgentTools.length,
+    offeredBuiltinNames,
+    offeredBuiltinCount: builtins.length,
+    withheldBuiltinNames: builtinAgentTools
+      .map((tool) => tool.name)
+      .filter((name) => !offeredSet.has(name)),
+    connectorTools: exposedConnectorTools,
+    reviewerExpectedWorkerBuiltins: REVIEWER_EXPECTED_WORKER_BUILTINS,
+    reviewerCountMatch: builtins.length === REVIEWER_EXPECTED_WORKER_BUILTINS,
+    missingConnectors: connector.missingConnectors,
+    missingDynamicResolution: [
+      `${connector.source} empty registry (network-off)`,
+      "agentConnectionTools (no live messaging identity)",
+      "generate_image/generate_video (no live media provider)",
+      "hostInstruction (no live sandbox.environment)",
+      "dockerComputerToolInstruction (no live computerKind; omitted rather than guessed)",
+    ],
+    assemblerInputs,
+  };
+}
+
+/** @deprecated use offeredToolsFromDeployedBuilder */
+export async function offeredToolsForSyntheticCapture(): Promise<ConnectorTool[]> {
+  return (await offeredToolsFromDeployedBuilder()).tools;
+}
+
+async function renderBotDirectoryBlock(): Promise<{
+  text: string | undefined;
+  source: string;
+}> {
+  try {
+    const mod = (await import(new URL("./botdir.js", import.meta.url).href)) as {
+      renderBotCapabilityDirectory?: (
+        peers: typeof SYNTHETIC_BOTDIR_PEERS,
+        selfId: string,
+      ) => string | undefined;
+    };
+    if (typeof mod.renderBotCapabilityDirectory !== "function") {
+      return { text: undefined, source: "botdir-present-without-renderer" };
+    }
+    return {
+      text: mod.renderBotCapabilityDirectory(SYNTHETIC_BOTDIR_PEERS, SYNTHETIC_BOTDIR_SELF_ID),
+      source: "renderBotCapabilityDirectory",
+    };
+  } catch {
+    return { text: undefined, source: "botdir-module-absent" };
+  }
+}
+
+function namedBlock(
+  name: string,
+  required: boolean,
+  source: string,
+  text: string | undefined | null,
+): NamedBlock {
+  return { name, required, source, ...hashText(text) };
+}
+
+export async function assembleCapturePrompt(): Promise<{
+  instructions: string;
+  prompt: string;
+  tools: ConnectorTool[];
+  blocks: NamedBlock[];
+  namedBlocks: NamedBlock[];
+  additionalEmitted: NamedBlock[];
+  toolInventory: Awaited<ReturnType<typeof offeredToolsFromDeployedBuilder>>;
+  computerInstruction: string;
+  botDirectory: string | undefined;
+  skillsLine: string | undefined;
+  longWork: string;
+}> {
+  const toolInventory = await offeredToolsFromDeployedBuilder();
+  const computerInstruction = persistentComputerInstruction({
+    heldForTakeover: false,
+    graphicalToolsAllowed: true,
+    graphical: true,
+  });
+  const longWork = longWorkProgressGuidance();
+  const skillsLine = formatSkillsCatalogInstruction(SYNTHETIC_SKILL_CATALOG);
+  const botdir = await renderBotDirectoryBlock();
+  const taskCatalogInstruction = toolInventory.tools.some((tool) => tool.name === "task_catalog")
+    ? TASK_CATALOG_GUIDANCE
+    : undefined;
+  const parts = {
     botInstructions: "Synthetic capture bot. No live chat.",
-    groupContext: RUNTIME_ONLY_PROMPT_BLOCKS.groupContext,
-    messagingContext: RUNTIME_ONLY_PROMPT_BLOCKS.messagingContext,
-    redactedMemoryContext: RUNTIME_ONLY_PROMPT_BLOCKS.redactedMemoryContext,
-    redactedScratchpadContext: RUNTIME_ONLY_PROMPT_BLOCKS.redactedScratchpadContext,
+    groupContext: undefined as string | undefined,
+    messagingContext: undefined as string | undefined,
+    redactedMemoryContext: undefined as string | undefined,
+    redactedScratchpadContext: undefined as string | undefined,
+    redactedTicketContext: undefined as string | undefined,
     hasHistoricalContext: false,
-    historyRetrievalEnabled: true,
-    computerInstruction: persistentComputerInstruction({
-      heldForTakeover: false,
-      graphicalToolsAllowed: true,
-      graphical: true,
-    }),
+    historyRetrievalEnabled: toolInventory.assemblerInputs.historyRetrievalEnabled,
+    computerInstruction,
     pageBrowserAllowed: true,
-    workspaceInstruction: "Workspace: synthetic-capture-workspace.",
-    agentEnvironmentInstruction: undefined,
-    botDirectory: undefined,
-    pluginLine: undefined,
-    agentSkillsLine: undefined,
-    taughtSkillsLine: undefined,
-    replyGuidance: "Be concise.",
-    offeredFleetTools: [],
-  })
-    .filter((part): part is string => Boolean(part))
-    .join("\n\n");
+    taskCatalogInstruction,
+    workspaceInstruction:
+      "This entire computer workspace is your private home. Relative file paths and shell working directories start at its root.",
+    agentEnvironmentInstruction: undefined as string | undefined,
+    botDirectory: botdir.text,
+    pluginLine: "No plugins are connected yet.",
+    agentSkillsLine: skillsLine,
+    taughtSkillsLine: undefined as string | undefined,
+    replyGuidance: longWork,
+    offeredFleetTools: offeredFleetTools(toolInventory.tools),
+  };
+  const userPrompt = syntheticUserPrompt();
+  const splitFn = (
+    executorApi as {
+      assistSplitInstructions?: (
+        prompt: string,
+        parts: Parameters<typeof userTurnInstructions>[0],
+      ) => { instructions: string; prompt: string };
+    }
+  ).assistSplitInstructions;
+  let instructions: string;
+  let prompt: string;
+  if (typeof splitFn === "function") {
+    const split = splitFn(userPrompt, parts);
+    instructions = split.instructions;
+    prompt = split.prompt;
+  } else {
+    instructions = userTurnInstructions(parts)
+      .filter((part): part is string => Boolean(part))
+      .join("\n\n");
+    prompt = userPrompt;
+  }
+  const required: NamedBlock[] = [
+    namedBlock(
+      "baseComputerInstruction",
+      true,
+      "persistentComputerInstruction",
+      computerInstruction,
+    ),
+    namedBlock("renderBotCapabilityDirectory", true, botdir.source, botdir.text),
+    namedBlock(
+      "formatSkillsCatalogInstruction",
+      true,
+      "formatSkillsCatalogInstruction",
+      skillsLine,
+    ),
+    namedBlock("longWorkProgressGuidance", true, "longWorkProgressGuidance()", longWork),
+  ];
+  const additionalEmitted: NamedBlock[] = [
+    namedBlock("groupContext", false, "userTurnInstructions-volatile", parts.groupContext),
+    namedBlock("messagingContext", false, "userTurnInstructions-volatile", parts.messagingContext),
+    namedBlock(
+      "redactedMemoryContext",
+      false,
+      "userTurnInstructions-volatile",
+      parts.redactedMemoryContext,
+    ),
+    namedBlock(
+      "redactedScratchpadContext",
+      false,
+      "userTurnInstructions-volatile",
+      parts.redactedScratchpadContext,
+    ),
+    namedBlock(
+      "redactedTicketContext",
+      false,
+      "userTurnInstructions-volatile",
+      parts.redactedTicketContext,
+    ),
+  ];
+  const namedBlocks: NamedBlock[] = [
+    ...required,
+    ...additionalEmitted,
+    namedBlock("botInstructions", false, "assembleCapturePrompt", parts.botInstructions),
+    namedBlock("workspaceInstruction", false, "assembleCapturePrompt", parts.workspaceInstruction),
+    namedBlock("pluginLine", false, "assembleCapturePrompt", parts.pluginLine),
+    namedBlock(
+      "taskCatalogInstruction",
+      false,
+      "TASK_CATALOG_GUIDANCE",
+      parts.taskCatalogInstruction,
+    ),
+    namedBlock(
+      "agentEnvironmentInstruction",
+      false,
+      "assembleCapturePrompt",
+      parts.agentEnvironmentInstruction,
+    ),
+    namedBlock("taughtSkillsLine", false, "assembleCapturePrompt", parts.taughtSkillsLine),
+    namedBlock(
+      "assembledInstructions",
+      false,
+      "assistSplitInstructions|userTurnInstructions",
+      instructions,
+    ),
+    namedBlock("assembledPrompt", false, "assistSplitInstructions|syntheticUserPrompt", prompt),
+  ];
+  return {
+    instructions,
+    prompt,
+    tools: toolInventory.tools,
+    blocks: required,
+    namedBlocks,
+    additionalEmitted,
+    toolInventory,
+    computerInstruction,
+    botDirectory: botdir.text,
+    skillsLine,
+    longWork,
+  };
 }
 
 export function syntheticUserPrompt(): string {
@@ -188,6 +507,19 @@ export function oversizedPage(index: number): Record<string, unknown> {
     tree: `BEGIN_PAGE_${index}_`.padEnd(OVERSIZED_PAGE_CHARS, "x"),
     elements: [],
   };
+}
+
+function requestBodyText(body: Record<string, unknown> | null): string {
+  if (!body) return "";
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  const parts: string[] = [];
+  for (const message of messages) {
+    if (!message || typeof message !== "object") continue;
+    const content = (message as { content?: unknown }).content;
+    if (typeof content === "string") parts.push(content);
+    else if (content != null) parts.push(JSON.stringify(content));
+  }
+  return parts.join("\n");
 }
 
 function toolNamesFromBody(body: Record<string, unknown> | null): string[] {
@@ -375,10 +707,14 @@ export async function capturePhaseTurn(service: string): Promise<{
   parsedBodies: Array<Record<string, unknown> | null>;
   runtimeEvents: unknown[];
   offeredToolNames: string[];
-  runtimeOnlyBlocksPresent: Record<keyof typeof RUNTIME_ONLY_PROMPT_BLOCKS, boolean>;
+  blocks: NamedBlock[];
+  namedBlocks: NamedBlock[];
+  additionalEmitted: NamedBlock[];
+  toolInventory: Awaited<ReturnType<typeof offeredToolsFromDeployedBuilder>>;
+  assembledInHttp: Record<string, boolean>;
 }> {
   const modelId = "qwen3.8-flash-next";
-  const tools = offeredToolsForSyntheticCapture();
+  const assembled = await assembleCapturePrompt();
   const snapshots = { value: 0 };
   const stub = await startCaptureStub({
     modelId,
@@ -409,15 +745,26 @@ export async function capturePhaseTurn(service: string): Promise<{
       botId: "bot-synthetic-capture",
       threadId: "thread-synthetic-capture",
       runId: `run-synthetic-phases-${service}`,
-      prompt: syntheticUserPrompt(),
-      instructions: syntheticTurnInstructions(),
+      prompt: assembled.prompt,
+      instructions: assembled.instructions,
       history: [],
-      tools,
+      tools: assembled.tools,
       contextStrategy: "current",
       model: syntheticModel(stub.baseUrl, modelId),
       executeTool: async (name) => executeSyntheticTool(name, snapshots),
     });
-    const haystack = JSON.stringify(stub.parsedBodies[0] ?? {});
+    const haystack = requestBodyText(stub.parsedBodies[0] ?? null);
+    const snippet = {
+      baseComputerInstruction: assembled.computerInstruction,
+      longWorkProgressGuidance: assembled.longWork,
+      formatSkillsCatalogInstruction: assembled.skillsLine ?? "",
+      renderBotCapabilityDirectory: assembled.botDirectory ?? "",
+    };
+    const assembledInHttp: Record<string, boolean> = {};
+    for (const block of assembled.blocks) {
+      const text = snippet[block.name as keyof typeof snippet] ?? "";
+      assembledInHttp[block.name] = block.present && text.length > 0 && haystack.includes(text);
+    }
     return {
       service,
       caseName: "phases",
@@ -425,15 +772,12 @@ export async function capturePhaseTurn(service: string): Promise<{
       rawBodies: stub.rawBodies,
       parsedBodies: stub.parsedBodies,
       runtimeEvents,
-      offeredToolNames: tools.map((tool) => tool.name),
-      runtimeOnlyBlocksPresent: {
-        groupContext: haystack.includes(RUNTIME_ONLY_PROMPT_BLOCKS.groupContext),
-        messagingContext: haystack.includes(RUNTIME_ONLY_PROMPT_BLOCKS.messagingContext),
-        redactedMemoryContext: haystack.includes(RUNTIME_ONLY_PROMPT_BLOCKS.redactedMemoryContext),
-        redactedScratchpadContext: haystack.includes(
-          RUNTIME_ONLY_PROMPT_BLOCKS.redactedScratchpadContext,
-        ),
-      },
+      offeredToolNames: assembled.tools.map((tool) => tool.name),
+      blocks: assembled.blocks,
+      namedBlocks: assembled.namedBlocks,
+      additionalEmitted: assembled.additionalEmitted,
+      toolInventory: assembled.toolInventory,
+      assembledInHttp,
     };
   } finally {
     await stub.close();
@@ -451,7 +795,7 @@ export async function capturePageTrim(service: string): Promise<{
   clipped12k: boolean;
 }> {
   const modelId = "qwen3.8-flash-next";
-  const tools = offeredToolsForSyntheticCapture();
+  const assembled = await assembleCapturePrompt();
   const snapshots = { value: 0 };
   const replies: StubReply[] = [1, 2, 3, 4].map((index) => ({
     kind: "sse" as const,
@@ -469,10 +813,10 @@ export async function capturePageTrim(service: string): Promise<{
       botId: "bot-synthetic-capture",
       threadId: "thread-synthetic-capture",
       runId: `run-synthetic-pagetrim-${service}`,
-      prompt: syntheticUserPrompt(),
-      instructions: syntheticTurnInstructions(),
+      prompt: assembled.prompt,
+      instructions: assembled.instructions,
       history: [],
-      tools,
+      tools: assembled.tools,
       contextStrategy: "current",
       model: syntheticModel(stub.baseUrl, modelId),
       executeTool: async (name) => executeSyntheticTool(name, snapshots),
@@ -907,14 +1251,67 @@ export async function runIsolatedCapture(options: {
 
   writeFileSync(join(outDir, "parser-guard.json"), `${JSON.stringify(parserGuard, null, 2)}\n`);
   writeFileSync(
+    join(outDir, "named-blocks.json"),
+    `${JSON.stringify(
+      {
+        required: phases.blocks,
+        additionalIfEmitted: phases.additionalEmitted,
+        everyBlock: phases.namedBlocks,
+        assembledInHttp: phases.assembledInHttp,
+        note: "group/messaging/memory/scratchpad/ticket are additional if emitted, not replacements for the four required blocks",
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  writeFileSync(
+    join(outDir, "tools-inventory.json"),
+    `${JSON.stringify(
+      {
+        offeredToolNames: phases.offeredToolNames,
+        builtinCatalogNames: phases.toolInventory.builtinCatalogNames,
+        builtinCatalogCount: phases.toolInventory.builtinCatalogCount,
+        offeredBuiltinCount: phases.toolInventory.offeredBuiltinCount,
+        withheldBuiltinNames: phases.toolInventory.withheldBuiltinNames,
+        reviewerExpectedWorkerBuiltins: phases.toolInventory.reviewerExpectedWorkerBuiltins,
+        reviewerCountMatch: phases.toolInventory.reviewerCountMatch,
+        missingConnectors: phases.toolInventory.missingConnectors,
+        missingDynamicResolution: phases.toolInventory.missingDynamicResolution,
+        connectorToolNames: phases.toolInventory.connectorTools.map((tool) => tool.name),
+        schemasFrom: "selectBuiltinToolsForRun + ConnectorRegistry.discoverTools (empty registry)",
+        handwrittenSchemas: false,
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  writeFileSync(
     join(outDir, "phases-summary.json"),
     `${JSON.stringify(
       {
         offeredToolNames: phases.offeredToolNames,
-        runtimeOnlyBlocksPresent: phases.runtimeOnlyBlocksPresent,
+        blocks: phases.blocks,
+        namedBlocks: phases.namedBlocks,
+        additionalEmitted: phases.additionalEmitted,
+        assembledInHttp: phases.assembledInHttp,
+        toolInventory: {
+          builtinCatalogNames: phases.toolInventory.builtinCatalogNames,
+          builtinCatalogCount: phases.toolInventory.builtinCatalogCount,
+          offeredBuiltinNames: phases.toolInventory.offeredBuiltinNames,
+          offeredBuiltinCount: phases.toolInventory.offeredBuiltinCount,
+          withheldBuiltinNames: phases.toolInventory.withheldBuiltinNames,
+          reviewerExpectedWorkerBuiltins: phases.toolInventory.reviewerExpectedWorkerBuiltins,
+          reviewerCountMatch: phases.toolInventory.reviewerCountMatch,
+          missingConnectors: phases.toolInventory.missingConnectors,
+          missingDynamicResolution: phases.toolInventory.missingDynamicResolution,
+          assemblerInputs: phases.toolInventory.assemblerInputs,
+          offeredToolNames: phases.offeredToolNames,
+          connectorToolNames: phases.toolInventory.connectorTools.map((tool) => tool.name),
+        },
         samplingByPhase: Object.fromEntries(
           phases.captures.map((capture) => [capture.phase, capture.sampling]),
         ),
+        gateMet: false,
       },
       null,
       2,

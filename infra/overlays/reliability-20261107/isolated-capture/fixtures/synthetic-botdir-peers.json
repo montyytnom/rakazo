@@ -1,0 +1,18 @@
+[
+  {
+    "id": "bot-synthetic-capture",
+    "name": "synthetic-self",
+    "title": "",
+    "description": "Synthetic capture bot. No live account.",
+    "mcpServers": [],
+    "botSecrets": []
+  },
+  {
+    "id": "bot-synthetic-peer",
+    "name": "synthetic-peer",
+    "title": "",
+    "description": "Synthetic peer bot for the directory renderer. No live account.",
+    "mcpServers": [],
+    "botSecrets": []
+  }
+]

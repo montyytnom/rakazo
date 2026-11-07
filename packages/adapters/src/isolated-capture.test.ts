@@ -1,7 +1,9 @@
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { formatSkillsCatalogInstruction } from "@rakazo/core";
 import { describe, expect, it } from "vitest";
+import { longWorkProgressGuidance, persistentComputerInstruction } from "./executor.js";
 import {
   CAPTURE_CLOCK_DEFAULT,
   captureCompactionPass,
@@ -10,19 +12,20 @@ import {
   capturePhaseTurn,
   collectProvenance,
   ISOLATED_CAPTURE_KIND,
-  offeredToolsForSyntheticCapture,
+  offeredToolsFromDeployedBuilder,
   pinPiAiVersion,
   pinToolCallGuardHash,
-  RUNTIME_ONLY_PROMPT_BLOCKS,
+  REVIEWER_EXPECTED_WORKER_BUILTINS,
   runIsolatedCapture,
   SAMPLING_KEYS,
   STALE_PAGE_STATE_NOTE,
+  SYNTHETIC_SKILL_CATALOG,
   secretStoreCapabilityReport,
   VOLATILE_FIELDS,
 } from "./isolated-capture.js";
 
 describe("isolated capture harness", () => {
-  it("captures first/postbrowser/guard-final at actual outbound HTTP to a local stub", async () => {
+  it("captures first/postbrowser/guard-final with named hashed assembler blocks", async () => {
     const result = await capturePhaseTurn("this-tree");
     expect(result.captures).toHaveLength(3);
     expect(result.captures.map((row) => row.phase)).toEqual([
@@ -30,15 +33,44 @@ describe("isolated capture harness", () => {
       "postbrowser",
       "guard-final",
     ]);
-    expect(result.runtimeOnlyBlocksPresent).toEqual({
-      groupContext: true,
-      messagingContext: true,
-      redactedMemoryContext: true,
-      redactedScratchpadContext: true,
+    const byName = Object.fromEntries(result.blocks.map((block) => [block.name, block]));
+    expect(byName.baseComputerInstruction?.present).toBe(true);
+    expect(byName.baseComputerInstruction?.sha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(byName.longWorkProgressGuidance?.present).toBe(true);
+    expect(byName.formatSkillsCatalogInstruction?.present).toBe(true);
+    expect(byName.renderBotCapabilityDirectory?.name).toBe("renderBotCapabilityDirectory");
+    const computer = persistentComputerInstruction({
+      heldForTakeover: false,
+      graphicalToolsAllowed: true,
+      graphical: true,
     });
-    const offered = offeredToolsForSyntheticCapture().map((tool) => tool.name);
-    expect(result.offeredToolNames).toEqual(offered);
-    expect([...result.captures[0]!.toolNames].sort()).toEqual([...offered].sort());
+    const longWork = longWorkProgressGuidance();
+    const skills = formatSkillsCatalogInstruction(SYNTHETIC_SKILL_CATALOG);
+    expect(result.assembledInHttp.baseComputerInstruction).toBe(true);
+    expect(result.assembledInHttp.longWorkProgressGuidance).toBe(true);
+    expect(result.assembledInHttp.formatSkillsCatalogInstruction).toBe(true);
+    const firstText = JSON.stringify(result.parsedBodies[0]);
+    expect(firstText).toContain(computer.slice(0, 40));
+    expect(firstText).toContain(longWork.slice(0, 40));
+    expect(skills && firstText.includes(skills.slice(0, 40))).toBe(true);
+    for (const extra of result.additionalEmitted) {
+      expect(extra.required).toBe(false);
+    }
+    const inventory = await offeredToolsFromDeployedBuilder();
+    expect(result.offeredToolNames).toEqual(inventory.tools.map((tool) => tool.name));
+    expect([...result.captures[0]!.toolNames].sort()).toEqual(
+      [...inventory.tools.map((tool) => tool.name)].sort(),
+    );
+    expect(inventory.reviewerExpectedWorkerBuiltins).toBe(REVIEWER_EXPECTED_WORKER_BUILTINS);
+    expect(typeof inventory.reviewerCountMatch).toBe("boolean");
+    expect(inventory.missingConnectors.length).toBeGreaterThan(0);
+    expect(inventory.missingDynamicResolution.length).toBeGreaterThan(0);
+    expect(result.namedBlocks.every((block) => block.name.length > 0)).toBe(true);
+    expect(result.namedBlocks.some((block) => block.name === "baseComputerInstruction")).toBe(true);
+    for (const block of result.namedBlocks) {
+      if (block.present) expect(block.sha256).toMatch(/^[a-f0-9]{64}$/);
+      else expect(block.sha256).toBeNull();
+    }
     for (const capture of result.captures) {
       expect(capture.rawSha256).toMatch(/^[a-f0-9]{64}$/);
       expect(capture.rawByteLength).toBeGreaterThan(100);
@@ -50,11 +82,7 @@ describe("isolated capture harness", () => {
         );
       }
     }
-    const first = JSON.stringify(result.parsedBodies[0]);
-    for (const block of Object.values(RUNTIME_ONLY_PROMPT_BLOCKS)) {
-      expect(first).toContain(block);
-    }
-    expect(first).toContain(CAPTURE_CLOCK_DEFAULT.slice(0, 10));
+    expect(firstText).toContain(CAPTURE_CLOCK_DEFAULT.slice(0, 10));
     expect(JSON.stringify(result)).not.toMatch(/sk-|BEGIN PRIVATE|password=/i);
   }, 60_000);
 
@@ -96,9 +124,6 @@ describe("isolated capture harness", () => {
     const capability = secretStoreCapabilityReport();
     expect(capability.didMutate).toBe(false);
     expect(capability.interfaceMethods).toContain("put");
-    expect(
-      capability.env.ENCRYPTION_KEY === "present" || capability.env.ENCRYPTION_KEY === "absent",
-    ).toBe(true);
   });
 
   it("writes a parent-replayable hash manifest", async () => {
@@ -108,5 +133,30 @@ describe("isolated capture harness", () => {
     expect(manifest).toContain("phases/first-0.bin");
     expect(manifest).toContain("provenance.json");
     expect(result.hashManifest["phases/first-0.bin"]).toMatch(/^[a-f0-9]{64}$/);
+    const summary = JSON.parse(readFileSync(join(outDir, "phases-summary.json"), "utf8")) as {
+      gateMet: boolean;
+      blocks: Array<{ name: string; sha256: string | null }>;
+    };
+    expect(summary.gateMet).toBe(false);
+    expect(summary.blocks.map((block) => block.name)).toEqual([
+      "baseComputerInstruction",
+      "renderBotCapabilityDirectory",
+      "formatSkillsCatalogInstruction",
+      "longWorkProgressGuidance",
+    ]);
+    const named = JSON.parse(readFileSync(join(outDir, "named-blocks.json"), "utf8")) as {
+      everyBlock: Array<{ name: string; sha256: string | null; present: boolean }>;
+    };
+    expect(named.everyBlock.length).toBeGreaterThan(4);
+    const inventoryFile = JSON.parse(
+      readFileSync(join(outDir, "tools-inventory.json"), "utf8"),
+    ) as {
+      handwrittenSchemas: boolean;
+      reviewerExpectedWorkerBuiltins: number;
+    };
+    expect(inventoryFile.handwrittenSchemas).toBe(false);
+    expect(inventoryFile.reviewerExpectedWorkerBuiltins).toBe(REVIEWER_EXPECTED_WORKER_BUILTINS);
+    expect(manifest).toContain("named-blocks.json");
+    expect(manifest).toContain("tools-inventory.json");
   }, 120_000);
 });

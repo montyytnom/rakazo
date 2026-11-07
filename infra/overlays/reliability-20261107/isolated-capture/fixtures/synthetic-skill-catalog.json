@@ -1,0 +1,8 @@
+[
+  {
+    "name": "synthetic-capture-skill",
+    "description": "Synthetic capture fixture skill. No live account.",
+    "source": "user",
+    "readOnly": false
+  }
+]
