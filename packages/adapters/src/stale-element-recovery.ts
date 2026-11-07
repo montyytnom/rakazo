@@ -83,12 +83,18 @@ export async function recoverStaleBrowserAct(input: {
   context: AdapterContext;
   actions: BrowserActStep[];
   memory: RefMemory;
+  /** Extra fields forwarded to browser.act (overlay login-guard `guard`, etc.). */
+  actExtras?: Record<string, unknown>;
 }): Promise<BrowserActResult & { recovered?: boolean }> {
-  const first = await input.browser.act(
-    input.computer,
-    { actions: input.actions, signal: input.context.signal },
-    input.context,
-  );
+  const act = (actions: BrowserActStep[]) =>
+    input.browser.act(
+      input.computer,
+      { actions, signal: input.context.signal, ...input.actExtras } as Parameters<
+        BrowserProvider["act"]
+      >[1],
+      input.context,
+    );
+  const first = await act(input.actions);
   if (first.ok || !isStaleElementError(first.error)) {
     rememberSnapshot(input.memory, first.elements, first.url);
     return first;
@@ -139,11 +145,7 @@ export async function recoverStaleBrowserAct(input: {
       error: `${first.error ?? "Stale element ref"}. Fresh snapshot taken; use the new refs. Do not retry the old ref.`,
     };
   }
-  const second = await input.browser.act(
-    input.computer,
-    { actions: remapped, signal: input.context.signal },
-    input.context,
-  );
+  const second = await act(remapped);
   rememberSnapshot(input.memory, second.elements ?? snap.elements, second.url ?? snap.url);
   if (second.ok) return { ...second, recovered: true };
   return {

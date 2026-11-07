@@ -75,9 +75,22 @@ export function resolveTurnIntentId(
   ).intentId;
 }
 
+function liveToolArgs(args: Record<string, unknown>): Record<string, unknown> {
+  if (
+    args.scope === "thread-intent" &&
+    args.args &&
+    typeof args.args === "object" &&
+    !Array.isArray(args.args)
+  ) {
+    return args.args as Record<string, unknown>;
+  }
+  return args;
+}
+
 export function innerExecutedToolName(name: string, args: Record<string, unknown>): string {
+  const live = liveToolArgs(args);
   if (name === "installed_execute_tool" || name === "COMPOSIO_MULTI_EXECUTE_TOOL") {
-    const inner = args.name ?? args.tool_name ?? args.tool;
+    const inner = live.name ?? live.tool_name ?? live.tool;
     if (typeof inner === "string" && inner.trim()) return inner.trim();
   }
   return name;
@@ -87,18 +100,19 @@ export function classifyIrreversibleTool(
   name: string,
   args: Record<string, unknown> = {},
 ): IrreversibleClassification | null {
+  const live = liveToolArgs(args);
   const tool = innerExecutedToolName(name, args);
-  if (name === "request_secret" && args.generate === true) {
+  if (name === "request_secret" && live.generate === true) {
     return {
       class: "secret-generate",
-      subject: String(args.destination ?? args.origin ?? "secret"),
+      subject: String(live.destination ?? live.origin ?? "secret"),
     };
   }
   if (SEND_NAME.test(tool)) {
-    return { class: "send", subject: sendSubject(args) };
+    return { class: "send", subject: sendSubject(live) };
   }
   if (PURCHASE_NAME.test(tool)) {
-    return { class: "purchase", subject: String(args.orderId ?? args.url ?? tool) };
+    return { class: "purchase", subject: String(live.orderId ?? live.url ?? tool) };
   }
   return null;
 }

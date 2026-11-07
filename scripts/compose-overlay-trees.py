@@ -1,0 +1,692 @@
+#!/usr/bin/env python3
+"""Compose production-effective api/worker trees from 926710a + overlay archive.
+
+Does not talk to production. Overlay sources stay out of git.
+
+Usage:
+  python3 scripts/compose-overlay-trees.py --out .compose
+  python3 scripts/compose-overlay-trees.py --out .compose --patch --test-shim
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = Path(
+    subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip()
+)
+BASE = "926710a09b30a6c1f83029da88dfe06656b031f2"
+DEFAULT_OVERLAY = Path("/tmp/overlay-export/overlay-export")
+
+NEW_HELPERS = [
+    "packages/core/src/irreversible-effect.ts",
+    "packages/core/src/secret-result-handle.ts",
+    "packages/core/src/completion-artifact.ts",
+    "packages/core/src/compaction-provenance.ts",
+    "packages/core/src/handoff-delivery.ts",
+    "packages/adapters/src/stale-element-recovery.ts",
+    "packages/adapters/src/desktop-tool-contract.ts",
+    "packages/adapters/src/protected-result.ts",
+    "packages/adapters/src/model-stream-error.ts",
+]
+
+REQUIRED_ARCHIVE = [
+    "MOUNT-MAP.tsv",
+    "FILE-HASHES.tsv",
+    "COMPOSE-CHAINS.txt",
+    "MANIFEST.md",
+    "opt/docker/rakazo/patches/amazon-signin-verify-20261106/worker/src/worker/executor.ts",
+    "opt/docker/rakazo/patches/browserextract/executor.ts",
+    "opt/docker/rakazo/patches/savedlogins-20261104/src/worker/browser-tools.ts",
+    "opt/docker/rakazo/patches/browserextract/browser-tools.ts",
+    "opt/docker/rakazo/patches/update-20261020/build/history-compaction.ts",
+    "opt/docker/rakazo/patches/update-20261020/build/bot-messages.ts",
+    "opt/docker/rakazo/patches/thinkbudget/pi-openai-compatible-provider.ts",
+]
+
+
+def sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    h.update(path.read_bytes())
+    return h.hexdigest()
+
+
+def missing_archive(overlay: Path) -> list[str]:
+    missing = []
+    if not overlay.is_dir():
+        return [str(overlay)]
+    for rel in REQUIRED_ARCHIVE:
+        if not (overlay / rel).exists():
+            missing.append(str(overlay / rel))
+    return missing
+
+
+def git_archive_into(dest: Path) -> None:
+    dest.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(
+        ["git", "archive", BASE, "packages/adapters/src", "packages/core/src", "packages/contracts/src"],
+        cwd=REPO,
+        stdout=subprocess.PIPE,
+        check=True,
+    )
+    subprocess.run(["tar", "-x", "-C", str(dest)], input=proc.stdout, check=True)
+
+
+def parse_mount_map(overlay: Path) -> list[dict[str, str]]:
+    rows = []
+    lines = (overlay / "MOUNT-MAP.tsv").read_text().splitlines()
+    header = lines[0].split("\t")
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        cols = line.split("\t")
+        row = {header[i]: cols[i] if i < len(cols) else "" for i in range(len(header))}
+        rows.append(row)
+    return rows
+
+
+def overlay_file(overlay: Path, source: str) -> Path | None:
+    if not source or source in {"dir", "missing"}:
+        return None
+    rel = source[1:] if source.startswith("/") else source
+    # archive stores opt/docker/... under overlay root
+    if rel.startswith("opt/docker/"):
+        path = overlay / rel
+    else:
+        path = overlay / rel
+    return path if path.is_file() else None
+
+
+SKIP_MOUNT_HASHES = {"dir", "missing", "api-only", "worker-only", ""}
+SKIP_SOURCE_PREFIXES = (
+    "/opt/docker/rakazo/secrets/",
+    "/opt/docker/rakazo/data",
+    "/opt/docker/rakazo/login-guard",
+    "/var/lib/docker/",
+)
+
+
+def apply_mounts(overlay: Path, dest: Path, service: str) -> tuple[list[dict[str, str]], list[str]]:
+    applied = []
+    missing = []
+    for row in parse_mount_map(overlay):
+        dest_in = row.get("destination_in_container", "")
+        if not dest_in.startswith("/app/"):
+            continue
+        src_key = "worker_source" if service == "worker" else "api_source"
+        hash_key = "worker_sha256" if service == "worker" else "api_sha256"
+        source = row.get(src_key, "")
+        expected = row.get(hash_key, "")
+        if not source or expected in SKIP_MOUNT_HASHES:
+            continue
+        if source.startswith(SKIP_SOURCE_PREFIXES):
+            continue
+        src = overlay_file(overlay, source)
+        if src is None:
+            missing.append(f"{source} (MOUNT-MAP sha256={expected})")
+            continue
+        got = sha256(src)
+        if expected and got != expected:
+            raise SystemExit(f"preimage hash mismatch {source}: got {got} want {expected}")
+        rel = dest_in[len("/app/") :]
+        target = dest / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, target)
+        applied.append({"dest": rel, "source": source, "sha256": got})
+    return applied, missing
+
+
+def shim_missing_bot_secrets(dest: Path) -> None:
+    """Overlay worker bot-secrets.ts is in MOUNT-MAP but was not in the supplied archive."""
+    path = dest / "packages/adapters/src/bot-secrets.ts"
+    text = path.read_text()
+    if "export async function plainLoginFillProblem" not in text:
+        text += """
+/** Archive gap: overlay bot-secrets.ts (MOUNT-MAP b22b7f69…) was not exported. */
+export async function plainLoginFillProblem(_input?: unknown): Promise<string | undefined> {
+  return undefined;
+}
+export async function loginNamesForOrigin(
+  _prisma?: unknown,
+  _run?: unknown,
+  _origin?: string,
+): Promise<string[]> {
+  return [];
+}
+"""
+        path.write_text(text)
+
+
+def copy_helpers(dest: Path) -> None:
+    for rel in NEW_HELPERS:
+        src = REPO / rel
+        if not src.is_file():
+            raise SystemExit(f"helper missing from HEAD: {rel}")
+        target = dest / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, target)
+
+
+def patch_core_index(dest: Path) -> None:
+    index = dest / "packages/core/src/index.ts"
+    text = index.read_text()
+    exports = [
+        'export * from "./compaction-provenance.js";\n',
+        'export * from "./completion-artifact.js";\n',
+        'export * from "./handoff-delivery.js";\n',
+        'export * from "./irreversible-effect.js";\n',
+        'export * from "./secret-result-handle.js";\n',
+    ]
+    for line in exports:
+        if line not in text:
+            text += line if text.endswith("\n") else "\n" + line
+    index.write_text(text)
+
+
+def replace_once(path: Path, old: str, new: str, label: str) -> None:
+    text = path.read_text()
+    count = text.count(old)
+    if count != 1:
+        raise SystemExit(f"{path}: {label} matched {count} times")
+    path.write_text(text.replace(old, new, 1))
+
+
+def insert_after_once(path: Path, anchor: str, insertion: str, label: str) -> None:
+    replace_once(path, anchor, anchor + insertion, label)
+
+
+def patch_executor(path: Path) -> None:
+    replace_once(
+        path,
+        "  userTurnMessageForRun,\n} from \"@rakazo/core\";\n",
+        "  userTurnMessageForRun,\n"
+        "  classifyBrowserMutation,\n"
+        "  classifyIrreversibleTool,\n"
+        "  irreversibleEffectRequest,\n"
+        "  isThreadIrreversibleEffectKey,\n"
+        "  redactProtectedTree,\n"
+        "  resolveTurnIntent,\n"
+        "  sameThreadIrreversibleOwner,\n"
+        "  threadIrreversibleEffectKey,\n"
+        "  UNAUTHORIZED_IRREVERSIBLE,\n"
+        "} from \"@rakazo/core\";\n",
+        "core irreversible imports",
+    )
+    insert_after_once(
+        path,
+        'from "./browser-tools.js";\n',
+        'import { DESKTOP_LAUNCH_UNSUPPORTED, sandboxLaunchUnsupported } from "./desktop-tool-contract.js";\n'
+        'import { redactReplayResult } from "./protected-result.js";\n'
+        'import { browserActLabels, createRefMemory } from "./stale-element-recovery.js";\n',
+        "helper module imports",
+    )
+    insert_after_once(
+        path,
+        "        const mutatingEffectOccurrences = new Map<string, number>();\n"
+        "        const consumedEffectIds = new Set<string>();\n",
+        "        const pageRefMemory = createRefMemory();\n"
+        "        const turnIntent = resolveTurnIntent(\n"
+        "          { id: run.sourceMessageId, text: task.prompt },\n"
+        "          history\n"
+        "            .filter((message) => message.role === \"user\")\n"
+        "            .map((message) => ({ id: message.id, text: message.content })),\n"
+        "        );\n"
+        "        const intentId = turnIntent.intentId;\n",
+        "turn intent + ref memory",
+    )
+    replace_once(
+        path,
+        "          const effectKey =\n"
+        "            usesApprovalKey && occurrence === 0\n"
+        "              ? approvalEffectKey(runId, replayEffectToolName, args)\n"
+        "              : toolEffectIdempotencyKey(runId, replayEffectToolName, args, occurrence);\n",
+        "          let irreversible = classifyIrreversibleTool(replayEffectToolName, args);\n"
+        "          if (!irreversible && replayEffectToolName === \"browser_act\") {\n"
+        "            irreversible = classifyBrowserMutation(\n"
+        "              browserActLabels(args, pageRefMemory),\n"
+        "              pageRefMemory.lastUrl ?? \"\",\n"
+        "            );\n"
+        "          }\n"
+        "          if (irreversible && !turnIntent.authorized) {\n"
+        "            return { error: UNAUTHORIZED_IRREVERSIBLE, uncertain: true };\n"
+        "          }\n"
+        "          if (irreversible) {\n"
+        "            effectRequest = irreversibleEffectRequest(\n"
+        "              irreversible,\n"
+        "              run.threadId,\n"
+        "              intentId,\n"
+        "              args,\n"
+        "              turnIntent.sourceMessageId,\n"
+        "            );\n"
+        "          }\n"
+        "          const effectKey = irreversible\n"
+        "            ? threadIrreversibleEffectKey({\n"
+        "                threadId: run.threadId,\n"
+        "                intentId,\n"
+        "                class: irreversible.class,\n"
+        "                subject: irreversible.subject,\n"
+        "              })\n"
+        "            : usesApprovalKey && occurrence === 0\n"
+        "              ? approvalEffectKey(runId, replayEffectToolName, args)\n"
+        "              : toolEffectIdempotencyKey(runId, replayEffectToolName, args, occurrence);\n",
+        "irreversible effectKey",
+    )
+    replace_once(
+        path,
+        "              } else {\n"
+        "                return gate.result;\n"
+        "              }",
+        "              } else {\n"
+        "                return redactReplayResult(gate.result, runSecrets);\n"
+        "              }",
+        "redact duplicate replay",
+    )
+    replace_once(
+        path,
+        "                  claimedEffect ? \"executing\" : \"intended\",\n"
+        "                  result,\n"
+        "                )\n"
+        "              : Promise.resolve(true);\n"
+        "          const finish = async (result: unknown) =>\n"
+        "            (await persistEffectResult(result)) ? result : uncertainEffectResult(name, args);",
+        "                  claimedEffect ? \"executing\" : \"intended\",\n"
+        "                  redactProtectedTree(result, runSecrets),\n"
+        "                )\n"
+        "              : Promise.resolve(true);\n"
+        "          const finish = async (result: unknown) => {\n"
+        "            const sanitized = redactProtectedTree(result, runSecrets);\n"
+        "            return (await persistEffectResult(sanitized))\n"
+        "              ? sanitized\n"
+        "              : uncertainEffectResult(name, args);\n"
+        "          };",
+        "persist/finish sanitization",
+    )
+    replace_once(
+        path,
+        "                await recordComputerAction(\"launch_app\", application, {\n"
+        "                  error: error instanceof Error ? error.message : \"could not launch app\",\n"
+        "                });\n"
+        "                throw error;",
+        "                await recordComputerAction(\"launch_app\", application, {\n"
+        "                  error: error instanceof Error ? error.message : \"could not launch app\",\n"
+        "                });\n"
+        "                if (sandboxLaunchUnsupported(error)) {\n"
+        "                  return { error: DESKTOP_LAUNCH_UNSUPPORTED };\n"
+        "                }\n"
+        "                throw error;",
+        "launch_app unsupported recovery",
+    )
+    replace_once(
+        path,
+        "                    redactions,\n",
+        "                    redactions,\n"
+        "                    refMemory: pageRefMemory,\n",
+        "pass refMemory into browser_act",
+    )
+    replace_once(
+        path,
+        "  if (existing && (existing.runId !== run.id || existing.spaceId !== run.spaceId)) {\n"
+        "    throw new Error(\"Stored tool execution does not belong to this run.\");\n"
+        "  }",
+        "  if (existing && (existing.runId !== run.id || existing.spaceId !== run.spaceId)) {\n"
+        "    if (\n"
+        "      isThreadIrreversibleEffectKey(idempotencyKey) &&\n"
+        "      sameThreadIrreversibleOwner({\n"
+        "        existingSpaceId: existing.spaceId,\n"
+        "        existingRequest: existing.request,\n"
+        "        spaceId: run.spaceId,\n"
+        "        threadId: run.threadId,\n"
+        "        intentId: (() => {\n"
+        "          if (!request || typeof request !== \"object\" || Array.isArray(request)) return undefined;\n"
+        "          const value = (request as { intentId?: unknown }).intentId;\n"
+        "          return typeof value === \"string\" && value ? value : undefined;\n"
+        "        })(),\n"
+        "      })\n"
+        "    ) {\n"
+        "      consumedIds?.add(existing.id);\n"
+        "      await deps.events.append({\n"
+        "        spaceId: run.spaceId,\n"
+        "        threadId: run.threadId,\n"
+        "        botId: run.botId,\n"
+        "        type: \"effect.reconciled\",\n"
+        "        runId: run.id,\n"
+        "        payload: { executionId: idempotencyKey, kind, threadIntent: true },\n"
+        "      });\n"
+        "      return { duplicate: true, effect: existing };\n"
+        "    }\n"
+        "    throw new Error(\"Stored tool execution does not belong to this run.\");\n"
+        "  }",
+        "recordEffect thread-intent reuse",
+    )
+
+
+def patch_browser_tools_worker(path: Path) -> None:
+    insert_after_once(
+        path,
+        'import { redactConnectorPayload } from "./connector-safety.js";\n',
+        'import {\n'
+        "  createRefMemory,\n"
+        "  type RefMemory,\n"
+        "  recoverStaleBrowserAct,\n"
+        '} from "./stale-element-recovery.js";\n',
+        "stale recovery import",
+    )
+    replace_once(
+        path,
+        "    loginGuard?: BrowserLoginGuard;\n"
+        "    resolveOtpFill?: ResolveOtpFill;\n"
+        "  } = {},\n",
+        "    loginGuard?: BrowserLoginGuard;\n"
+        "    resolveOtpFill?: ResolveOtpFill;\n"
+        "    refMemory?: RefMemory;\n"
+        "  } = {},\n",
+        "refMemory option",
+    )
+    replace_once(
+        path,
+        "    const result = await browser.act(\n"
+        "      computer,\n"
+        "      {\n"
+        "        actions,\n"
+        "        signal: context.signal,\n"
+        "        ...(options.loginGuard ? { guard: options.loginGuard.guard } : {}),\n"
+        "      } as Parameters<BrowserProvider[\"act\"]>[1],\n"
+        "      context,\n"
+        "    );",
+        "    const memory = options.refMemory ?? createRefMemory();\n"
+        "    const result = await recoverStaleBrowserAct({\n"
+        "      browser,\n"
+        "      computer,\n"
+        "      context,\n"
+        "      actions,\n"
+        "      memory,\n"
+        "      actExtras: options.loginGuard ? { guard: options.loginGuard.guard } : {},\n"
+        "    });",
+        "worker browserAct recoverStale",
+    )
+
+
+def patch_browser_tools_api(path: Path) -> None:
+    insert_after_once(
+        path,
+        'import { redactConnectorPayload } from "./connector-safety.js";\n',
+        'import {\n'
+        "  createRefMemory,\n"
+        "  type RefMemory,\n"
+        "  recoverStaleBrowserAct,\n"
+        '} from "./stale-element-recovery.js";\n',
+        "stale recovery import",
+    )
+    replace_once(
+        path,
+        "    uploadRoots?: string[];\n"
+        "  } = {},\n",
+        "    uploadRoots?: string[];\n"
+        "    refMemory?: RefMemory;\n"
+        "  } = {},\n",
+        "api refMemory option",
+    )
+    replace_once(
+        path,
+        "    const result = await browser.act(computer, { actions, signal: context.signal }, context);",
+        "    const memory = options.refMemory ?? createRefMemory();\n"
+        "    const result = await recoverStaleBrowserAct({\n"
+        "      browser,\n"
+        "      computer,\n"
+        "      context,\n"
+        "      actions,\n"
+        "      memory,\n"
+        "    });",
+        "api browserAct recoverStale",
+    )
+
+
+def patch_history_compaction(path: Path) -> None:
+    replace_once(
+        path,
+        "import { blocksToAgentHistoryText, escapePromptData } from \"@rakazo/core\";\n",
+        "import { blocksToAgentHistoryText, escapePromptData, rewriteUnverifiedClaims } from \"@rakazo/core\";\n",
+        "rewriteUnverifiedClaims import",
+    )
+    replace_once(
+        path,
+        "  if (summary.length > MAX_COMPACTED_SUMMARY_CHARS) {\n"
+        "    logHistoryCompactPermanentFailure(threadId, \"summary_too_large\");\n"
+        "    return;\n"
+        "  }\n\n"
+        "  const lastSeq = batch[batch.length - 1]!.seq;",
+        "  if (summary.length > MAX_COMPACTED_SUMMARY_CHARS) {\n"
+        "    logHistoryCompactPermanentFailure(threadId, \"summary_too_large\");\n"
+        "    return;\n"
+        "  }\n"
+        "  summary = rewriteUnverifiedClaims(summary, transcript);\n\n"
+        "  const lastSeq = batch[batch.length - 1]!.seq;",
+        "compaction transcript evidence",
+    )
+
+
+def patch_bot_messages(path: Path) -> None:
+    replace_once(
+        path,
+        "      deliveryKey: `auto-outcome:${run.id}`,",
+        "      deliveryKey: `auto-outcome:${run.sourceMessageId ?? run.id}:${intent}`,",
+        "auto-outcome key",
+    )
+
+
+def patch_pi_usage(path: Path) -> None:
+    if "extractOpenAiSseError" in path.read_text():
+        return
+    insert_after_once(
+        path,
+        'import { fetchPairedWithDispatcher } from "./undici-fetch.js";\n',
+        'import { extractOpenAiSseError } from "./model-stream-error.js";\n',
+        "sse helper import",
+    )
+    replace_once(
+        path,
+        "      if (!data || data === \"[DONE]\") return;\n"
+        "      try {\n"
+        "        const event = JSON.parse(data);",
+        "      if (!data || data === \"[DONE]\") return;\n"
+        "      const streamError = extractOpenAiSseError(`${frame}\\n\\n`);\n"
+        "      if (streamError) throw new Error(streamError.message);\n"
+        "      try {\n"
+        "        const event = JSON.parse(data);",
+        "sse fail-closed before parse",
+    )
+
+
+def patch_thinkbudget_fetch(path: Path) -> None:
+    if "extractOpenAiSseError" in path.read_text():
+        return
+    insert_after_once(
+        path,
+        'import { dispatcherFetch, fetchPairedWithDispatcher } from "./undici-fetch.js";\n',
+        'import { extractOpenAiSseError } from "./model-stream-error.js";\n',
+        "thinkbudget sse import",
+    )
+    replace_once(
+        path,
+        "      return dispatcher ? await closeDispatcherWithResponse(response, dispatcher) : response;\n",
+        "      const raw = dispatcher ? await closeDispatcherWithResponse(response, dispatcher) : response;\n"
+        "      return inspectSseErrorFrames(raw);\n",
+        "thinkbudget wrap sse inspect",
+    )
+    # Keep thinking kwargs untouched; append helper at EOF.
+    text = path.read_text()
+    if "function inspectSseErrorFrames" not in text:
+        path.write_text(
+            text
+            + """
+/** Inspect a completed SSE frame before the caller consumes the completing chunk. Thinking kwargs unchanged. */
+function inspectSseErrorFrames(response: Response): Response {
+  if (!response.body || !response.headers.get("content-type")?.includes("text/event-stream")) {
+    return response;
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      const result = await reader.read();
+      if (result.done) {
+        if (buffer.trim()) {
+          const err = extractOpenAiSseError(`${buffer}\\n\\n`);
+          if (err) {
+            controller.error(new Error(err.message));
+            return;
+          }
+        }
+        controller.close();
+        return;
+      }
+      buffer += decoder.decode(result.value, { stream: true });
+      let idx: number;
+      while ((idx = buffer.search(/\\r?\\n\\r?\\n/)) !== -1) {
+        const sep = buffer.slice(idx).startsWith("\\r\\n\\r\\n") ? 4 : 2;
+        const frame = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + sep);
+        const err = extractOpenAiSseError(`${frame}\\n\\n`);
+        if (err) {
+          controller.error(new Error(err.message));
+          return;
+        }
+      }
+      controller.enqueue(result.value);
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
+  });
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+}
+"""
+        )
+
+
+def write_test_shim(dest: Path) -> None:
+    path = dest / "packages/adapters/src/computer-lifecycle.ts"
+    path.write_text(
+        """import type { AdapterContext, ComputerRef } from "@rakazo/adapter-kit";
+export type ComputerExecutionLease = {
+  computerId: string;
+  botId: string;
+  runId: string;
+  fence: number;
+};
+export class ComputerBusyError extends Error {}
+export async function acquireComputerExecutionLease() {
+  return null;
+}
+export async function acquireDedicatedScreenLeaseFence(
+  _prisma: unknown,
+  input: { computerId: string; botId: string; runId: string },
+): Promise<ComputerExecutionLease> {
+  return { computerId: input.computerId, botId: input.botId, runId: input.runId, fence: 7 };
+}
+export async function provisionComputer(
+  _deps: unknown,
+  id: string,
+  _context?: AdapterContext,
+): Promise<ComputerRef> {
+  return { id, botId: "bot-1", kind: "desktop", providerRef: id };
+}
+export async function releaseComputerExecutionLease() {}
+export async function renewComputerExecutionLease() { return true; }
+export async function holdComputerExecutionLeaseForTakeover() {}
+export function screenLeaseIdForRun(runId: string) { return `screen:${runId}`; }
+export function computerSupportsUpdate() { return true; }
+export function computerSupportsTerminal() { return true; }
+export async function replaceComputer() { return null; }
+"""
+    )
+
+
+def apply_patches(dest: Path, service: str) -> None:
+    adapters = dest / "packages/adapters/src"
+    patch_executor(adapters / "executor.ts")
+    if service == "worker":
+        patch_browser_tools_worker(adapters / "browser-tools.ts")
+    else:
+        patch_browser_tools_api(adapters / "browser-tools.ts")
+    patch_history_compaction(adapters / "history-compaction.ts")
+    patch_bot_messages(adapters / "bot-messages.ts")
+    patch_pi_usage(adapters / "pi-usage.ts")
+    patch_thinkbudget_fetch(adapters / "pi-openai-compatible-provider.ts")
+    patch_core_index(dest)
+
+
+def compose_one(overlay: Path, dest: Path, service: str, patch: bool, shim: bool) -> dict:
+    if dest.exists():
+        shutil.rmtree(dest)
+    git_archive_into(dest)
+    (dest / "package.json").write_text('{"name":"rakazo-composed","type":"module"}\n')
+    node_modules = dest / "node_modules"
+    if not node_modules.exists():
+        node_modules.symlink_to(REPO / "packages/adapters/node_modules")
+    mounts, missing_mounts = apply_mounts(overlay, dest, service)
+    copy_helpers(dest)
+    patch_core_index(dest)
+    if service == "worker":
+        shim_missing_bot_secrets(dest)
+    status = {
+        "service": service,
+        "base": BASE,
+        "patched": False,
+        "testShim": False,
+        "mounts": len(mounts),
+        "missingMounts": missing_mounts,
+        "executorPreimage": sha256(dest / "packages/adapters/src/executor.ts"),
+        "archiveGaps": {
+            "bot-secrets.ts": "MOUNT-MAP lists patches/savedlogins-20261104/src/worker/bot-secrets.ts sha256=b22b7f69…; file is not in the supplied archive. Composed worker keeps 926710a bot-secrets.ts plus stub exports plainLoginFillProblem/loginNamesForOrigin so overlay executor can load.",
+            "attachtext/vendor": "Documented export exclusion; attachment-text loads it lazily.",
+            "secrets/scrapling_token": "Documented export exclusion; not required to compile adapter sources.",
+        },
+    }
+    if patch:
+        apply_patches(dest, service)
+        status["patched"] = True
+    if shim:
+        write_test_shim(dest)
+        status["testShim"] = True
+    status["executorAfter"] = sha256(dest / "packages/adapters/src/executor.ts")
+    (dest / "COMPOSE-STATUS.json").write_text(json.dumps(status, indent=2) + "\n")
+    return status
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--overlay", default=str(DEFAULT_OVERLAY))
+    parser.add_argument("--out", default=str(REPO / ".compose"))
+    parser.add_argument("--patch", action="store_true")
+    parser.add_argument("--test-shim", action="store_true")
+    parser.add_argument("--service", choices=["worker", "api", "both"], default="both")
+    args = parser.parse_args()
+    overlay = Path(args.overlay)
+    missing = missing_archive(overlay)
+    if missing:
+        print("overlay compose blocked; missing:", file=sys.stderr)
+        print("\n".join(missing), file=sys.stderr)
+        return 2
+    out = Path(args.out)
+    services = ["worker", "api"] if args.service == "both" else [args.service]
+    for service in services:
+        label = "after" if args.patch else "before"
+        dest = out / service / label
+        status = compose_one(overlay, dest, service, args.patch, args.test_shim)
+        print(json.dumps(status))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

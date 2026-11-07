@@ -75,6 +75,18 @@ describe("classifyIrreversibleTool", () => {
       subject: "https://shop.example/checkout",
     });
   });
+
+  it("classifies a stored thread-intent request the overlay replays as args", () => {
+    expect(
+      classifyIrreversibleTool("installed_execute_tool", {
+        scope: "thread-intent",
+        args: {
+          name: "mac_messages_send",
+          arguments: { handle: "+15550100", text: "Running 10 minutes late." },
+        },
+      }),
+    ).toMatchObject({ class: "send", subject: "+15550100" });
+  });
 });
 
 describe("threadIrreversibleEffectKey", () => {

@@ -2,6 +2,12 @@
 
 Parent rollout only after backup, tests, and idle drain. This branch does not merge or deploy.
 
+## Compose + patch (offline)
+
+`python3 scripts/compose-overlay-trees.py --overlay /tmp/overlay-export/overlay-export --out .compose --patch --test-shim`
+
+Produces `.compose/{worker,api}/{before,after}` from `926710a` plus the supplied overlay mounts. `--patch` inserts HOOKS at the overlay orchestration entrypoints. The overlay archive is not committed. `bot-secrets.ts` is listed in MOUNT-MAP but is not in the supplied archive; compose records that gap and stubs the two missing named exports so the overlay executor can load.
+
 ## What this is
 
 Source repairs on production base `926710a`, plus bind-mount notes for a later worker/api recreate. Thinking budget and Flash-Next primary settings are **observed, not changed**.

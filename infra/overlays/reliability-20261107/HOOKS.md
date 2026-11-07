@@ -1,6 +1,12 @@
 # Overlay hook points (worker-effective files)
 
-Do not wholesale-replace overlay `executor.ts`. After rebuilding from this commit, or when bind-mounting new modules, apply these insertions to the live overlay copies:
+Do not wholesale-replace overlay `executor.ts`. After rebuilding from this commit, or when bind-mounting new modules, apply these insertions to the live overlay copies.
+
+Offline compose against the supplied overlay archive (hash-gated, no production):
+
+`python3 scripts/compose-overlay-trees.py --overlay "$OVERLAY_EXPORT" --out .compose --patch --test-shim`
+
+That copies `926710a` sources, overlays MOUNT-MAP files, then applies the insertions below at the live `createRunExecutor` / `browserActFromTool` / compaction / SSE fetch callsites. Entry-path proof: `packages/adapters/src/overlay-orchestration.entry.test.ts`.
 
 1. `recordEffect`: reuse `irr:v1:` keys across runs in the same thread/intent. Key is thread + authorizing **source message id** + class. Recipient is stored as authorized scope, not part of the key.
 2. Continue / Try again reuses that source message id. A later user message with the same text is a new id. Compacted summary without a live user message id is unauthorized; irreversible tools fail closed and do not execute.

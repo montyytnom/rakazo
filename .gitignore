@@ -17,6 +17,7 @@ playwright-report
 data
 apps/**/data
 .tmp
+.compose
 .DS_Store
 apps/web/dist
 apps/desktop/dist
