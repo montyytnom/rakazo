@@ -26,7 +26,10 @@ while [[ $# -gt 0 ]]; do
       echo "usage: $0 --candidate-overlay DIR --stage DIR --out DIR [--dry-run|--execute]"
       echo "       $0 --stage DIR --cleanup-stage"
       echo "env: RAKAZO_WORKER_IMAGE RAKAZO_API_IMAGE (local digest, --pull=never)"
-      echo "optional inspect-only: RAKAZO_WORKER_CONTAINER RAKAZO_API_CONTAINER"
+      echo "inspect-only required for dry-run and execute:"
+      echo "  RAKAZO_WORKER_CONTAINER=rakazo-worker-1"
+      echo "  RAKAZO_API_CONTAINER=rakazo-api-1"
+      echo "  or unset to resolve unique com.docker.compose.service=worker|api (not a guessed -1 suffix)"
       exit 0
       ;;
     *) echo "unknown arg $1" >&2; exit 2 ;;

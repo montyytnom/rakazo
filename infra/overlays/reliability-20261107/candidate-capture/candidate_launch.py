@@ -64,6 +64,12 @@ SKIP_ACTION = "skip-unchanged-image"
 PINNED_WORKER_IMAGE = "sha256:47d3423567b35333059f9ff55817c03656a43431539f0478e3eb959e13e9cdc6"
 PINNED_API_IMAGE = "sha256:c500071f5b2fde76d4bfca3ae883afb817c2265e2f113515cdb59c653d469f1f"
 EXPECTED_CANDIDATE_BINDS = 37
+EXPECTED_REPLACE_BINDS = 15
+# Live compose replicas confirmed on .67 (6:36 and 6:52 AM EST). Not rakazo-worker / rakazo-api.
+AUTHORED_WORKER_CONTAINER = "rakazo-worker-1"
+AUTHORED_API_CONTAINER = "rakazo-api-1"
+COMPOSE_SERVICE_LABEL = "com.docker.compose.service"
+COMPOSE_SERVICES = {"worker": "worker", "api": "api"}
 
 HARNESS_DEST = "/app/packages/adapters/src/candidate-capture-harness.ts"
 
@@ -282,9 +288,67 @@ def inspect_image(ref: str) -> dict:
     }
 
 
+def list_compose_replica_names(compose_service: str) -> tuple[list[str], str | None]:
+    """Unique running-or-stopped containers labeled com.docker.compose.service=worker|api."""
+    try:
+        proc = run_cmd(
+            [
+                "docker",
+                "ps",
+                "-a",
+                "--filter",
+                f"label={COMPOSE_SERVICE_LABEL}={compose_service}",
+                "--format",
+                "{{.Names}}",
+            ]
+        )
+    except FileNotFoundError:
+        return [], "docker-unavailable (no exec was attempted)"
+    if proc.returncode != 0:
+        err = (proc.stderr or "").strip() or "compose identity listing failed"
+        return [], err
+    names = [line.strip().lstrip("/") for line in proc.stdout.splitlines() if line.strip()]
+    return names, None
+
+
+def resolve_container_name(service: str, explicit: str) -> dict:
+    """Exact env name, or unique compose-label identity. Never retries a guessed -1 suffix."""
+    compose_service = COMPOSE_SERVICES[service]
+    if explicit and explicit != compose_service:
+        return {
+            "name": explicit,
+            "resolution": "explicit",
+            "composeService": compose_service,
+        }
+    names, err = list_compose_replica_names(compose_service)
+    if err:
+        return {
+            "name": explicit or "",
+            "error": err,
+            "resolution": "compose-label",
+            "composeService": compose_service,
+        }
+    if len(names) != 1:
+        return {
+            "name": explicit or "",
+            "error": (
+                f"compose identity for {compose_service} matched {names!r}, need exactly one; "
+                f"set RAKAZO_{service.upper()}_CONTAINER (live replica {AUTHORED_WORKER_CONTAINER if service == 'worker' else AUTHORED_API_CONTAINER})"
+            ),
+            "resolution": "compose-label",
+            "composeService": compose_service,
+            "matched": names,
+        }
+    return {
+        "name": names[0],
+        "resolution": "compose-label" if not explicit else "compose-service-name",
+        "composeService": compose_service,
+    }
+
+
 def inspect_container(name: str, policy: dict[str, str]) -> dict | None:
     if not name:
-        return None
+        return {"name": "", "error": "container name empty (no inspect)"}
     try:
         proc = run_cmd(["docker", "inspect", name])
     except FileNotFoundError:
@@ -485,6 +549,7 @@ def merge_mounts(
                 "path": row["path"],
                 "after_sha256": row["after_sha256"],
                 "replacedInspectedSource": mount.get("source", ""),
+                "matchedInspectedDest": True,
             }
             add(rec, candidate=True)
         else:
@@ -500,6 +565,19 @@ def merge_mounts(
     for dest, row in candidate_by_dest.items():
         if dest in seen:
             continue
+        if row["action"] == "replace-existing-bind":
+            rec = {
+                "source": row["staged_source"],
+                "destination": dest,
+                "mode": "ro",
+                "action": "unmatched-replace-existing-bind",
+                "composeAction": row["action"],
+                "path": row["path"],
+                "after_sha256": row["after_sha256"],
+                "matchedInspectedDest": False,
+            }
+            add(rec, candidate=True)
+            continue
         rec = {
             "source": row["staged_source"],
             "destination": dest,
@@ -508,6 +586,7 @@ def merge_mounts(
             "composeAction": row["action"],
             "path": row["path"],
             "after_sha256": row["after_sha256"],
+            "matchedInspectedDest": False,
         }
         add(rec, candidate=True)
 
@@ -516,6 +595,43 @@ def merge_mounts(
 
 def prefix_name(service: str) -> str:
     return f"{PREFIX}-{service}-{os.getpid()}"
+
+
+def inspect_gate(plan: dict, staged_rows: list[dict[str, str]]) -> str | None:
+    """Dry-run and execute both fail-closed. Replace rows count only when dest was inspected."""
+    live = plan.get("liveInspect") or {}
+    service = plan["service"]
+    if live.get("error"):
+        return f"{service}: inspect failed for {live.get('name') or '(empty)'}: {live['error']}"
+    if "sourceMounts" not in live:
+        return f"{service}: inspect missing (no live source mounts)"
+    mounts = live.get("sourceMounts") or []
+    if not mounts:
+        return f"{service}: inspect returned no app-source mounts"
+    needed = [
+        row
+        for row in staged_rows
+        if row["service"] == service and row["action"] == "replace-existing-bind"
+    ]
+    matched = [
+        row
+        for row in plan.get("candidateBinds") or []
+        if row.get("action") == "replace-existing-bind" and row.get("matchedInspectedDest")
+    ]
+    unmatched = [
+        row
+        for row in plan.get("candidateBinds") or []
+        if row.get("action") == "unmatched-replace-existing-bind"
+    ]
+    if unmatched or len(matched) != len(needed):
+        missing = [row["destination"] for row in unmatched] or [
+            f"/app/{row['path']}" for row in needed
+        ]
+        return (
+            f"{service}: replace-existing-bind matched {len(matched)} inspected dests, "
+            f"need {len(needed)}; unmatched={missing}"
+        )
+    return None
 
 
 def plan_service(
@@ -593,6 +709,7 @@ def plan_service(
     return {
         "service": service,
         "containerName": name,
+        "inspectTarget": container_name,
         "image": image,
         "liveInspect": live_public,
         "mounts": mounts,
@@ -661,10 +778,19 @@ def build_manifest(
                 "composeAction": row.get("composeAction"),
                 "after_sha256": row.get("after_sha256"),
                 "source": row["source"],
+                "matchedInspectedDest": bool(row.get("matchedInspectedDest")),
             }
             for plan in (worker, api)
             for row in plan.get("candidateBinds") or []
         ],
+        "authoredContainers": {
+            "worker": AUTHORED_WORKER_CONTAINER,
+            "api": AUTHORED_API_CONTAINER,
+        },
+        "inspectTargets": {
+            "worker": worker.get("inspectTarget"),
+            "api": api.get("inspectTarget"),
+        },
         "fileHashes": file_hashes,
         "createdAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "execute": execute,
@@ -735,10 +861,12 @@ def main(argv: list[str]) -> int:
         pack_sha = sha_file.read_text().split()[0]
     staged_rows = stage_after_files(overlay, stage, candidate_rows)
     policy = load_env_policy(bundle)
+    worker_resolved = resolve_container_name("worker", os.environ.get("RAKAZO_WORKER_CONTAINER", ""))
+    api_resolved = resolve_container_name("api", os.environ.get("RAKAZO_API_CONTAINER", ""))
     worker = plan_service(
         "worker",
         os.environ.get("RAKAZO_WORKER_IMAGE", PINNED_WORKER_IMAGE),
-        os.environ.get("RAKAZO_WORKER_CONTAINER", ""),
+        worker_resolved.get("name") or "",
         bundle,
         out,
         overlay,
@@ -750,7 +878,7 @@ def main(argv: list[str]) -> int:
     api = plan_service(
         "api",
         os.environ.get("RAKAZO_API_IMAGE", PINNED_API_IMAGE),
-        os.environ.get("RAKAZO_API_CONTAINER", ""),
+        api_resolved.get("name") or "",
         bundle,
         out,
         overlay,
@@ -759,12 +887,32 @@ def main(argv: list[str]) -> int:
         pack_sha=pack_sha,
         git_head=git_head,
     )
+    worker["containerResolution"] = worker_resolved
+    api["containerResolution"] = api_resolved
+    for plan, resolved in ((worker, worker_resolved), (api, api_resolved)):
+        live = plan.get("liveInspect") or {}
+        if resolved.get("error") and not live.get("error"):
+            plan["liveInspect"] = {
+                **(live if isinstance(live, dict) else {}),
+                "name": resolved.get("name") or "",
+                "error": resolved["error"],
+                "resolution": resolved.get("resolution"),
+            }
     combined = len(worker["candidateBinds"]) + len(api["candidateBinds"])
-    if combined != EXPECTED_CANDIDATE_BINDS:
-        raise SystemExit(f"planned candidate binds {combined} != {EXPECTED_CANDIDATE_BINDS}")
     manifest = build_manifest(worker, api, execute, overlay, pack_sha, git_head, staged_rows)
+    gates = [inspect_gate(worker, staged_rows), inspect_gate(api, staged_rows)]
+    gate_errors = [item for item in gates if item]
+    replace_matched = sum(
+        1
+        for row in manifest["candidateBinds"]
+        if row["action"] == "replace-existing-bind" and row.get("matchedInspectedDest")
+    )
+    manifest["inspectGateOk"] = not gate_errors
+    manifest["inspectGateErrors"] = gate_errors
+    manifest["replaceExistingBindMatched"] = replace_matched
+    manifest["expectedReplaceExistingBind"] = EXPECTED_REPLACE_BINDS
     (out / "dry-run-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    binds_tsv = ["service\tdest\taction\tcomposeAction\tafter_sha256\tsource"]
+    binds_tsv = ["service\tdest\taction\tcomposeAction\tmatchedInspectedDest\tafter_sha256\tsource"]
     for row in manifest["candidateBinds"]:
         binds_tsv.append(
             "\t".join(
@@ -773,6 +921,7 @@ def main(argv: list[str]) -> int:
                     row["destination"],
                     row["action"],
                     str(row.get("composeAction") or ""),
+                    str(row.get("matchedInspectedDest")).lower(),
                     str(row.get("after_sha256") or ""),
                     row["source"],
                 ]
@@ -780,7 +929,19 @@ def main(argv: list[str]) -> int:
         )
     (out / "candidate-binds.tsv").write_text("\n".join(binds_tsv) + "\n")
     print(out / "dry-run-manifest.json")
+    if gate_errors:
+        for item in gate_errors:
+            print(item, file=sys.stderr)
+        print("dry-run refused: inspect gate failed (not a 37-bind pass)", file=sys.stderr)
+        return 2
+    if combined != EXPECTED_CANDIDATE_BINDS:
+        print(
+            f"planned candidate binds {combined} != {EXPECTED_CANDIDATE_BINDS}",
+            file=sys.stderr,
+        )
+        return 2
     print(f"candidate binds: {combined}")
+    print(f"replace-existing-bind matched inspected dests: {replace_matched}")
     for row in manifest["candidateBinds"]:
         print(f"{row['service']}\t{row['action']}\t{row['destination']}")
     if not execute:
@@ -789,23 +950,6 @@ def main(argv: list[str]) -> int:
     if not worker["image"].get("local") or not api["image"].get("local"):
         print("refusing execute: both images must exist locally (no pull)", file=sys.stderr)
         return 1
-    for plan in (worker, api):
-        live = plan.get("liveInspect") or {}
-        if live.get("error"):
-            print(f"refusing execute: inspect failed for {plan['service']}: {live['error']}", file=sys.stderr)
-            return 1
-        replace = [row for row in plan["candidateBinds"] if row["action"] == "replace-existing-bind"]
-        compose_replace = [
-            row
-            for row in staged_rows
-            if row["service"] == plan["service"] and row["action"] == "replace-existing-bind"
-        ]
-        if len(replace) < len(compose_replace):
-            print(
-                f"refusing execute: {plan['service']} replace-existing-bind dest missing from inspect",
-                file=sys.stderr,
-            )
-            return 1
     started = []
     try:
         for plan in (worker, api):

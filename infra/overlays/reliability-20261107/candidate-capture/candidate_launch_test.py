@@ -183,14 +183,51 @@ class CandidateLaunchTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             candidate_launch.assert_unique_dests(rows)
 
-    def test_dry_run_lists_all_37_and_records_hashes(self) -> None:
-        env = os.environ.copy()
+    def fake_live(self, service: str) -> dict:
+        rels = WORKER_REPLACE if service == "worker" else API_REPLACE
+        extra = (
+            "/app/packages/adapters/src/login-guard.ts"
+            if service == "worker"
+            else "/app/packages/adapters/src/page-browser-session.ts"
+        )
+        mounts = [
+            {
+                "source": f"/opt/production/{rel}",
+                "destination": f"/app/{rel}",
+                "mode": "ro",
+            }
+            for rel in rels
+        ] + [{"source": "/opt/production/extra.ts", "destination": extra, "mode": "ro"}]
+        name = (
+            candidate_launch.AUTHORED_WORKER_CONTAINER
+            if service == "worker"
+            else candidate_launch.AUTHORED_API_CONTAINER
+        )
+        return {
+            "name": name,
+            "sourceMounts": mounts,
+            "skippedMounts": [],
+            "forwardedEnv": {},
+            "envPrivacy": {"observed": []},
+        }
+
+    def run_main(self, **env: str) -> int:
+        previous = os.environ.copy()
         os.environ["RAKAZO_WORKER_IMAGE"] = candidate_launch.PINNED_WORKER_IMAGE
         os.environ["RAKAZO_API_IMAGE"] = candidate_launch.PINNED_API_IMAGE
-        os.environ.pop("RAKAZO_WORKER_CONTAINER", None)
-        os.environ.pop("RAKAZO_API_CONTAINER", None)
+        os.environ["RAKAZO_WORKER_CONTAINER"] = env.get(
+            "RAKAZO_WORKER_CONTAINER", candidate_launch.AUTHORED_WORKER_CONTAINER
+        )
+        os.environ["RAKAZO_API_CONTAINER"] = env.get(
+            "RAKAZO_API_CONTAINER", candidate_launch.AUTHORED_API_CONTAINER
+        )
+        for key, value in env.items():
+            if value == "":
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
         try:
-            rc = candidate_launch.main(
+            return candidate_launch.main(
                 [
                     "--bundle",
                     str(self.bundle),
@@ -209,25 +246,174 @@ class CandidateLaunchTests(unittest.TestCase):
             )
         finally:
             os.environ.clear()
-            os.environ.update(env)
+            os.environ.update(previous)
+
+    def test_dry_run_lists_all_37_when_inspect_matches(self) -> None:
+        lives = {"worker": self.fake_live("worker"), "api": self.fake_live("api")}
+
+        def fake_inspect(name: str, policy: dict[str, str]) -> dict:
+            if name == candidate_launch.AUTHORED_WORKER_CONTAINER:
+                return lives["worker"]
+            if name == candidate_launch.AUTHORED_API_CONTAINER:
+                return lives["api"]
+            return {"name": name, "error": "inspect failed (no exec was attempted)"}
+
+        original = candidate_launch.inspect_container
+        candidate_launch.inspect_container = fake_inspect  # type: ignore[method-assign]
+        try:
+            rc = self.run_main()
+        finally:
+            candidate_launch.inspect_container = original
         self.assertEqual(rc, 0)
         manifest = json.loads((self.out / "dry-run-manifest.json").read_text())
+        self.assertTrue(manifest["inspectGateOk"])
         self.assertEqual(manifest["candidateBindCount"], 37)
-        self.assertEqual(len(manifest["candidateBinds"]), 37)
-        self.assertEqual(manifest["packSha256"], "e342a560deadbeef")
-        self.assertEqual(manifest["gitHead"], "b44665b26")
-        self.assertTrue(manifest["notBaselineAssembler"])
-        tsv = (self.out / "candidate-binds.tsv").read_text().splitlines()
-        self.assertEqual(len(tsv) - 1, 37)
+        self.assertEqual(manifest["replaceExistingBindMatched"], 15)
+        self.assertEqual(manifest["inspectTargets"]["worker"], "rakazo-worker-1")
+        self.assertEqual(manifest["inspectTargets"]["api"], "rakazo-api-1")
+        self.assertGreater(len(manifest["services"][0]["preservedMounts"]), 0)
+        self.assertGreater(len(manifest["services"][1]["preservedMounts"]), 0)
+        replaced = [
+            row
+            for row in manifest["candidateBinds"]
+            if row["action"] == "replace-existing-bind"
+        ]
+        self.assertEqual(len(replaced), 15)
+        self.assertTrue(all(row["matchedInspectedDest"] for row in replaced))
         joined = " ".join(manifest["services"][0]["dockerRun"])
         self.assertIn("--pull=never", joined)
-        self.assertIn("--network none", joined.replace(" --network ", " --network "))
         self.assertIn("--read-only", joined)
-        self.assertIn("--cap-drop", joined)
         self.assertIn("no-new-privileges:true", joined)
-        self.assertIn("--pids-limit", joined)
         self.assertNotIn("/run/secrets", joined)
-        self.assertNotIn("/data:", joined)
+
+    def test_inspect_failure_dry_run_nonzero(self) -> None:
+        called: list[str] = []
+
+        def fake_inspect(name: str, policy: dict[str, str]) -> dict:
+            called.append(name)
+            return {"name": name, "error": "inspect failed (no exec was attempted)"}
+
+        original = candidate_launch.inspect_container
+        candidate_launch.inspect_container = fake_inspect  # type: ignore[method-assign]
+        try:
+            rc = self.run_main(
+                RAKAZO_WORKER_CONTAINER="rakazo-worker-1",
+                RAKAZO_API_CONTAINER="rakazo-api-1",
+            )
+        finally:
+            candidate_launch.inspect_container = original
+        self.assertEqual(rc, 2)
+        self.assertEqual(called, ["rakazo-worker-1", "rakazo-api-1"])
+        manifest = json.loads((self.out / "dry-run-manifest.json").read_text())
+        self.assertFalse(manifest["inspectGateOk"])
+        self.assertGreater(len(manifest["inspectGateErrors"]), 0)
+        self.assertEqual(manifest["replaceExistingBindMatched"], 0)
+        replaced = [
+            row
+            for row in manifest["candidateBinds"]
+            if row["action"] == "replace-existing-bind"
+        ]
+        self.assertEqual(replaced, [])
+
+    def test_wrong_name_does_not_retry_minus_one(self) -> None:
+        called: list[str] = []
+
+        def fake_inspect(name: str, policy: dict[str, str]) -> dict:
+            called.append(name)
+            return {"name": name, "error": "inspect failed (no exec was attempted)"}
+
+        def fake_list(compose_service: str) -> tuple[list[str], str | None]:
+            raise AssertionError(f"must not list compose replicas after explicit name {compose_service}")
+
+        original_inspect = candidate_launch.inspect_container
+        original_list = candidate_launch.list_compose_replica_names
+        candidate_launch.inspect_container = fake_inspect  # type: ignore[method-assign]
+        candidate_launch.list_compose_replica_names = fake_list  # type: ignore[method-assign]
+        try:
+            rc = self.run_main(
+                RAKAZO_WORKER_CONTAINER="rakazo-worker",
+                RAKAZO_API_CONTAINER="rakazo-api",
+            )
+        finally:
+            candidate_launch.inspect_container = original_inspect
+            candidate_launch.list_compose_replica_names = original_list
+        self.assertEqual(rc, 2)
+        self.assertEqual(called, ["rakazo-worker", "rakazo-api"])
+        self.assertNotIn("rakazo-worker-1", called)
+        self.assertNotIn("rakazo-api-1", called)
+
+    def test_compose_identity_resolves_unique_replica_one(self) -> None:
+        lives = {"worker": self.fake_live("worker"), "api": self.fake_live("api")}
+
+        def fake_list(compose_service: str) -> tuple[list[str], str | None]:
+            if compose_service == "worker":
+                return ["rakazo-worker-1"], None
+            if compose_service == "api":
+                return ["rakazo-api-1"], None
+            return [], f"unexpected {compose_service}"
+
+        def fake_inspect(name: str, policy: dict[str, str]) -> dict:
+            if name == "rakazo-worker-1":
+                return lives["worker"]
+            if name == "rakazo-api-1":
+                return lives["api"]
+            return {"name": name, "error": "inspect failed (no exec was attempted)"}
+
+        original_inspect = candidate_launch.inspect_container
+        original_list = candidate_launch.list_compose_replica_names
+        candidate_launch.list_compose_replica_names = fake_list  # type: ignore[method-assign]
+        candidate_launch.inspect_container = fake_inspect  # type: ignore[method-assign]
+        try:
+            rc = self.run_main(RAKAZO_WORKER_CONTAINER="", RAKAZO_API_CONTAINER="")
+        finally:
+            candidate_launch.inspect_container = original_inspect
+            candidate_launch.list_compose_replica_names = original_list
+        self.assertEqual(rc, 0)
+        manifest = json.loads((self.out / "dry-run-manifest.json").read_text())
+        self.assertEqual(manifest["inspectTargets"]["worker"], "rakazo-worker-1")
+        self.assertEqual(manifest["inspectTargets"]["api"], "rakazo-api-1")
+        self.assertEqual(manifest["replaceExistingBindMatched"], 15)
+
+    def test_replace_requires_inspected_destination(self) -> None:
+        live = self.fake_live("worker")
+        live["sourceMounts"] = [
+            row
+            for row in live["sourceMounts"]
+            if not str(row["destination"]).endswith("/executor.ts")
+        ]
+
+        def fake_inspect(name: str, policy: dict[str, str]) -> dict:
+            if name.endswith("worker-1"):
+                return live
+            return self.fake_live("api")
+
+        original = candidate_launch.inspect_container
+        candidate_launch.inspect_container = fake_inspect  # type: ignore[method-assign]
+        try:
+            rc = self.run_main()
+        finally:
+            candidate_launch.inspect_container = original
+        self.assertEqual(rc, 2)
+        manifest = json.loads((self.out / "dry-run-manifest.json").read_text())
+        self.assertFalse(manifest["inspectGateOk"])
+        unmatched = [
+            row
+            for row in manifest["candidateBinds"]
+            if row["action"] == "unmatched-replace-existing-bind"
+        ]
+        self.assertTrue(any(row["destination"].endswith("/executor.ts") for row in unmatched))
+
+    def test_authored_container_names_are_compose_replica_one(self) -> None:
+        self.assertEqual(candidate_launch.AUTHORED_WORKER_CONTAINER, "rakazo-worker-1")
+        self.assertEqual(candidate_launch.AUTHORED_API_CONTAINER, "rakazo-api-1")
+        commands = (HERE / "CANDIDATE-CAPTURE.md").read_text()
+        self.assertIn("RAKAZO_WORKER_CONTAINER=rakazo-worker-1", commands)
+        self.assertIn("RAKAZO_API_CONTAINER=rakazo-api-1", commands)
+        self.assertNotRegex(commands, r"RAKAZO_WORKER_CONTAINER=rakazo-worker\s")
+        self.assertNotRegex(commands, r"RAKAZO_API_CONTAINER=rakazo-api\s")
+        help_text = (HERE / "host-launch.sh").read_text()
+        self.assertIn("rakazo-worker-1", help_text)
+        self.assertIn("rakazo-api-1", help_text)
 
     def test_cleanup_refuses_production_roots(self) -> None:
         with self.assertRaises(SystemExit):

@@ -336,7 +336,7 @@ logs = sorted(p.name for p in (stage / "logs").glob("*") if p.is_file())
 index = [
     "# Pack index",
     "",
-    "Sat Nov 7, 2026, 6:48 AM EST. Scratch-only. Not production.",
+    "Sat Nov 7, 2026, 6:54 AM EST. Scratch-only. Not production.",
     "",
     "## Recipe",
     "",
