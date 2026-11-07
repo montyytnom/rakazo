@@ -39,8 +39,23 @@ export function captureBuiltinToolsJson(): {
   };
 }
 
-export function captureCallLimits(env: NodeJS.ProcessEnv = process.env): {
+export const SANITIZED_PRODUCTION_SHAPED_ENV: Record<string, string> = {
+  RAKAZO_MODEL_STREAM_TIMEOUT_MS: "600000",
+  MAX_TOOL_CALLS_PER_TURN: "150",
+  RAKAZO_THINKING_BUDGET: "64",
+  RAKAZO_THINKING_BUDGET_MODELS: "qwen3.8-flash-next",
+};
+
+export type CaptureEnvSource = "agent-vm-defaults" | "sanitized-production-shaped";
+
+export function captureCallLimits(
+  env: NodeJS.ProcessEnv = process.env,
+  envSource: CaptureEnvSource = "agent-vm-defaults",
+): {
   label: typeof CAPTURE_LABEL;
+  envSource: CaptureEnvSource;
+  productionFaithful: false;
+  liveGate: "locked";
   thinking: {
     budget: string | null;
     models: string | null;
@@ -56,6 +71,9 @@ export function captureCallLimits(env: NodeJS.ProcessEnv = process.env): {
 } {
   return {
     label: CAPTURE_LABEL,
+    envSource,
+    productionFaithful: false,
+    liveGate: "locked",
     thinking: {
       budget: env.RAKAZO_THINKING_BUDGET ?? null,
       models: env.RAKAZO_THINKING_BUDGET_MODELS ?? null,
@@ -140,7 +158,9 @@ export function reconstructOfflinePhases(input: {
 }): {
   kind: typeof RECONSTRUCTION;
   productionCapture: false;
+  productionFaithful: false;
   productionLiveCapture: typeof PRODUCTION_CAPTURE;
+  liveGate: "locked";
   thinkingUnchanged: true;
   phases: {
     first: { tools: CapturedToolWire[]; params: ReturnType<typeof captureCallLimits> };
@@ -151,12 +171,16 @@ export function reconstructOfflinePhases(input: {
 } {
   const params = {
     ...input.limits,
+    productionFaithful: false as const,
+    liveGate: "locked" as const,
     thinking: { ...input.limits.thinking, unchanged: true as const },
   };
   return {
     kind: RECONSTRUCTION,
     productionCapture: false,
+    productionFaithful: false,
     productionLiveCapture: PRODUCTION_CAPTURE,
+    liveGate: "locked",
     thinkingUnchanged: true,
     phases: {
       first: { tools: input.baseTools, params },

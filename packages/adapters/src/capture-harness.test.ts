@@ -44,8 +44,24 @@ describe("capture harness", () => {
       baseTools: captureBuiltinToolsJson().tools,
     });
     expect(phases.productionCapture).toBe(false);
+    expect(phases.productionFaithful).toBe(false);
+    expect(phases.liveGate).toBe("locked");
     expect(phases.kind).toBe(RECONSTRUCTION);
     expect(phases.productionLiveCapture).toBe(PRODUCTION_CAPTURE);
     expect(phases.apiWorkerNameDelta).toEqual(["browser_extract"]);
+    const shaped = captureCallLimits(
+      {
+        RAKAZO_MODEL_STREAM_TIMEOUT_MS: "600000",
+        MAX_TOOL_CALLS_PER_TURN: "150",
+        RAKAZO_THINKING_BUDGET: "64",
+        RAKAZO_THINKING_BUDGET_MODELS: "qwen3.8-flash-next",
+      },
+      "sanitized-production-shaped",
+    );
+    expect(shaped.envSource).toBe("sanitized-production-shaped");
+    expect(shaped.productionFaithful).toBe(false);
+    expect(shaped.streamTimeoutMs).toBe(600000);
+    expect(shaped.maxToolCallsPerTurn).toBe("150");
+    expect(captureCallLimits().envSource).toBe("agent-vm-defaults");
   });
 });

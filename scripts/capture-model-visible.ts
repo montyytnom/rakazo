@@ -3,11 +3,15 @@ import {
   captureCallLimits,
   captureOverlayToolNames,
   reconstructOfflinePhases,
+  SANITIZED_PRODUCTION_SHAPED_ENV,
 } from "../packages/adapters/src/capture-harness.ts";
 
 const overlayRoot = process.argv[2];
 const base = captureBuiltinToolsJson();
-const limits = captureCallLimits();
+const limits = captureCallLimits(
+  { ...process.env, ...SANITIZED_PRODUCTION_SHAPED_ENV },
+  "sanitized-production-shaped",
+);
 const overlayNames = await captureOverlayToolNames(overlayRoot);
 const phases = reconstructOfflinePhases({
   apiToolNames: overlayNames?.api ?? [],
@@ -19,7 +23,10 @@ const payload = {
   label: "code-derived-not-captured",
   kind: phases.kind,
   productionCapture: false,
+  productionFaithful: false,
   productionLiveCapture: phases.productionLiveCapture,
+  liveGate: "locked",
+  envSource: limits.envSource,
   thinkingUnchanged: true,
   baseToolCount: base.tools.length,
   limits,
