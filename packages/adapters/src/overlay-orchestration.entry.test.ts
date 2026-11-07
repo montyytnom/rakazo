@@ -1,6 +1,8 @@
 import type { AgentRunRequest } from "@rakazo/adapter-kit";
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { beforeAll, describe, expect, it, vi } from "vitest";
@@ -1241,6 +1243,98 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
     expect(visible.final).not.toContain(STALE_SECRET_SENTINEL);
     expect(visible.http).toMatch(/Protected result|\[withheld\]|\[redacted\]/);
   });
+
+  it("compose-before leaves 926710a-absent helpers absent and does not patch core index", () => {
+    if (missing.length) return;
+    const added = [
+      "packages/core/src/completion-artifact.ts",
+      "packages/core/src/irreversible-effect.ts",
+      "packages/core/src/secret-result-handle.ts",
+      "packages/core/src/compaction-provenance.ts",
+      "packages/core/src/handoff-delivery.ts",
+      "packages/adapters/src/protected-result.ts",
+      "packages/adapters/src/stale-element-recovery.ts",
+      "packages/adapters/src/desktop-tool-contract.ts",
+      "packages/adapters/src/model-stream-error.ts",
+    ];
+    for (const rel of added) {
+      expect(existsSync(path.join(composeOut, "worker/before", rel)), rel).toBe(false);
+      expect(existsSync(path.join(composeOut, "api/before", rel)), rel).toBe(false);
+      expect(existsSync(path.join(composeOut, "worker/after", rel)), rel).toBe(true);
+      expect(existsSync(path.join(composeOut, "api/after", rel)), rel).toBe(true);
+    }
+    const beforeIndex = readFileSync(
+      path.join(composeOut, "worker/before/packages/core/src/index.ts"),
+      "utf8",
+    );
+    const afterIndex = readFileSync(
+      path.join(composeOut, "worker/after/packages/core/src/index.ts"),
+      "utf8",
+    );
+    expect(beforeIndex).not.toContain('export * from "./completion-artifact.js";');
+    expect(afterIndex).toContain('export * from "./completion-artifact.js";');
+    expect(afterIndex).toContain('export * from "./irreversible-effect.js";');
+    expect(afterIndex).toContain('export * from "./secret-result-handle.js";');
+    const afterArtifact = readFileSync(
+      path.join(composeOut, "worker/after/packages/core/src/completion-artifact.ts"),
+      "utf8",
+    );
+    expect(afterArtifact).toContain('from "./irreversible-effect.js"');
+    expect(
+      existsSync(
+        path.join(composeOut, "worker/after/packages/core/src/irreversible-effect.ts"),
+      ),
+    ).toBe(true);
+  });
+
+  it("loads after completion-artifact through irreversible-effect without workspace @rakazo/core", async () => {
+    if (missing.length) return;
+    const tmp = mkdtempSync(path.join(tmpdir(), "isolated-core-"));
+    try {
+      for (const name of [
+        "completion-artifact.ts",
+        "irreversible-effect.ts",
+        "approval-effect-key.ts",
+        "secret-result-handle.ts",
+      ]) {
+        writeFileSync(
+          path.join(tmp, name),
+          readFileSync(path.join(composeOut, "worker/after/packages/core/src", name)),
+        );
+      }
+      const mod = await import(
+        `${pathToFileURL(path.join(tmp, "completion-artifact.ts")).href}?t=${Date.now()}`
+      );
+      expect(typeof mod.bindOutcomeArtifact).toBe("function");
+      expect(
+        mod.bindOutcomeArtifact({
+          result: { verified: true, tree: "Reset password successful." },
+          toolName: "browser_extract",
+          intentId: "intent-1",
+          sourceMessageId: "msg-1",
+          runId: "run-1",
+        })?.class,
+      ).toBe("verified-read");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("records live source loading: tsx start and @rakazo/core default ./src/index.ts", () => {
+    const corePkg = JSON.parse(
+      readFileSync(path.join(repo, "packages/core/package.json"), "utf8"),
+    ) as { exports: { ".": { default: string } } };
+    const workerPkg = JSON.parse(
+      readFileSync(path.join(repo, "apps/worker/package.json"), "utf8"),
+    ) as { scripts: { start: string } };
+    const apiPkg = JSON.parse(
+      readFileSync(path.join(repo, "apps/api/package.json"), "utf8"),
+    ) as { scripts: { start: string } };
+    expect(corePkg.exports["."].default).toBe("./src/index.ts");
+    expect(corePkg.exports["."].default).not.toMatch(/dist/);
+    expect(workerPkg.scripts.start).toBe("tsx src/index.ts");
+    expect(apiPkg.scripts.start).toBe("tsx src/index.ts");
+  });
 });
 
 function sseToolCall(id: string, name: string, args: Record<string, unknown>) {
@@ -1339,13 +1433,51 @@ async function captureSecretBoundary(executorFile: string, runId: string) {
     });
     await f.runTurn(runId);
     const http = stub.rawBodies.map((body) => body.toString("utf8")).join("\n");
+    const persist = dump(f.effects.map((effect) => effect.result));
+    const final = dump(f.finalized);
+    const debug = dump({ events: piEvents, error: piError, executeCalls, hasExecute });
+    const logPath = process.env.CANDIDATE_PIRUNTIME_LOG;
+    if (logPath) {
+      const { appendFileSync } = await import("node:fs");
+      appendFileSync(
+        logPath,
+        `${JSON.stringify({
+          runId,
+          executorFile,
+          captureCount: stub.captures.length,
+          executeCalls,
+          events: piEvents,
+          error: piError,
+          hasExecute,
+          httpSha256: stub.rawBodies.map((body) =>
+            createHash("sha256").update(body).digest("hex"),
+          ),
+          currentSentinelInHttp: http.includes(CURRENT_SECRET_SENTINEL),
+          staleSentinelInHttp: http.includes(STALE_SECRET_SENTINEL),
+          currentSentinelInPersist: persist.includes(CURRENT_SECRET_SENTINEL),
+          staleSentinelInPersist: persist.includes(STALE_SECRET_SENTINEL),
+          currentSentinelInFinal: final.includes(CURRENT_SECRET_SENTINEL),
+          httpPreview: stub.parsedBodies.map((body) => ({
+            roles: Array.isArray(body?.messages)
+              ? (body.messages as Array<{ role?: string }>).map((message) => message.role)
+              : [],
+            toolResultPreview:
+              JSON.stringify(body).includes("Protected result") ||
+              JSON.stringify(body).includes("[withheld]"),
+          })),
+          persist,
+          final,
+          debug,
+        })}\n`,
+      );
+    }
     return {
       http,
       captureCount: stub.captures.length,
-      persist: dump(f.effects.map((effect) => effect.result)),
-      final: dump(f.finalized),
+      persist,
+      final,
       results: dump(f.results),
-      debug: dump({ events: piEvents, error: piError, executeCalls, hasExecute }),
+      debug,
     };
   } finally {
     await stub.close();

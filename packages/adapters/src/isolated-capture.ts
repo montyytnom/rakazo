@@ -768,11 +768,21 @@ function syntheticCaptureMemoryStore(): MemoryStore {
           }
         : { documents: [] },
     search: async () => [],
-    commit: async () => ({ revision: 1, path: "FACTS.md" }),
+    commit: async () => ({
+      id: "rev-capture-1",
+      revision: 1,
+      path: "FACTS.md",
+      content: SYNTHETIC_FACTS_CONTENT,
+    }),
     remove: async () => ({ removed: false }),
     exportMarkdown: async function* () {},
-    importMarkdown: async () => ({ revision: 1, path: "FACTS.md" }),
-  } as MemoryStore;
+    importMarkdown: async () => ({
+      id: "rev-capture-1",
+      revision: 1,
+      path: "FACTS.md",
+      content: SYNTHETIC_FACTS_CONTENT,
+    }),
+  };
 }
 
 export function syntheticPriorTurnHistory(): Array<{
@@ -2382,17 +2392,14 @@ function syntheticCompactionMessages(count: number, startSeq = 0) {
 async function withPinnedCaptureClock<T>(fn: () => Promise<T>): Promise<T> {
   const pinnedMs = captureClock().getTime();
   const OriginalDate = Date;
-  const PinnedDate = function PinnedDate(
-    this: Date | void,
-    ...args: ConstructorParameters<typeof Date>
-  ) {
+  const PinnedDate = function PinnedDate(this: Date | void, ...args: unknown[]) {
     if (args.length === 0) return new OriginalDate(pinnedMs);
-    return new OriginalDate(...args);
+    return new OriginalDate(...(args as ConstructorParameters<DateConstructor>));
   } as unknown as DateConstructor;
   PinnedDate.now = () => pinnedMs;
   PinnedDate.parse = OriginalDate.parse.bind(OriginalDate);
   PinnedDate.UTC = OriginalDate.UTC.bind(OriginalDate);
-  PinnedDate.prototype = OriginalDate.prototype;
+  Object.defineProperty(PinnedDate, "prototype", { value: OriginalDate.prototype });
   Object.setPrototypeOf(PinnedDate, OriginalDate);
   const previous = globalThis.Date;
   globalThis.Date = PinnedDate;

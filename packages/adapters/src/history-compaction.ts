@@ -3,8 +3,10 @@ import { historyCompactJob } from "@rakazo/adapter-kit";
 import type { MessageBlock } from "@rakazo/contracts";
 import {
   blocksToAgentHistoryText,
+  collectToolEvidence,
   escapePromptData,
   rewriteUnverifiedClaims,
+  sanitizeFinalText,
   secretsFromPriorAssistantText,
   stripSecretEchoes,
 } from "@rakazo/core";
@@ -438,7 +440,10 @@ export async function compactHistory(deps: CompactHistoryDeps, threadId: string)
     return;
   }
   summary = stripSecretEchoes(
-    rewriteUnverifiedClaims(summary, transcript),
+    sanitizeFinalText(
+      rewriteUnverifiedClaims(summary, transcript),
+      collectToolEvidence([transcript]),
+    ),
     secretsFromPriorAssistantText([summary, transcript]),
   ).text;
 

@@ -485,6 +485,58 @@ describe("compactHistory", () => {
     );
   });
 
+  it("does not keep All set/Successfully changed/It is reset without a current-intent ledger", async () => {
+    const claimsOnly = compactionHarness({ deploymentModelKey: "openrouter-key" });
+    claimsOnly.runtime.run = vi.fn<AgentRuntime["run"]>(async function* () {
+      yield { type: "done", text: "All set. Successfully changed. It is reset." };
+    });
+    await compactHistory(claimsOnly.deps, "thread-1");
+    expect(claimsOnly.thread.historyCompactionSummary).toMatch(/not verified/i);
+    expect(claimsOnly.thread.historyCompactionSummary).not.toMatch(/\bAll set\b/);
+
+    const mixed = compactionHarness({ deploymentModelKey: "openrouter-key" });
+    mixed.runtime.run = vi.fn<AgentRuntime["run"]>(async function* () {
+      yield {
+        type: "done",
+        text: "All set. Successfully changed. It is reset. Login page only.",
+      };
+    });
+    await compactHistory(mixed.deps, "thread-1");
+    const summary = mixed.thread.historyCompactionSummary ?? "";
+    expect(summary.length).toBeGreaterThan(0);
+    expect(summary).not.toMatch(/\bAll set\b/);
+    expect(summary).not.toMatch(/Successfully changed/);
+    expect(summary).not.toMatch(/\bIt is reset\b/);
+    expect(summary).toMatch(/Login page only/);
+  });
+
+  it("does not treat a stale verified blob in the compacted transcript as current-intent success", async () => {
+    const harness = compactionHarness({
+      deploymentModelKey: "openrouter-key",
+      messages: Array.from({ length: 50 }, (_, i) =>
+        i === 1
+          ? {
+              seq: 1,
+              role: "bot",
+              blocks: [{ kind: "text", text: '{"verified":true,"runId":"run-old"}' }],
+            }
+          : {
+              seq: i,
+              role: i % 2 === 0 ? "user" : "bot",
+              blocks: [{ kind: "text", text: `message ${i}` }],
+            },
+      ),
+    });
+    harness.runtime.run = vi.fn<AgentRuntime["run"]>(async function* () {
+      yield { type: "done", text: "Done. Password reset is verified." };
+    });
+    await compactHistory(harness.deps, "thread-1");
+    const summary = harness.thread.historyCompactionSummary ?? "";
+    expect(summary.length).toBeGreaterThan(0);
+    expect(summary).not.toMatch(/\bDone\b/);
+    expect(summary).toMatch(/not verified|claimed:/i);
+  });
+
   it("summarizes the next batch, saves it through the provider, and advances the cursor", async () => {
     const harness = compactionHarness({ deploymentModelKey: "openrouter-key" });
 

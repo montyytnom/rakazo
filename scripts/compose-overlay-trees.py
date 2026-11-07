@@ -36,6 +36,22 @@ NEW_HELPERS = [
     "packages/adapters/src/model-stream-error.ts",
 ]
 
+# Candidate file-state: patched overlay/git files plus helpers plus isolated-core closure.
+TRACKED_PATHS = [
+    "packages/adapters/src/executor.ts",
+    "packages/adapters/src/bot-secrets.ts",
+    "packages/adapters/src/computer-browser.ts",
+    "packages/adapters/src/browser-tools.ts",
+    "packages/adapters/src/pi-runtime.ts",
+    "packages/adapters/src/history-compaction.ts",
+    "packages/adapters/src/bot-messages.ts",
+    "packages/adapters/src/pi-usage.ts",
+    "packages/adapters/src/pi-openai-compatible-provider.ts",
+    "packages/core/src/index.ts",
+    "packages/core/src/approval-effect-key.ts",
+    *NEW_HELPERS,
+]
+
 WORKER_BOT_SECRETS_SHA = "b22b7f69ce3a0a45c54258dc9b66134352068f3abd89fb7800b3631b88e89d53"
 WORKER_BOT_SECRETS_REL = (
     "opt/docker/rakazo/patches/savedlogins-20261104/src/worker/bot-secrets.ts"
@@ -648,7 +664,7 @@ def patch_history_compaction(path: Path) -> None:
     replace_once(
         path,
         "import { blocksToAgentHistoryText, escapePromptData } from \"@rakazo/core\";\n",
-        "import { blocksToAgentHistoryText, escapePromptData, rewriteUnverifiedClaims, secretsFromPriorAssistantText, stripSecretEchoes } from \"@rakazo/core\";\n",
+        "import { blocksToAgentHistoryText, collectToolEvidence, escapePromptData, rewriteUnverifiedClaims, sanitizeFinalText, secretsFromPriorAssistantText, stripSecretEchoes } from \"@rakazo/core\";\n",
         "rewriteUnverifiedClaims import",
     )
     replace_once(
@@ -663,7 +679,10 @@ def patch_history_compaction(path: Path) -> None:
         "    return;\n"
         "  }\n"
         "  summary = stripSecretEchoes(\n"
-        "    rewriteUnverifiedClaims(summary, transcript),\n"
+        "    sanitizeFinalText(\n"
+        "      rewriteUnverifiedClaims(summary, transcript),\n"
+        "      collectToolEvidence([transcript]),\n"
+        "    ),\n"
         "    secretsFromPriorAssistantText([summary, transcript]),\n"
         "  ).text;\n\n"
         "  const lastSeq = batch[batch.length - 1]!.seq;",
@@ -985,17 +1004,16 @@ def bot_secrets_map(dest: Path, service: str) -> dict:
 
 
 def emit_hashes(dest: Path, service: str, patch: bool) -> None:
-    rows = [
-        "path\tsha256",
-        f"packages/adapters/src/executor.ts\t{sha256(dest / 'packages/adapters/src/executor.ts')}",
-        f"packages/adapters/src/bot-secrets.ts\t{sha256(dest / 'packages/adapters/src/bot-secrets.ts')}",
-        f"packages/adapters/src/computer-browser.ts\t{sha256(dest / 'packages/adapters/src/computer-browser.ts')}",
-        f"packages/adapters/src/browser-tools.ts\t{sha256(dest / 'packages/adapters/src/browser-tools.ts')}",
-        f"packages/adapters/src/protected-result.ts\t{sha256(dest / 'packages/adapters/src/protected-result.ts')}",
-        f"packages/adapters/src/pi-runtime.ts\t{sha256(dest / 'packages/adapters/src/pi-runtime.ts')}",
-        f"packages/core/src/secret-result-handle.ts\t{sha256(dest / 'packages/core/src/secret-result-handle.ts')}",
-        f"packages/core/src/completion-artifact.ts\t{sha256(dest / 'packages/core/src/completion-artifact.ts')}",
-    ]
+    rows = ["path\tsha256"]
+    missing = []
+    for rel in TRACKED_PATHS:
+        path = dest / rel
+        if path.is_file():
+            rows.append(f"{rel}\t{sha256(path)}")
+        elif patch:
+            missing.append(rel)
+    if missing:
+        raise SystemExit(f"{service} after tree missing tracked files: {missing}")
     name = "AFTER-HASHES.tsv" if patch else "PREIMAGE-HASHES.tsv"
     (dest / name).write_text("\n".join(rows) + "\n")
 
@@ -1015,8 +1033,6 @@ def compose_one(
     if not node_modules.exists():
         node_modules.symlink_to(REPO / "packages/adapters/node_modules")
     mounts, missing_mounts = apply_mounts(overlay, dest, service)
-    copy_helpers(dest)
-    patch_core_index(dest)
     secrets_map = bot_secrets_map(dest, service)
     status = {
         "service": service,
@@ -1038,6 +1054,10 @@ def compose_one(
         ],
     }
     if patch:
+        # Helpers and core index exports belong only on the patched after tree.
+        # Copying them onto before made compose-before look like HEAD and hid
+        # 926710a-absent paths from rollback/preimage classification.
+        copy_helpers(dest)
         apply_patches(dest, service)
         status["patched"] = True
     if shim:
