@@ -5901,7 +5901,11 @@ export function createRunExecutor(deps: ExecutorDeps) {
                   });
               const protectedPage = redactToolResultForModel(raw, protectedResults);
               if (protectedPage.handle) {
-                registerRunSecrets([...protectedResults.values()].map((row) => row.plaintext));
+                registerRunSecrets(
+                  [...protectedResults.values()].flatMap((row) =>
+                    row.plaintext ? [row.plaintext] : [],
+                  ),
+                );
               }
               const result = protectedPage.result;
               unchangedVisualStreak = unchangedVisualStreakAfterPageBrowser(
@@ -9431,18 +9435,28 @@ export async function recordEffect(
     return { duplicate: true, effect: legacy };
   }
 
-  const effect = await deps.prisma.externalEffect.create({
-    data: {
-      spaceId: run.spaceId,
-      runId: run.id,
-      kind,
-      idempotencyKey,
-      status: "intended",
-      request: request as never,
-    },
-  });
-  consumedIds?.add(effect.id);
-  return { duplicate: false, effect };
+  try {
+    const effect = await deps.prisma.externalEffect.create({
+      data: {
+        spaceId: run.spaceId,
+        runId: run.id,
+        kind,
+        idempotencyKey,
+        status: "intended",
+        request: request as never,
+      },
+    });
+    consumedIds?.add(effect.id);
+    return { duplicate: false, effect };
+  } catch (error) {
+    if (!isUniqueViolation(error)) throw error;
+    const raced = await deps.prisma.externalEffect.findUnique({
+      where: { idempotencyKey },
+    });
+    if (!raced) throw error;
+    consumedIds?.add(raced.id);
+    return { duplicate: true, effect: raced };
+  }
 }
 
 async function completeEffect(

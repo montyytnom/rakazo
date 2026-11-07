@@ -10,7 +10,7 @@ Do **not** wholesale-replace overlay `executor.ts`, `browser-tools.ts`, `builtin
 
 1. Bind-mount the **new** modules below onto both api and worker.
 2. Apply `HOOKS.md` insertions into the live overlay copies of patched files.
-3. `computer-browser.ts` is **untouched** and remains **SKEWED**.
+3. `computer-browser.ts` remains **SKEWED**. Apply HOOKS only: worker `focused()` never returns a value; api LOGIN_GUARD refusal is final. Do not wholesale-replace. Worker login-guard + `focused()` stay.
 
 Thinking / Flash-Next files stay untouched.
 
@@ -53,9 +53,9 @@ Thinking / Flash-Next files stay untouched.
 
 ## Untouched overlays (leave mounted)
 
-- `/app/packages/adapters/src/computer-browser.ts` — **SKEWED** (worker savedlogins ≠ api browserextract); not patched here
+- `/app/packages/adapters/src/computer-browser.ts` — **SKEWED** (worker savedlogins ≠ api browserextract); HOOKS only, login-guard preserved
 - `fast-thinking.ts`, `pi-openai-compatible-provider.ts`, thinkbudget compose — Flash-Next / thinking **unchanged**
-- savedlogins worker-only: `bot-secrets.ts`, `login-guard.ts`, `/run/login-guard`
+- savedlogins worker-only: overlay `bot-secrets.ts` (`b22b7f69…`), `login-guard.ts`, `/run/login-guard`. API `bot-secrets.ts` is `926710a` (`e9ef81aa…`).
 - api-only: `computer-status.ts`, `pending-card-wait.ts`, `router.ts`, `shared-logins.ts`, `thread-target.ts`, contracts `rpc.ts`
 - remaining shared overlays: loop-guard, attachtext, cardtext, quiet-gate, write-guard, ctxmem, yelpguard, browserdiag, streamretry, and the rest of the compose chain
 

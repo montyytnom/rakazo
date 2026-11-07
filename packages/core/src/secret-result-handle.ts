@@ -39,6 +39,9 @@ export function looksLikeSecretValue(value: string): boolean {
   const trimmed = value.trim();
   if (trimmed.length < 8 || trimmed.length > 128) return false;
   if (/\s/.test(trimmed)) return false;
+  if (/^op-[a-f0-9]{8}$/.test(trimmed)) return false;
+  if (/^sha256:[a-f0-9]{64}$/.test(trimmed)) return false;
+  if (trimmed.startsWith("v2:")) return false;
   const classes = [
     /[a-z]/.test(trimmed),
     /[A-Z]/.test(trimmed),
@@ -55,7 +58,7 @@ export function redactProtectedTree(value: unknown, extras: readonly string[] = 
 
 export function extractGeneratedPassword(text: string): string | undefined {
   const match = GENERATED_PASSWORD.exec(text);
-  const candidate = match?.[1]?.replace(/[.,;]+$/, "");
+  const candidate = match?.[1]?.replace(/[.,;}"']+$/, "");
   return candidate && looksLikeSecretValue(candidate) ? candidate : undefined;
 }
 

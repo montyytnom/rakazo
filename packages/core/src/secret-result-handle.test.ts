@@ -28,7 +28,12 @@ describe("protected result handles", () => {
     );
     expect(JSON.stringify(tree)).not.toContain(FIXTURE_NEW);
     expect(extractGeneratedPassword(`New password: ${FIXTURE_NEW}`)).toBe(FIXTURE_NEW);
+    expect(
+      extractGeneratedPassword(JSON.stringify({ tree: `New password: ${FIXTURE_NEW}` })),
+    ).toBe(FIXTURE_NEW);
     expect(looksLikeSecretValue(FIXTURE_NEW)).toBe(true);
+    expect(looksLikeSecretValue("op-deadbeef")).toBe(false);
+    expect(looksLikeSecretValue(`sha256:${"a".repeat(64)}`)).toBe(false);
     const prior = secretsFromPriorAssistantText([
       `Reset complete. Temporary password: ${FIXTURE_OLD}`,
     ]);

@@ -23,7 +23,11 @@ type Effect = {
 function fixture(initial: Effect[] = []) {
   const stored = new Map(initial.map((effect) => [effect.idempotencyKey, effect]));
   const create = async ({ data }: { data: Omit<Effect, "id"> }) => {
-    if (stored.has(data.idempotencyKey)) throw new Error("Duplicate key");
+    if (stored.has(data.idempotencyKey)) {
+      const error = new Error("Unique constraint failed");
+      Object.assign(error, { code: "P2002" });
+      throw error;
+    }
     const effect = { ...data, id: `effect-${stored.size}` };
     stored.set(data.idempotencyKey, effect);
     return effect;
@@ -149,5 +153,51 @@ describe("cross-run irreversible ledger", () => {
     if (replay.action === "return") {
       expect(JSON.stringify(redactReplayResult(replay.result))).not.toContain("FxNew#2207GenA");
     }
+  });
+
+  it("reuses the persistent row when a concurrent create hits the unique constraint", async () => {
+    const intentId = resolveTurnIntent({ id: "msg-1", text: "Text Pat: running late" }).intentId;
+    const classification = classifyIrreversibleTool("installed_execute_tool", {
+      name: "mac_messages_send",
+      arguments: { handle: "+15550100" },
+    });
+    const key = threadIrreversibleEffectKey({
+      threadId: "thread-1",
+      intentId,
+      class: classification!.class,
+    });
+    const request = irreversibleEffectRequest(classification!, "thread-1", intentId, {
+      handle: "+15550100",
+    });
+    const f = fixture();
+    const first = await recordEffect(
+      f.deps,
+      { id: "run-1", spaceId: "space-1", threadId: "thread-1", botId: "bot-1" },
+      "send",
+      key,
+      request,
+    );
+    let hideOnce = true;
+    const findUnique = f.deps.prisma.externalEffect.findUnique.bind(f.deps.prisma.externalEffect);
+    f.deps.prisma.externalEffect.findUnique = (async (args: { where?: { idempotencyKey?: string } }) => {
+      const key = args.where?.idempotencyKey;
+      const row = key ? (f.stored.get(key) ?? null) : await findUnique(args as never);
+      if (row && hideOnce) {
+        hideOnce = false;
+        return null;
+      }
+      return row;
+    }) as unknown as typeof f.deps.prisma.externalEffect.findUnique;
+    const raced = await recordEffect(
+      f.deps,
+      { id: "run-2", spaceId: "space-1", threadId: "thread-1", botId: "bot-1" },
+      "send",
+      key,
+      request,
+    );
+    expect(first.duplicate).toBe(false);
+    expect(raced.duplicate).toBe(true);
+    expect(raced.effect.id).toBe(first.effect.id);
+    expect(f.stored.size).toBe(1);
   });
 });

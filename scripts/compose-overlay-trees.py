@@ -5,7 +5,8 @@ Does not talk to production. Overlay sources stay out of git.
 
 Usage:
   python3 scripts/compose-overlay-trees.py --out .compose
-  python3 scripts/compose-overlay-trees.py --out .compose --patch --test-shim
+  python3 scripts/compose-overlay-trees.py --out .compose --patch
+  python3 scripts/compose-overlay-trees.py --out .compose --patch --bot-secrets /path/to/bot-secrets.ts
 """
 from __future__ import annotations
 
@@ -35,6 +36,12 @@ NEW_HELPERS = [
     "packages/adapters/src/model-stream-error.ts",
 ]
 
+WORKER_BOT_SECRETS_SHA = "b22b7f69ce3a0a45c54258dc9b66134352068f3abd89fb7800b3631b88e89d53"
+WORKER_BOT_SECRETS_REL = (
+    "opt/docker/rakazo/patches/savedlogins-20261104/src/worker/bot-secrets.ts"
+)
+API_BOT_SECRETS_BASE_SHA = "e9ef81aaa20645c3ad27cd310600afae728295abc853ed602a00bf18317f6384"
+
 REQUIRED_ARCHIVE = [
     "MOUNT-MAP.tsv",
     "FILE-HASHES.tsv",
@@ -47,6 +54,10 @@ REQUIRED_ARCHIVE = [
     "opt/docker/rakazo/patches/update-20261020/build/history-compaction.ts",
     "opt/docker/rakazo/patches/update-20261020/build/bot-messages.ts",
     "opt/docker/rakazo/patches/thinkbudget/pi-openai-compatible-provider.ts",
+    "opt/docker/rakazo/patches/savedlogins-20261104/src/worker/bot-secrets.ts",
+    "opt/docker/rakazo/patches/savedlogins-20261104/src/worker/login-guard.ts",
+    "opt/docker/rakazo/patches/savedlogins-20261104/src/worker/computer-browser.ts",
+    "opt/docker/rakazo/patches/browserextract/computer-browser.ts",
 ]
 
 
@@ -141,25 +152,29 @@ def apply_mounts(overlay: Path, dest: Path, service: str) -> tuple[list[dict[str
     return applied, missing
 
 
-def shim_missing_bot_secrets(dest: Path) -> None:
-    """Overlay worker bot-secrets.ts is in MOUNT-MAP but was not in the supplied archive."""
-    path = dest / "packages/adapters/src/bot-secrets.ts"
-    text = path.read_text()
-    if "export async function plainLoginFillProblem" not in text:
-        text += """
-/** Archive gap: overlay bot-secrets.ts (MOUNT-MAP b22b7f69…) was not exported. */
-export async function plainLoginFillProblem(_input?: unknown): Promise<string | undefined> {
-  return undefined;
-}
-export async function loginNamesForOrigin(
-  _prisma?: unknown,
-  _run?: unknown,
-  _origin?: string,
-): Promise<string[]> {
-  return [];
-}
-"""
-        path.write_text(text)
+def install_worker_bot_secrets(overlay: Path, extra: Path | None) -> Path:
+    dest = overlay / WORKER_BOT_SECRETS_REL
+    if extra is not None:
+        got = sha256(extra)
+        if got != WORKER_BOT_SECRETS_SHA:
+            raise SystemExit(
+                f"bot-secrets.ts hash mismatch: got {got} want {WORKER_BOT_SECRETS_SHA}"
+            )
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(extra, dest)
+    if not dest.is_file():
+        raise SystemExit(
+            "overlay compose blocked; missing worker bot-secrets.ts:\n"
+            f"{dest}\n"
+            f"MOUNT-MAP sha256={WORKER_BOT_SECRETS_SHA} (30395 bytes). "
+            "Pass --bot-secrets with the exact overlay file. Do not stub."
+        )
+    got = sha256(dest)
+    if got != WORKER_BOT_SECRETS_SHA:
+        raise SystemExit(
+            f"overlay bot-secrets.ts hash mismatch: got {got} want {WORKER_BOT_SECRETS_SHA}"
+        )
+    return dest
 
 
 def copy_helpers(dest: Path) -> None:
@@ -221,7 +236,13 @@ def patch_executor(path: Path) -> None:
         path,
         'from "./browser-tools.js";\n',
         'import { DESKTOP_LAUNCH_UNSUPPORTED, sandboxLaunchUnsupported } from "./desktop-tool-contract.js";\n'
-        'import { redactReplayResult } from "./protected-result.js";\n'
+        "import {\n"
+        "  createProtectedResultStore,\n"
+        "  handoffProtectedResultDurable,\n"
+        "  protectPersistedEffectResult,\n"
+        "  redactReplayResult,\n"
+        "  resolveProtectedResultVault,\n"
+        '} from "./protected-result.js";\n'
         'import { browserActLabels, createRefMemory } from "./stale-element-recovery.js";\n',
         "helper module imports",
     )
@@ -230,6 +251,8 @@ def patch_executor(path: Path) -> None:
         "        const mutatingEffectOccurrences = new Map<string, number>();\n"
         "        const consumedEffectIds = new Set<string>();\n",
         "        const pageRefMemory = createRefMemory();\n"
+        "        const protectedResults = createProtectedResultStore();\n"
+        "        const protectedVault = resolveProtectedResultVault(deps.secretStore, context);\n"
         "        const turnIntent = resolveTurnIntent(\n"
         "          { id: run.sourceMessageId, text: task.prompt },\n"
         "          history\n"
@@ -295,13 +318,18 @@ def patch_executor(path: Path) -> None:
         "          const finish = async (result: unknown) =>\n"
         "            (await persistEffectResult(result)) ? result : uncertainEffectResult(name, args);",
         "                  claimedEffect ? \"executing\" : \"intended\",\n"
-        "                  redactProtectedTree(result, runSecrets),\n"
+        "                  result,\n"
         "                )\n"
         "              : Promise.resolve(true);\n"
         "          const finish = async (result: unknown) => {\n"
-        "            const sanitized = redactProtectedTree(result, runSecrets);\n"
-        "            return (await persistEffectResult(sanitized))\n"
-        "              ? sanitized\n"
+        "            const protectedPage = await protectPersistedEffectResult({\n"
+        "              result,\n"
+        "              extras: runSecrets,\n"
+        "              store: protectedResults,\n"
+        "              vault: protectedVault,\n"
+        "            });\n"
+        "            return (await persistEffectResult(protectedPage.stored))\n"
+        "              ? protectedPage.model\n"
         "              : uncertainEffectResult(name, args);\n"
         "          };",
         "persist/finish sanitization",
@@ -362,6 +390,73 @@ def patch_executor(path: Path) -> None:
         "    throw new Error(\"Stored tool execution does not belong to this run.\");\n"
         "  }",
         "recordEffect thread-intent reuse",
+    )
+    replace_once(
+        path,
+        "  const effect = await deps.prisma.externalEffect.create({\n"
+        "    data: {\n"
+        "      spaceId: run.spaceId,\n"
+        "      runId: run.id,\n"
+        "      kind,\n"
+        "      idempotencyKey,\n"
+        "      status: \"intended\",\n"
+        "      request: request as never,\n"
+        "    },\n"
+        "  });\n"
+        "  consumedIds?.add(effect.id);\n"
+        "  return { duplicate: false, effect };\n"
+        "}",
+        "  try {\n"
+        "    const effect = await deps.prisma.externalEffect.create({\n"
+        "      data: {\n"
+        "        spaceId: run.spaceId,\n"
+        "        runId: run.id,\n"
+        "        kind,\n"
+        "        idempotencyKey,\n"
+        "        status: \"intended\",\n"
+        "        request: request as never,\n"
+        "      },\n"
+        "    });\n"
+        "    consumedIds?.add(effect.id);\n"
+        "    return { duplicate: false, effect };\n"
+        "  } catch (error) {\n"
+        "    if (!isUniqueViolation(error)) throw error;\n"
+        "    const raced = await deps.prisma.externalEffect.findUnique({\n"
+        "      where: { idempotencyKey },\n"
+        "    });\n"
+        "    if (!raced) throw error;\n"
+        "    consumedIds?.add(raced.id);\n"
+        "    return { duplicate: true, effect: raced };\n"
+        "  }\n"
+        "}",
+        "recordEffect unique-constraint reuse",
+    )
+    replace_once(
+        path,
+        '          if (name === "list_secrets") return listBotSecrets(deps.prisma, run);\n',
+        "          if (name === \"protected_result_handoff\") {\n"
+        "            const opId = String(args.op_id ?? \"\");\n"
+        "            const storedRows = await deps.prisma.externalEffect.findMany({\n"
+        "              where: { spaceId: run.spaceId },\n"
+        "            });\n"
+        "            const storedResult = storedRows\n"
+        "              .map((row: { result?: unknown }) => row.result)\n"
+        "              .find((result: unknown) => {\n"
+        "                if (!result || typeof result !== \"object\" || Array.isArray(result)) return false;\n"
+        "                const handle = (result as { protectedResult?: { handle?: unknown } }).protectedResult?.handle;\n"
+        "                return handle === opId;\n"
+        "              });\n"
+        "            return finish(\n"
+        "              await handoffProtectedResultDurable(\n"
+        "                protectedResults,\n"
+        "                opId,\n"
+        "                protectedVault,\n"
+        "                storedResult,\n"
+        "              ),\n"
+        "            );\n"
+        "          }\n"
+        '          if (name === "list_secrets") return listBotSecrets(deps.prisma, run);\n',
+        "protected_result_handoff",
     )
 
 
@@ -612,13 +707,60 @@ export async function replaceComputer() { return null; }
     )
 
 
+def patch_computer_browser_worker(path: Path) -> None:
+    replace_once(
+        path,
+        "    if (!live || live.ok !== true) return { ok: false, error: String(live?.error ?? \"unavailable\") };\n"
+        "    return {\n"
+        "      ok: true,\n"
+        "      hasFocus: live.hasFocus === true,\n",
+        "    if (!live || live.ok !== true) return { ok: false, error: String(live?.error ?? \"unavailable\") };\n"
+        "    delete (live as { value?: unknown }).value;\n"
+        "    return {\n"
+        "      ok: true,\n"
+        "      hasFocus: live.hasFocus === true,\n",
+        "worker focused never a value",
+    )
+
+
+def patch_computer_browser_api(path: Path) -> None:
+    replace_once(
+        path,
+        "    const live = await this.runLive(\n"
+        "      computer,\n"
+        "      { command: \"act\", actions: request.actions },\n"
+        "      context,\n"
+        "    );\n"
+        "    if (live?.ok !== true || live.fallback === \"computer_act\") {\n",
+        "    const live = await this.runLive(\n"
+        "      computer,\n"
+        "      { command: \"act\", actions: request.actions },\n"
+        "      context,\n"
+        "    );\n"
+        "    if (live?.ok !== true && /LOGIN_GUARD refused/.test(String(live?.error ?? \"\"))) {\n"
+        "      return {\n"
+        "        ok: false,\n"
+        "        completed: typeof live?.completed === \"number\" ? live.completed : 0,\n"
+        "        uncertain: false,\n"
+        "        url: typeof live?.url === \"string\" ? live.url : \"\",\n"
+        "        title: typeof live?.title === \"string\" ? live.title : \"\",\n"
+        "        error: String(live?.error),\n"
+        "      };\n"
+        "    }\n"
+        "    if (live?.ok !== true || live.fallback === \"computer_act\") {\n",
+        "api LOGIN_GUARD refusal is final",
+    )
+
+
 def apply_patches(dest: Path, service: str) -> None:
     adapters = dest / "packages/adapters/src"
     patch_executor(adapters / "executor.ts")
     if service == "worker":
         patch_browser_tools_worker(adapters / "browser-tools.ts")
+        patch_computer_browser_worker(adapters / "computer-browser.ts")
     else:
         patch_browser_tools_api(adapters / "browser-tools.ts")
+        patch_computer_browser_api(adapters / "computer-browser.ts")
     patch_history_compaction(adapters / "history-compaction.ts")
     patch_bot_messages(adapters / "bot-messages.ts")
     patch_pi_usage(adapters / "pi-usage.ts")
@@ -626,7 +768,55 @@ def apply_patches(dest: Path, service: str) -> None:
     patch_core_index(dest)
 
 
-def compose_one(overlay: Path, dest: Path, service: str, patch: bool, shim: bool) -> dict:
+def bot_secrets_map(dest: Path, service: str) -> dict:
+    path = dest / "packages/adapters/src/bot-secrets.ts"
+    digest = sha256(path)
+    if service == "worker":
+        if digest != WORKER_BOT_SECRETS_SHA:
+            raise SystemExit(
+                f"worker bot-secrets.ts after mount is {digest}, want overlay {WORKER_BOT_SECRETS_SHA}"
+            )
+        return {
+            "service": "worker",
+            "source": WORKER_BOT_SECRETS_REL,
+            "container": "/app/packages/adapters/src/bot-secrets.ts",
+            "sha256": digest,
+            "overlay": True,
+        }
+    if digest != API_BOT_SECRETS_BASE_SHA:
+        raise SystemExit(
+            f"api bot-secrets.ts is {digest}, want 926710a {API_BOT_SECRETS_BASE_SHA} "
+            "(no overlay mount; worker-only)"
+        )
+    return {
+        "service": "api",
+        "source": "926710a:packages/adapters/src/bot-secrets.ts",
+        "container": "/app/packages/adapters/src/bot-secrets.ts",
+        "sha256": digest,
+        "overlay": False,
+    }
+
+
+def emit_hashes(dest: Path, service: str, patch: bool) -> None:
+    rows = [
+        "path\tsha256",
+        f"packages/adapters/src/executor.ts\t{sha256(dest / 'packages/adapters/src/executor.ts')}",
+        f"packages/adapters/src/bot-secrets.ts\t{sha256(dest / 'packages/adapters/src/bot-secrets.ts')}",
+        f"packages/adapters/src/computer-browser.ts\t{sha256(dest / 'packages/adapters/src/computer-browser.ts')}",
+        f"packages/adapters/src/browser-tools.ts\t{sha256(dest / 'packages/adapters/src/browser-tools.ts')}",
+        f"packages/adapters/src/protected-result.ts\t{sha256(dest / 'packages/adapters/src/protected-result.ts')}",
+    ]
+    name = "AFTER-HASHES.tsv" if patch else "PREIMAGE-HASHES.tsv"
+    (dest / name).write_text("\n".join(rows) + "\n")
+
+
+def compose_one(
+    overlay: Path,
+    dest: Path,
+    service: str,
+    patch: bool,
+    shim: bool,
+) -> dict:
     if dest.exists():
         shutil.rmtree(dest)
     git_archive_into(dest)
@@ -637,8 +827,7 @@ def compose_one(overlay: Path, dest: Path, service: str, patch: bool, shim: bool
     mounts, missing_mounts = apply_mounts(overlay, dest, service)
     copy_helpers(dest)
     patch_core_index(dest)
-    if service == "worker":
-        shim_missing_bot_secrets(dest)
+    secrets_map = bot_secrets_map(dest, service)
     status = {
         "service": service,
         "base": BASE,
@@ -647,11 +836,16 @@ def compose_one(overlay: Path, dest: Path, service: str, patch: bool, shim: bool
         "mounts": len(mounts),
         "missingMounts": missing_mounts,
         "executorPreimage": sha256(dest / "packages/adapters/src/executor.ts"),
+        "botSecrets": secrets_map,
         "archiveGaps": {
-            "bot-secrets.ts": "MOUNT-MAP lists patches/savedlogins-20261104/src/worker/bot-secrets.ts sha256=b22b7f69…; file is not in the supplied archive. Composed worker keeps 926710a bot-secrets.ts plus stub exports plainLoginFillProblem/loginNamesForOrigin so overlay executor can load.",
             "attachtext/vendor": "Documented export exclusion; attachment-text loads it lazily.",
             "secrets/scrapling_token": "Documented export exclusion; not required to compile adapter sources.",
+            "login-guard-policy-dir": "/run/login-guard is a directory mount; login-guard.ts is overlay-mounted on worker.",
         },
+        "testShimRemaining": [
+            "none for overlay executor import under vitest: keep real computer-lifecycle.ts and mock prisma/sandbox/browser at the harness boundary",
+            "do not stub overlay executor, login-guard.ts, bot-secrets.ts, or computer-browser.ts",
+        ],
     }
     if patch:
         apply_patches(dest, service)
@@ -660,6 +854,7 @@ def compose_one(overlay: Path, dest: Path, service: str, patch: bool, shim: bool
         write_test_shim(dest)
         status["testShim"] = True
     status["executorAfter"] = sha256(dest / "packages/adapters/src/executor.ts")
+    emit_hashes(dest, service, patch)
     (dest / "COMPOSE-STATUS.json").write_text(json.dumps(status, indent=2) + "\n")
     return status
 
@@ -669,10 +864,20 @@ def main() -> int:
     parser.add_argument("--overlay", default=str(DEFAULT_OVERLAY))
     parser.add_argument("--out", default=str(REPO / ".compose"))
     parser.add_argument("--patch", action="store_true")
-    parser.add_argument("--test-shim", action="store_true")
+    parser.add_argument(
+        "--test-shim",
+        action="store_true",
+        help="Do not use for the composed gate. Stubs computer-lifecycle.ts.",
+    )
+    parser.add_argument("--bot-secrets", default="")
     parser.add_argument("--service", choices=["worker", "api", "both"], default="both")
     args = parser.parse_args()
     overlay = Path(args.overlay)
+    extra = Path(args.bot_secrets) if args.bot_secrets else None
+    if extra is not None and not extra.is_file():
+        print(f"overlay compose blocked; --bot-secrets not a file: {extra}", file=sys.stderr)
+        return 2
+    install_worker_bot_secrets(overlay, extra)
     missing = missing_archive(overlay)
     if missing:
         print("overlay compose blocked; missing:", file=sys.stderr)
