@@ -56,7 +56,11 @@ LAUNCH="$PACK/candidate-capture/host-launch.sh"
   --git-head GIT_HEAD \
   --execute
 
-# 3. Dedicated staging cleanup (not production overlay paths)
+# 3. Non-vacuous checker — execute writes OUT/worker and OUT/api, not OUT/service/branch.
+#    Do not request raw HTTP bodies. Metrics + httpSha256 only.
+python3 "$PACK/candidate-capture/check_nonvacuous.py" "$OUT"
+
+# 4. Dedicated staging cleanup (not production overlay paths)
 "$LAUNCH" --stage "$STAGE" --cleanup-stage
 ```
 

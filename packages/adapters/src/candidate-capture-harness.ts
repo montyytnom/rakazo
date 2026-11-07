@@ -20,6 +20,10 @@ export const SYNTHETIC_CAPTURE_MAX_TOKENS = 32_768;
 export const SYNTHETIC_CAPTURE_CONTEXT_WINDOW = 131_072;
 export const SYNTHETIC_CAPTURE_WINDOW_NOTE =
   "DEFAULT_MODEL_CONTEXT_WINDOW=32768 cannot reserve REASONING_MODEL_MAX_TOKENS=32768 plus assembler/tools (ContextBudgetError). Synthetic window is 4*32768=131072 so input room remains. Previously accepted for isolated-capture runs 10-13. Not a live encrypted secret.contextWindow/maxTokens value.";
+/** Exact overlay assistBareDone follow-up (composed AFTER pi-runtime). */
+export const ASSIST_BARE_DONE_NUDGE =
+  "Give the user the actual result now: what you did, what you found or changed, and how you checked it. A bare 'done' is not enough.";
+export const SCRIPT_NUDGE_FILLER = "synthetic-stop-0";
 
 type Effect = {
   id: string;
@@ -103,11 +107,23 @@ async function startLoopbackStub(options: {
         parsed = null;
       }
       parsedBodies.push(parsed);
-      const reply = options.replies[seq];
+      const blob = parsed ? JSON.stringify(parsed) : "";
+      const isBareDoneNudge = blob.includes(ASSIST_BARE_DONE_NUDGE);
+      let reply = options.replies[seq];
       seq += 1;
-      if (!reply) {
+      if (isBareDoneNudge) {
+        reply = {
+          kind: "sse",
+          finish: "stop",
+          events: [{ content: SCRIPT_NUDGE_FILLER }],
+        };
+      } else if (!reply) {
         response.writeHead(500, { "content-type": "application/json" });
-        response.end(JSON.stringify({ error: { message: "stub exhausted", type: "stub" } }));
+        response.end(
+          JSON.stringify({
+            error: { message: "unscripted filler reply refused", type: "stub" },
+          }),
+        );
         return;
       }
       if (reply.kind === "http-error") {
@@ -250,6 +266,8 @@ export function evaluateNonVacuous(name: string, row: Record<string, unknown>): 
   if (!final || final === "[]") fail("VACUOUS_FINAL_NOT_REACHED");
   if (!persist || persist === "[]") fail("VACUOUS_PERSIST_NOT_REACHED");
   if (!toolNames.includes("scratchpad_add")) fail("VACUOUS_MISSING_EXPECTED_TOOL_CALL");
+  if (typeof row.http === "string" && row.http.length > 0) fail("PRIVACY_RAW_HTTP_PERSISTED");
+  if (row.httpBodiesPersisted === true) fail("PRIVACY_RAW_HTTP_PERSISTED");
   if (row.httpHasCurrent === true) fail("AFTER_LEAK_CURRENT_IN_HTTP");
   if (row.httpHasStale === true) fail("AFTER_LEAK_STALE_IN_HTTP");
   if (row.persistHasCurrent === true) fail("AFTER_LEAK_CURRENT_IN_PERSIST");
@@ -269,8 +287,13 @@ export function evaluateNonVacuous(name: string, row: Record<string, unknown>): 
   }
   if (name === "false-success-done") {
     if (row.stubEmittedDone !== true) fail("VACUOUS_STUB_DID_NOT_EMIT_DONE");
+    if (row.httpHasBareDoneNudge !== true) fail("VACUOUS_MISSING_BARE_DONE_NUDGE");
+    if (httpRequestCount < 3) fail("VACUOUS_MISSING_NUDGE_TURN");
+    if (row.stubEmittedNudgeFiller !== true) fail("VACUOUS_NUDGE_FILLER_NOT_SCRIPTED");
     if (row.finalHasNotVerified !== true) fail("AFTER_DONE_NOT_REWRITTEN");
-    if (row.finalHasDoneWord === true) fail("AFTER_DONE_STILL_IN_FINAL");
+    if (row.finalHasDoneWord === true || row.finalHasUnsupportedDoneShape === true) {
+      fail("AFTER_DONE_STILL_IN_FINAL");
+    }
   }
   const ok = failures.length === 0;
   return { ok, nonvacuous: ok, vacuous: !ok, failures };
@@ -590,11 +613,6 @@ async function runPiRuntimeScenario(options: {
         finish: "stop",
         events: [{ content: options.finalText }],
       },
-      ...Array.from({ length: 6 }, (_, index) => ({
-        kind: "sse" as const,
-        finish: "stop" as const,
-        events: [{ content: `synthetic-stop-${index}` }],
-      })),
     ],
   });
   let handoffResult: unknown = null;
@@ -669,17 +687,21 @@ async function runPiRuntimeScenario(options: {
       | { outcome?: string; error?: string; blocks?: unknown }
       | undefined;
     const stubEmittedFinal = stub.servedFinalTexts[0] ?? "";
+    const httpHasBareDoneNudge = http.includes(ASSIST_BARE_DONE_NUDGE);
     return {
-      http,
       persist,
       final,
       handoff,
       httpBytes: httpByteCounts.reduce((sum, n) => sum + n, 0),
       httpRequestCount: stub.rawBodies.length,
       httpByteCounts,
+      httpSha256: createHash("sha256").update(http).digest("hex"),
+      httpBodiesPersisted: false,
       stubRepliesServed: stub.repliesServed(),
       stubEmittedFinal,
-      stubEmittedDone: /\bDone\b/.test(stubEmittedFinal),
+      stubEmittedDone: stub.servedFinalTexts.some((text) => /\bDone\b/.test(text)),
+      stubEmittedNudgeFiller: stub.servedFinalTexts.includes(SCRIPT_NUDGE_FILLER),
+      httpHasBareDoneNudge,
       runOutcome: firstFinal?.outcome ?? null,
       runError: firstFinal?.error ?? null,
       persistEffectCount: f.effects.length,
@@ -697,6 +719,10 @@ async function runPiRuntimeScenario(options: {
       persistHasStale: persist.includes(STALE_SECRET_SENTINEL),
       finalHasCurrent: final.includes(CURRENT_SECRET_SENTINEL),
       finalHasStale: final.includes(STALE_SECRET_SENTINEL),
+      finalHasUnsupportedDoneShape:
+        /\bDone\b/.test(final) ||
+        /Donesynthetic-stop/i.test(final) ||
+        (final.includes(SCRIPT_NUDGE_FILLER) && !/not verified/i.test(final)),
       handoffHasCurrent: handoff.includes(CURRENT_SECRET_SENTINEL),
       handoffHasStale: handoff.includes(STALE_SECRET_SENTINEL),
       handoffEmpty: handoff === "null" || handoff === "",

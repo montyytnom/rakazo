@@ -19,6 +19,11 @@ need() {
   [[ -f "$1" ]] || { echo "missing $1" >&2; exit 1; }
 }
 
+if [[ -d "$OVERLAY" ]]; then
+  python3 "$ROOT/scripts/compose-overlay-trees.py" --overlay "$OVERLAY" --out "$COMPOSE" --service worker --patch
+  python3 "$ROOT/scripts/compose-overlay-trees.py" --overlay "$OVERLAY" --out "$COMPOSE" --service api --patch
+fi
+
 need "$COMPOSE/worker/after/AFTER-HASHES.tsv"
 need "$COMPOSE/api/after/AFTER-HASHES.tsv"
 need "$COMPOSE/worker/before/PREIMAGE-HASHES.tsv"
@@ -321,7 +326,7 @@ Live hash-only 6:36 AM EST closed c7e5 preimages (22 match, 18 absent, images 47
 HEAD vitest adapters/core suites label HEAD workspace, not composed trees.
 PiRuntime stub JSON measures HTTP/persist/final; named tests cover in-run handoff (repaired path vs preimage invariant) and composed compaction including secret strip.
 candidate-capture/ is the composed executor→PiRuntime→stub SSE launcher; run13 assembler harness is not used.
-Harness fake DB includes memoryDocument/botMcpServer/botSecret for production-forwarded RAKAZO_CTXMEM=1. Overlay-orchestration tests do not exercise candidate-capture-harness.ts. Cloud smoke is composed AFTER trees + workspace @rakazo/core, not Docker image 47d34235.
+Harness fake DB includes memoryDocument/botMcpServer/botSecret for production-forwarded RAKAZO_CTXMEM=1. Overlay-orchestration tests do not exercise candidate-capture-harness.ts. Cloud smoke is composed AFTER trees + workspace @rakazo/core, not Docker image 47d34235. RAKAZO_ASSIST_HARNESS is production-on (unset). Pack logs do not include raw HTTP bodies.
 HISTORICAL_PLAINTEXT_CLEANUP_LOCKED=true
 isolated-capture baseline fixtures unchanged
 no production calls, no model calls, no heldout inspection
@@ -341,10 +346,7 @@ if [[ -f "$SMOKE_OUT/nonvacuous-metrics.json" ]]; then
   cp -a "$SMOKE_OUT/nonvacuous-metrics.json" "$STAGE/logs/candidate-harness-nonvacuous-metrics.json"
   cp -a "$SMOKE_OUT/nonvacuous-metrics.json" /opt/cursor/artifacts/candidate-harness-nonvacuous-metrics.json
 fi
-if [[ -d "$SMOKE_OUT/worker" ]]; then
-  mkdir -p "$STAGE/logs/candidate-harness-smoke"
-  cp -a "$SMOKE_OUT/worker" "$SMOKE_OUT/api" "$STAGE/logs/candidate-harness-smoke/" 2>/dev/null || true
-fi
+# Do not pack raw HTTP bodies or per-scenario request JSON. Metrics only.
 "$STAGE/prove-isolated-core.sh" "$STAGE" | tee "$STAGE/logs/candidate-isolated-core.log"
 "$STAGE/apply-to-scratch.sh" --self-test --from "$STAGE" | tee "$STAGE/logs/candidate-apply-rollback-selftest.log"
 
@@ -368,8 +370,8 @@ index = [
     "- `RUNTIME-LOADING.txt` — tsx + `@rakazo/core` default `./src/index.ts`",
     "- `candidate-capture/` — composed executor→PiRuntime→stub SSE launcher; dry-run lists 37 binds",
     "- `CANDIDATE-CAPTURE.md` — authored dry-run / execute / cleanup commands",
-    "- `logs/candidate-harness-smoke.log` — actual harness on composed AFTER trees, CTXMEM=1 facts on/off, both services",
-    "- `logs/candidate-harness-nonvacuous-metrics.json` — fail-closed HTTP byte/outcome checker; ok is not no-throw",
+    "- `logs/candidate-harness-smoke.log` — actual harness on composed AFTER trees, CTXMEM=1 facts on/off, both services; no raw HTTP bodies",
+    "- `logs/candidate-harness-nonvacuous-metrics.json` — fail-closed HTTP byte/outcome checker; ok is not no-throw; synthetic metrics only",
     "",
     "## Labels",
     "",

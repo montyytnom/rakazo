@@ -78,6 +78,10 @@ def evaluate(name: str, row: dict) -> list[str]:
         fail("AFTER_LEAK_CURRENT_IN_HANDOFF")
     if row.get("handoffHasStale") is True:
         fail("AFTER_LEAK_STALE_IN_HANDOFF")
+    if isinstance(row.get("http"), str) and row.get("http"):
+        fail("PRIVACY_RAW_HTTP_PERSISTED")
+    if row.get("httpBodiesPersisted") is True:
+        fail("PRIVACY_RAW_HTTP_PERSISTED")
     if name != "false-success-done" and row.get("executeArgsHasCurrent") is not True:
         fail("VACUOUS_SENTINEL_DID_NOT_REACH_TOOL_ARGS")
     if row.get("toolResultAfterHasCurrent") is True:
@@ -92,9 +96,15 @@ def evaluate(name: str, row: dict) -> list[str]:
     if name == "false-success-done":
         if row.get("stubEmittedDone") is not True:
             fail("VACUOUS_STUB_DID_NOT_EMIT_DONE")
+        if row.get("httpHasBareDoneNudge") is not True:
+            fail("VACUOUS_MISSING_BARE_DONE_NUDGE")
+        if http_n < 3:
+            fail("VACUOUS_MISSING_NUDGE_TURN")
+        if row.get("stubEmittedNudgeFiller") is not True:
+            fail("VACUOUS_NUDGE_FILLER_NOT_SCRIPTED")
         if row.get("finalHasNotVerified") is not True:
             fail("AFTER_DONE_NOT_REWRITTEN")
-        if row.get("finalHasDoneWord") is True:
+        if row.get("finalHasDoneWord") is True or row.get("finalHasUnsupportedDoneShape") is True:
             fail("AFTER_DONE_STILL_IN_FINAL")
     return failures
 
@@ -118,43 +128,61 @@ def metrics_row(service: str, branch: str, name: str, row: dict, failures: list[
         "executeToolNames": row.get("executeToolNames"),
         "executeArgsHasCurrent": row.get("executeArgsHasCurrent"),
         "stubEmittedDone": row.get("stubEmittedDone"),
+        "stubEmittedNudgeFiller": row.get("stubEmittedNudgeFiller"),
+        "httpHasBareDoneNudge": row.get("httpHasBareDoneNudge"),
         "stubEmittedFinal": row.get("stubEmittedFinal"),
         "finalHasNotVerified": row.get("finalHasNotVerified"),
+        "httpSha256": row.get("httpSha256"),
+        "httpBodiesPersisted": row.get("httpBodiesPersisted"),
         "summary": (row.get("summary") or "")[:80] if name.startswith("compaction-") else None,
     }
+
+
+def discover_summaries(root: Path) -> list[tuple[str, str, Path]]:
+    """Launcher writes OUT/service/phases-summary.json. Smoke writes OUT/service/branch/."""
+    found: list[tuple[str, str, Path]] = []
+    for path in sorted(root.rglob("phases-summary.json")):
+        rel = path.relative_to(root)
+        parts = rel.parts
+        if len(parts) < 2:
+            continue
+        service = parts[0]
+        if service not in ("worker", "api"):
+            continue
+        branch = parts[1] if len(parts) > 2 else "execute"
+        found.append((service, branch, path))
+    return found
 
 
 def check_tree(root: Path) -> dict:
     rows = []
     failed = 0
     missing = 0
-    for service in ("worker", "api"):
-        for branch in ("ctxmem-facts-on", "ctxmem-facts-off"):
-            summary_path = root / service / branch / "phases-summary.json"
-            if not summary_path.is_file():
-                missing += 1
+    summaries = discover_summaries(root)
+    if not summaries:
+        missing = 1
+        failed = 1
+        rows.append(
+            {
+                "service": "*",
+                "branch": "*",
+                "scenario": "*",
+                "nonvacuous": False,
+                "vacuous": True,
+                "failures": ["MISSING_PHASES_SUMMARY"],
+            }
+        )
+    for service, branch, summary_path in summaries:
+        summary = json.loads(summary_path.read_text())
+        scenarios = summary.get("scenarios") or {}
+        for name in sorted(REQUIRED):
+            row = scenarios.get(name) or {}
+            failures = evaluate(name, row)
+            if name not in scenarios:
+                failures = ["MISSING_SCENARIO", *failures]
+            if failures:
                 failed += 1
-                rows.append(
-                    {
-                        "service": service,
-                        "branch": branch,
-                        "scenario": "*",
-                        "nonvacuous": False,
-                        "vacuous": True,
-                        "failures": ["MISSING_PHASES_SUMMARY"],
-                    }
-                )
-                continue
-            summary = json.loads(summary_path.read_text())
-            scenarios = summary.get("scenarios") or {}
-            for name in sorted(REQUIRED):
-                row = scenarios.get(name) or {}
-                failures = evaluate(name, row)
-                if name not in scenarios:
-                    failures = ["MISSING_SCENARIO", *failures]
-                if failures:
-                    failed += 1
-                rows.append(metrics_row(service, branch, name, row, failures))
+            rows.append(metrics_row(service, branch, name, row, failures))
     report = {
         "ok": failed == 0,
         "failed": failed,

@@ -54,7 +54,7 @@ describe("candidate-capture non-vacuous gate", () => {
   it("rejects false-success-done that never emitted Done", () => {
     const verdict = evaluateNonVacuous("false-success-done", {
       ...vacuous729d,
-      http: "x",
+      http: "",
       httpBytes: 12,
       httpRequestCount: 2,
       persist: '[{"id":"effect-1"}]',
@@ -71,9 +71,42 @@ describe("candidate-capture non-vacuous gate", () => {
     expect(verdict.ok).toBe(false);
   });
 
+  it("rejects false-success-done without the overlay bare-done nudge turn", () => {
+    const verdict = evaluateNonVacuous("false-success-done", {
+      httpBytes: 80_000,
+      httpRequestCount: 2,
+      persist: '[{"id":"effect-1"}]',
+      final: '[{"outcome":"completed","blocks":[{"text":"Outcome was not verified."}]}]',
+      runOutcome: "completed",
+      executeToolNames: ["scratchpad_add"],
+      stubEmittedDone: true,
+      httpHasBareDoneNudge: false,
+      stubEmittedNudgeFiller: false,
+      finalHasNotVerified: true,
+      finalHasDoneWord: false,
+      finalHasUnsupportedDoneShape: false,
+    });
+    expect(verdict.failures).toContain("VACUOUS_MISSING_BARE_DONE_NUDGE");
+    expect(verdict.ok).toBe(false);
+  });
+
+  it("rejects persisted raw HTTP bodies", () => {
+    const verdict = evaluateNonVacuous("generated-secret", {
+      http: '{"messages":[{"role":"user","content":"operating-name"}]}',
+      httpBytes: 40,
+      httpRequestCount: 2,
+      persist: '[{"result":{"title":"[withheld]"}}]',
+      final: '[{"outcome":"completed"}]',
+      runOutcome: "completed",
+      executeToolNames: ["scratchpad_add"],
+      executeArgsHasCurrent: true,
+    });
+    expect(verdict.failures).toContain("PRIVACY_RAW_HTTP_PERSISTED");
+    expect(verdict.ok).toBe(false);
+  });
+
   it("accepts an AFTER secret row with before-args leak and after withhold", () => {
     const verdict = evaluateNonVacuous("generated-secret", {
-      http: '{"messages":[{"role":"user"}]}',
       httpBytes: 40,
       httpRequestCount: 2,
       persist: '[{"result":{"title":"[withheld]"}}]',
@@ -86,6 +119,25 @@ describe("candidate-capture non-vacuous gate", () => {
       httpHasCurrent: false,
       persistHasCurrent: false,
       finalHasCurrent: false,
+    });
+    expect(verdict.failures).toEqual([]);
+    expect(verdict.ok).toBe(true);
+  });
+
+  it("accepts false-success-done only when the overlay nudge ran and the gate rewrote the glued filler", () => {
+    const verdict = evaluateNonVacuous("false-success-done", {
+      httpBytes: 80_000,
+      httpRequestCount: 3,
+      persist: '[{"id":"effect-1"}]',
+      final: '[{"outcome":"completed","blocks":[{"text":"Outcome was not verified."}]}]',
+      runOutcome: "completed",
+      executeToolNames: ["scratchpad_add"],
+      stubEmittedDone: true,
+      httpHasBareDoneNudge: true,
+      stubEmittedNudgeFiller: true,
+      finalHasNotVerified: true,
+      finalHasDoneWord: false,
+      finalHasUnsupportedDoneShape: false,
     });
     expect(verdict.failures).toEqual([]);
     expect(verdict.ok).toBe(true);

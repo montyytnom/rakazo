@@ -63,6 +63,18 @@ describe("completion artifacts", () => {
     }
   });
 
+  it("rewrites a bare Done glued to a nudge-turn filler at the terminal boundary", () => {
+    const idle = collectToolEvidence([]);
+    for (const claim of [
+      "Donesynthetic-stop-0",
+      "Done\n\nsynthetic-stop-0",
+      "Done synthetic-stop-0",
+    ]) {
+      expect(unsupportedClaims(claim, idle)).toContain("success-without-artifact");
+      expect(sanitizeFinalText(claim, idle)).toBe("Outcome was not verified.");
+    }
+  });
+
   it("keeps the original final when the ledger has current-intent delivered-send proof", () => {
     const ledger = emptyCompletionLedger(INTENT);
     const artifact = bindOutcomeArtifact({

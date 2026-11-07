@@ -67,7 +67,18 @@ describe("candidate-capture-harness composed-tree smoke", { timeout: 180_000 }, 
           );
           for (const [name, row] of Object.entries(summary.scenarios)) {
             expect(row.ok, `${service} ${branch} ${name} ${row.error?.message ?? ""}`).toBe(true);
+            expect(row).not.toHaveProperty("http");
           }
+          const falseDone = summary.scenarios["false-success-done"] as {
+            httpRequestCount?: number;
+            httpHasBareDoneNudge?: boolean;
+            finalHasNotVerified?: boolean;
+            stubEmittedNudgeFiller?: boolean;
+          };
+          expect(falseDone.httpRequestCount, `${service} ${branch}`).toBeGreaterThanOrEqual(3);
+          expect(falseDone.httpHasBareDoneNudge).toBe(true);
+          expect(falseDone.stubEmittedNudgeFiller).toBe(true);
+          expect(falseDone.finalHasNotVerified).toBe(true);
           expect(existsSync(path.join(out, service, branch, "scenario-compaction-current-secret.json"))).toBe(
             true,
           );
@@ -86,6 +97,7 @@ describe("candidate-capture-harness composed-tree smoke", { timeout: 180_000 }, 
       expect(executor.length).toBe(16);
       expect(executor.every((row) => (row.httpBytes ?? 0) > 0 && row.nonvacuous)).toBe(true);
       expect(result.stdout).toContain("LIMIT: not Docker image");
+      expect(result.stdout).toContain("RAKAZO_ASSIST_HARNESS unset");
       expect(result.stdout).toContain("nonvacuous checker passed");
     } finally {
       rmSync(out, { recursive: true, force: true });

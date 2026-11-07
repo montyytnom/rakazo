@@ -453,6 +453,63 @@ class CandidateLaunchTests(unittest.TestCase):
         self.assertTrue(any("worker" in name for name in docker_runs))
         self.assertTrue(any("api" in name for name in docker_runs))
 
+    def test_nonvacuous_checker_accepts_execute_out_service_layout(self) -> None:
+        out = Path(tempfile.mkdtemp())
+        passing = {
+            "ok": True,
+            "httpBytes": 80000,
+            "httpRequestCount": 3,
+            "persist": '[{"id":"effect-1"}]',
+            "final": '[{"outcome":"completed"}]',
+            "runOutcome": "completed",
+            "executeToolNames": ["scratchpad_add"],
+            "executeArgsHasCurrent": True,
+            "stubEmittedDone": True,
+            "httpHasBareDoneNudge": True,
+            "stubEmittedNudgeFiller": True,
+            "finalHasNotVerified": True,
+            "finalHasDoneWord": False,
+            "finalHasUnsupportedDoneShape": False,
+        }
+        compaction = {
+            "summary": "New password: [withheld]",
+            "hasCurrent": False,
+            "hasStale": False,
+            "hasAllSet": False,
+        }
+        for service in ("worker", "api"):
+            dest = out / service
+            dest.mkdir()
+            scenarios = {
+                "generated-secret": {
+                    **passing,
+                    "httpRequestCount": 2,
+                    "httpHasBareDoneNudge": False,
+                    "stubEmittedNudgeFiller": False,
+                    "finalHasNotVerified": False,
+                },
+                "stale-secret": {
+                    **passing,
+                    "httpRequestCount": 2,
+                    "httpHasBareDoneNudge": False,
+                    "stubEmittedNudgeFiller": False,
+                },
+                "protected-handoff-repaired-path": {
+                    **passing,
+                    "httpRequestCount": 2,
+                    "httpHasBareDoneNudge": False,
+                    "stubEmittedNudgeFiller": False,
+                    "executeToolNames": ["scratchpad_add", "protected_result_handoff"],
+                    "handoff": '{"ok":true}',
+                },
+                "false-success-done": {**passing, "executeArgsHasCurrent": False},
+                "compaction-current-secret": compaction,
+                "compaction-stale-secret": compaction,
+            }
+            (dest / "phases-summary.json").write_text(json.dumps({"scenarios": scenarios}) + "\n")
+        rc = candidate_launch.run_nonvacuous_checker(out)
+        self.assertEqual(rc, 0)
+
     def test_cleanup_refuses_production_roots(self) -> None:
         with self.assertRaises(SystemExit):
             candidate_launch.cleanup_stage(Path("/opt/docker/rakazo"))

@@ -950,10 +950,17 @@ def main(argv: list[str]) -> int:
     if not worker["image"].get("local") or not api["image"].get("local"):
         print("refusing execute: both images must exist locally (no pull)", file=sys.stderr)
         return 1
-    return execute_capture_services(worker, api)
+    return execute_capture_services(worker, api, out)
 
 
-def execute_capture_services(worker: dict, api: dict) -> int:
+def run_nonvacuous_checker(out: Path) -> int:
+    """Launcher writes OUT/service/phases-summary.json (not OUT/service/branch)."""
+    checker = Path(__file__).with_name("check_nonvacuous.py")
+    proc = subprocess.run([sys.executable, str(checker), str(out)])
+    return proc.returncode
+
+
+def execute_capture_services(worker: dict, api: dict, out: Path) -> int:
     """Run both capture containers. A worker failure still starts api when safe."""
     started: list[str] = []
     failed: list[str] = []
@@ -972,6 +979,13 @@ def execute_capture_services(worker: dict, api: dict) -> int:
     finally:
         for name in started:
             subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+    checker_rc = run_nonvacuous_checker(out)
+    if checker_rc != 0:
+        failed.append(f"nonvacuous-checker rc={checker_rc}")
+        print(
+            f"nonvacuous checker failed rc={checker_rc} (layout is OUT/service, not OUT/service/branch)",
+            file=sys.stderr,
+        )
     if failed:
         print("execute failed: " + "; ".join(failed), file=sys.stderr)
         return 1

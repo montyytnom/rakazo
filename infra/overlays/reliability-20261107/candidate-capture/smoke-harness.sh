@@ -18,25 +18,24 @@ echo "candidate-harness-smoke $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "LIMIT: not Docker image 47d34235/c500071f. Relative imports resolve to composed AFTER executor/pi-runtime/history-compaction/ctxmem. @rakazo/core package resolution is workspace HEAD."
 echo "ctxmem production path is RAKAZO_CTXMEM=1; facts on unless RAKAZO_CTXMEM_FACTS=0."
 echo "synthetic window 131072 / maxTokens 32768 (4*32768). Not a live encrypted secret limit. ok is not no-throw."
+echo "RAKAZO_ASSIST_HARNESS unset (production-on). Overlay assistBareDone nudge is in composed AFTER pi-runtime. Not Docker image preserved mounts beyond candidate overlay."
 
 if [[ ! -f "$HARNESS_SRC" ]]; then
   echo "missing harness $HARNESS_SRC" >&2
   exit 1
 fi
 
-need_compose=0
-for svc in worker api; do
-  if ! grep -q 'memoryDocument.findFirst' "$COMPOSE/$svc/after/packages/adapters/src/history-compaction.ts" 2>/dev/null; then
-    need_compose=1
-  fi
-done
-if [[ "$need_compose" -eq 1 ]]; then
-  if [[ ! -d "$OVERLAY" ]]; then
-    echo "overlay archive missing; cannot compose AFTER trees for harness smoke" >&2
-    exit 1
-  fi
+if [[ -d "$OVERLAY" ]]; then
   python3 "$ROOT/scripts/compose-overlay-trees.py" --overlay "$OVERLAY" --out "$COMPOSE" --service worker --patch
   python3 "$ROOT/scripts/compose-overlay-trees.py" --overlay "$OVERLAY" --out "$COMPOSE" --service api --patch
+else
+  for svc in worker api; do
+    if ! grep -q 'memoryDocument.findFirst' "$COMPOSE/$svc/after/packages/adapters/src/history-compaction.ts" 2>/dev/null; then
+      echo "overlay archive missing; cannot compose AFTER trees for harness smoke" >&2
+      exit 1
+    fi
+  done
+  echo "LIMIT: overlay archive absent; using existing .compose AFTER trees. Not an exact pinned-image remount."
 fi
 
 TSX="${REPO_TSX:-}"
@@ -58,7 +57,8 @@ apply_forwarded_production_env() {
   export RAKAZO_CTXMEM=1
   export RAKAZO_ASSIST_PROMPT=1
   export RAKAZO_ASSIST_STABLE_PREFIX=1
-  export RAKAZO_ASSIST_HARNESS=0
+  # Production-on: RAKAZO_ASSIST_HARNESS is off_when_0. Unset (not "0") so overlay
+  # assistBareDone nudge runs. Forcing 0 hid the third model request in cloud smoke.
   export RAKAZO_FAST_COMPUTER_STEPS=0
   export RAKAZO_GUARD_FINAL_SUMMARY=1
   export RAKAZO_BOT_DIRECTORY_CARDS=1

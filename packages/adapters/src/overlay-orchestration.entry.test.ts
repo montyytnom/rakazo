@@ -1329,6 +1329,26 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
       runId: "run-1",
     });
     expect(sanitizeFinalText("Done", evidence, ledger)).toBe("Outcome was not verified.");
+    expect(sanitizeFinalText("Donesynthetic-stop-0", evidence)).toBe("Outcome was not verified.");
+    expect(sanitizeFinalText("Done\n\nsynthetic-stop-0", evidence)).toBe(
+      "Outcome was not verified.",
+    );
+  });
+
+  it("composed AFTER pi-runtime has the exact pinned-image bare-done nudge", () => {
+    if (missing.length) return;
+    const previous = process.env.RAKAZO_ASSIST_HARNESS;
+    delete process.env.RAKAZO_ASSIST_HARNESS;
+    try {
+      const src = readFileSync(afterPiRuntime, "utf8");
+      expect(src).toContain(
+        "Give the user the actual result now: what you did, what you found or changed, and how you checked it. A bare 'done' is not enough.",
+      );
+      expect(src).toContain("export function assistBareDone");
+    } finally {
+      if (previous === undefined) delete process.env.RAKAZO_ASSIST_HARNESS;
+      else process.env.RAKAZO_ASSIST_HARNESS = previous;
+    }
   });
 
   it("compose-before leaves 926710a-absent helpers absent and does not patch core index", () => {

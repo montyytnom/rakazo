@@ -15,6 +15,10 @@ const CREDIT_LIMIT = /credit limit/i;
 /** Claim *detection* is English regex. Allowing a success claim is ledger-only. */
 const SUCCESS_CLAIM =
   /\b(done|complete|completed|success(?:ful(?:ly)?)?|all set|successfully changed|it is reset|reset (?:is |was )?done)\b/i;
+/** Bare-done nudge concat ("Donesynthetic-stop-0") has no word boundary after Done. */
+const GLUED_SUCCESS =
+  /^(done|ok|okay|completed?|finished|all done|task complete|it'?s done)(?=[A-Za-z0-9_-])/i;
+const FILLER_REPLY = /synthetic-stop-\d+/i;
 const EMAIL = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
 const LOGIN_PAGE = /\b(sign in|log in|login)\b/i;
 
@@ -192,10 +196,23 @@ export function unsupportedClaims(
   if (LIMIT_AS_PAYMENT.test(finalText) && !CREDIT_LIMIT.test(finalText)) {
     violations.push("limit-as-payment");
   }
-  if (positiveClaims(finalText, SUCCESS_CLAIM).length > 0 && !ledgerAllowsSuccess(ledger)) {
+  if (
+    !ledgerAllowsSuccess(ledger) &&
+    (positiveClaims(finalText, SUCCESS_CLAIM).length > 0 ||
+      hasGluedOrFillerUnsupportedCompletion(finalText))
+  ) {
     violations.push("success-without-artifact");
   }
   return [...new Set(violations)];
+}
+
+/** Terminal final after a bare-done nudge may glue the fallback Done to the next turn. */
+export function hasGluedOrFillerUnsupportedCompletion(text: string): boolean {
+  const compact = text.trim();
+  if (!compact) return false;
+  if (FILLER_REPLY.test(compact)) return true;
+  if (GLUED_SUCCESS.test(compact)) return true;
+  return false;
 }
 
 export function sanitizeFinalText(
@@ -232,10 +249,14 @@ export function sanitizeFinalText(
   }
   if (violations.has("success-without-artifact")) {
     const keptSuccess = clauses(text).filter(
-      (clause) => !(SUCCESS_CLAIM.test(clause) && !NEGATIVE.test(clause)),
+      (clause) =>
+        !(SUCCESS_CLAIM.test(clause) && !NEGATIVE.test(clause)) &&
+        !hasGluedOrFillerUnsupportedCompletion(clause),
     );
     text = keptSuccess.join(". ").replace(/\s+/g, " ").trim();
-    if (!text) text = "Outcome was not verified.";
+    if (!text || hasGluedOrFillerUnsupportedCompletion(text) || FILLER_REPLY.test(text)) {
+      text = "Outcome was not verified.";
+    }
   }
   return text.replace(/\s+/g, " ").trim();
 }
