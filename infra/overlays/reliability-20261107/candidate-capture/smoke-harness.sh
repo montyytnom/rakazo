@@ -17,6 +17,7 @@ exec > >(tee "$LOG") 2>&1
 echo "candidate-harness-smoke $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "LIMIT: not Docker image 47d34235/c500071f. Relative imports resolve to composed AFTER executor/pi-runtime/history-compaction/ctxmem. @rakazo/core package resolution is workspace HEAD."
 echo "ctxmem production path is RAKAZO_CTXMEM=1; facts on unless RAKAZO_CTXMEM_FACTS=0."
+echo "synthetic window 131072 / maxTokens 32768 (4*32768). Not a live encrypted secret limit. ok is not no-throw."
 
 if [[ ! -f "$HARNESS_SRC" ]]; then
   echo "missing harness $HARNESS_SRC" >&2
@@ -102,7 +103,11 @@ print("phases", sys.argv[2], sys.argv[3], "failed", p.get("failed"), "scenarios"
 for name, row in (p.get("scenarios") or {}).items():
     ok = row.get("ok")
     err = (row.get("error") or {}).get("message") if isinstance(row.get("error"), dict) else None
-    print(f"  {name} ok={ok} error={err}")
+    print(
+        f"  {name} ok={ok} nonvacuous={row.get('nonvacuous')} vacuous={row.get('vacuous')} "
+        f"httpBytes={row.get('httpBytes')} requests={row.get('httpRequestCount')} "
+        f"outcome={row.get('runOutcome')} failures={row.get('failures')} error={err}"
+    )
 PY
   else
     echo "missing phases-summary.json for $service $branch" >&2
@@ -119,7 +124,13 @@ run_one worker ctxmem-facts-off
 run_one api ctxmem-facts-off
 
 echo "smoke failed=$failed"
+python3 "$HERE/check_nonvacuous.py" "$OUT"
+checker_rc=$?
+if [[ "$checker_rc" -ne 0 ]]; then
+  failed=1
+  echo "FAIL nonvacuous checker rc=$checker_rc" >&2
+fi
 if [[ "$failed" -ne 0 ]]; then
   exit 1
 fi
-echo "candidate-harness-smoke OK"
+echo "candidate-harness-smoke OK (nonvacuous checker passed)"

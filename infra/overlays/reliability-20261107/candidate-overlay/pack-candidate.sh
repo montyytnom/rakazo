@@ -241,11 +241,12 @@ mkdir -p "$STAGE/candidate-capture"
 cp -a "$CAPTURE/host-launch.sh" "$CAPTURE/candidate_launch.py" "$CAPTURE/run.sh" \
   "$CAPTURE/allowlisted-env.txt" "$CAPTURE/README.md" "$CAPTURE/CANDIDATE-CAPTURE.md" \
   "$CAPTURE/candidate_launch_test.py" "$CAPTURE/smoke-harness.sh" \
+  "$CAPTURE/check_nonvacuous.py" "$CAPTURE/check_nonvacuous_test.py" \
   "$STAGE/candidate-capture/"
 cp -a "$ROOT/packages/adapters/src/candidate-capture-harness.ts" \
   "$STAGE/candidate-capture/candidate-capture-harness.ts"
 chmod +x "$STAGE/candidate-capture/host-launch.sh" "$STAGE/candidate-capture/run.sh" \
-  "$STAGE/candidate-capture/smoke-harness.sh"
+  "$STAGE/candidate-capture/smoke-harness.sh" "$STAGE/candidate-capture/check_nonvacuous.py"
 git -C "$ROOT" rev-parse HEAD > "$STAGE/HEAD.txt"
 cp -a "$ROOT/infra/overlays/reliability-20261107/ROLLBACK.sh" "$STAGE/ROLLBACK.sh"
 chmod +x "$STAGE/ROLLBACK.sh"
@@ -293,7 +294,8 @@ for log in \
   candidate-apply-rollback-selftest.log \
   candidate-capture-launcher-tests.log \
   candidate-capture-dry-run.log \
-  candidate-harness-smoke.log
+  candidate-harness-smoke.log \
+  candidate-harness-nonvacuous-metrics.json
 do
   if [[ -f "/opt/cursor/artifacts/$log" ]]; then
     cp -a "/opt/cursor/artifacts/$log" "$STAGE/logs/$log"
@@ -335,6 +337,10 @@ mkdir -p "$SMOKE_OUT"
 echo "running actual candidate-capture harness smoke under production-forwarded ctxmem (facts on and off) on both composed AFTER trees"
 bash "$CAPTURE/smoke-harness.sh" "$SMOKE_OUT"
 cp -a "$SMOKE_OUT/smoke.log" "$STAGE/logs/candidate-harness-smoke.log"
+if [[ -f "$SMOKE_OUT/nonvacuous-metrics.json" ]]; then
+  cp -a "$SMOKE_OUT/nonvacuous-metrics.json" "$STAGE/logs/candidate-harness-nonvacuous-metrics.json"
+  cp -a "$SMOKE_OUT/nonvacuous-metrics.json" /opt/cursor/artifacts/candidate-harness-nonvacuous-metrics.json
+fi
 if [[ -d "$SMOKE_OUT/worker" ]]; then
   mkdir -p "$STAGE/logs/candidate-harness-smoke"
   cp -a "$SMOKE_OUT/worker" "$SMOKE_OUT/api" "$STAGE/logs/candidate-harness-smoke/" 2>/dev/null || true
@@ -363,6 +369,7 @@ index = [
     "- `candidate-capture/` — composed executor→PiRuntime→stub SSE launcher; dry-run lists 37 binds",
     "- `CANDIDATE-CAPTURE.md` — authored dry-run / execute / cleanup commands",
     "- `logs/candidate-harness-smoke.log` — actual harness on composed AFTER trees, CTXMEM=1 facts on/off, both services",
+    "- `logs/candidate-harness-nonvacuous-metrics.json` — fail-closed HTTP byte/outcome checker; ok is not no-throw",
     "",
     "## Labels",
     "",

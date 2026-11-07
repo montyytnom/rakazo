@@ -15,6 +15,11 @@ export const CURRENT_SECRET_SENTINEL = "Cur#Rpr7xQ2mN9kL";
 export const STALE_SECRET_SENTINEL = "Old#Stl4pW8vB3yH";
 export const CANDIDATE_CAPTURE_KIND = "composed-executor-piruntime-stub-sse";
 export const CAPTURE_MODEL_ID = "qwen3.8-flash-next";
+/** Isolated-capture runs 10–13 used 4 × 32768. Not a live encrypted secret window. */
+export const SYNTHETIC_CAPTURE_MAX_TOKENS = 32_768;
+export const SYNTHETIC_CAPTURE_CONTEXT_WINDOW = 131_072;
+export const SYNTHETIC_CAPTURE_WINDOW_NOTE =
+  "DEFAULT_MODEL_CONTEXT_WINDOW=32768 cannot reserve REASONING_MODEL_MAX_TOKENS=32768 plus assembler/tools (ContextBudgetError). Synthetic window is 4*32768=131072 so input room remains. Previously accepted for isolated-capture runs 10-13. Not a live encrypted secret.contextWindow/maxTokens value.";
 
 type Effect = {
   id: string;
@@ -66,6 +71,16 @@ function sseToolCall(id: string, name: string, args: Record<string, unknown>) {
   ];
 }
 
+function stubEventText(events: unknown[]): string {
+  return events
+    .map((event) => {
+      if (!event || typeof event !== "object" || !("content" in event)) return "";
+      const content = (event as { content?: unknown }).content;
+      return typeof content === "string" ? content : "";
+    })
+    .join("");
+}
+
 async function startLoopbackStub(options: {
   modelId: string;
   replies: StubReply[];
@@ -73,6 +88,7 @@ async function startLoopbackStub(options: {
 }) {
   const rawBodies: Buffer[] = [];
   const parsedBodies: Array<Record<string, unknown> | null> = [];
+  const servedFinalTexts: string[] = [];
   let seq = 0;
   const server: Server = createServer((request: IncomingMessage, response) => {
     void (async () => {
@@ -99,6 +115,7 @@ async function startLoopbackStub(options: {
         response.end(reply.body);
         return;
       }
+      if (reply.finish === "stop") servedFinalTexts.push(stubEventText(reply.events));
       const stubSse = ssePayload(options.modelId, reply.events, reply.finish);
       response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
       response.end(stubSse);
@@ -116,6 +133,8 @@ async function startLoopbackStub(options: {
     baseUrl: `http://127.0.0.1:${address.port}/v1`,
     rawBodies,
     parsedBodies,
+    servedFinalTexts,
+    repliesServed: () => seq,
     caseName: options.caseName,
     async close() {
       await new Promise<void>((resolveClose, reject) => {
@@ -132,10 +151,10 @@ function captureRunModel(baseUrl: string) {
     id: CAPTURE_MODEL_ID,
     baseUrl,
     apiKey: "local",
-    reasoning: false,
-    acceptsImages: false,
-    maxTokens: 8192,
-    contextWindow: 32768,
+    reasoning: true,
+    acceptsImages: true,
+    maxTokens: SYNTHETIC_CAPTURE_MAX_TOKENS,
+    contextWindow: SYNTHETIC_CAPTURE_CONTEXT_WINDOW,
   };
 }
 
@@ -181,6 +200,80 @@ function missingPrismaGuard<T extends object>(base: T, label: string): T {
       throw new Error(`${label} synthetic prisma missing ${String(prop)}`);
     },
   }) as T;
+}
+
+export type NonVacuousVerdict = {
+  ok: boolean;
+  nonvacuous: boolean;
+  vacuous: boolean;
+  failures: string[];
+};
+
+const EXECUTOR_SCENARIOS = new Set([
+  "generated-secret",
+  "stale-secret",
+  "protected-handoff-repaired-path",
+  "false-success-done",
+]);
+
+/** Fail-closed: no-throw / rc=0 is not proof the model boundary ran. */
+export function evaluateNonVacuous(name: string, row: Record<string, unknown>): NonVacuousVerdict {
+  const failures: string[] = [];
+  const fail = (code: string) => failures.push(code);
+  if (name.startsWith("compaction-")) {
+    const summary = typeof row.summary === "string" ? row.summary : "";
+    if (!summary) fail("VACUOUS_EMPTY_COMPACTION_SUMMARY");
+    if (row.hasCurrent === true) fail("AFTER_LEAK_CURRENT_IN_COMPACTION");
+    if (row.hasStale === true) fail("AFTER_LEAK_STALE_IN_COMPACTION");
+    if (row.hasAllSet === true) fail("AFTER_FALSE_ALL_SET_NOT_REMOVED");
+    const ok = failures.length === 0;
+    return { ok, nonvacuous: ok, vacuous: !ok, failures };
+  }
+  if (!EXECUTOR_SCENARIOS.has(name)) {
+    fail("UNKNOWN_SCENARIO");
+    return { ok: false, nonvacuous: false, vacuous: true, failures };
+  }
+  const httpBytes = Number(row.httpBytes ?? 0);
+  const httpRequestCount = Number(row.httpRequestCount ?? 0);
+  const runOutcome = typeof row.runOutcome === "string" ? row.runOutcome : "";
+  const runError = typeof row.runError === "string" ? row.runError : "";
+  const persist = typeof row.persist === "string" ? row.persist : "";
+  const final = typeof row.final === "string" ? row.final : "";
+  const handoff = typeof row.handoff === "string" ? row.handoff : "";
+  const toolNames = Array.isArray(row.executeToolNames)
+    ? row.executeToolNames.map((value) => String(value))
+    : [];
+  if (httpBytes <= 0) fail("VACUOUS_ZERO_HTTP");
+  if (httpRequestCount < 2) fail("VACUOUS_MISSING_TOOL_ROUND");
+  if (runOutcome !== "completed") fail("VACUOUS_FAILED_RUN");
+  if (/context budget/i.test(runError) || /context budget/i.test(final)) fail("VACUOUS_CONTEXT_BUDGET");
+  if (!final || final === "[]") fail("VACUOUS_FINAL_NOT_REACHED");
+  if (!persist || persist === "[]") fail("VACUOUS_PERSIST_NOT_REACHED");
+  if (!toolNames.includes("scratchpad_add")) fail("VACUOUS_MISSING_EXPECTED_TOOL_CALL");
+  if (row.httpHasCurrent === true) fail("AFTER_LEAK_CURRENT_IN_HTTP");
+  if (row.httpHasStale === true) fail("AFTER_LEAK_STALE_IN_HTTP");
+  if (row.persistHasCurrent === true) fail("AFTER_LEAK_CURRENT_IN_PERSIST");
+  if (row.persistHasStale === true) fail("AFTER_LEAK_STALE_IN_PERSIST");
+  if (row.finalHasCurrent === true) fail("AFTER_LEAK_CURRENT_IN_FINAL");
+  if (row.finalHasStale === true) fail("AFTER_LEAK_STALE_IN_FINAL");
+  if (row.handoffHasCurrent === true) fail("AFTER_LEAK_CURRENT_IN_HANDOFF");
+  if (row.handoffHasStale === true) fail("AFTER_LEAK_STALE_IN_HANDOFF");
+  if (name !== "false-success-done" && row.executeArgsHasCurrent !== true) {
+    fail("VACUOUS_SENTINEL_DID_NOT_REACH_TOOL_ARGS");
+  }
+  if (row.toolResultAfterHasCurrent === true) fail("AFTER_LEAK_CURRENT_IN_TOOL_RESULT");
+  if (row.toolResultAfterHasStale === true) fail("AFTER_LEAK_STALE_IN_TOOL_RESULT");
+  if (name === "protected-handoff-repaired-path") {
+    if (!toolNames.includes("protected_result_handoff")) fail("VACUOUS_MISSING_EXPECTED_HANDOFF");
+    if (handoff === "null" || handoff === "" || handoff === "undefined") fail("VACUOUS_HANDOFF_NULL");
+  }
+  if (name === "false-success-done") {
+    if (row.stubEmittedDone !== true) fail("VACUOUS_STUB_DID_NOT_EMIT_DONE");
+    if (row.finalHasNotVerified !== true) fail("AFTER_DONE_NOT_REWRITTEN");
+    if (row.finalHasDoneWord === true) fail("AFTER_DONE_STILL_IN_FINAL");
+  }
+  const ok = failures.length === 0;
+  return { ok, nonvacuous: ok, vacuous: !ok, failures };
 }
 
 function harness(options: {
@@ -505,6 +598,8 @@ async function runPiRuntimeScenario(options: {
     ],
   });
   let handoffResult: unknown = null;
+  const executeCalls: Array<{ name: string; args: unknown }> = [];
+  const toolResults: Array<{ name: string; result: unknown }> = [];
   try {
     const f = harness({
       runId: options.runId,
@@ -528,15 +623,23 @@ async function runPiRuntimeScenario(options: {
           const inner = request.executeTool;
           request.executeTool = inner
             ? async (name, args, executionId) => {
+                executeCalls.push({ name, args });
                 const result = await inner(name, args, executionId);
+                toolResults.push({ name, result });
                 if (options.invokeHandoff && name === "scratchpad_add") {
                   const handle = extractProtectedHandle(dump(result));
                   if (handle) {
-                    handoffResult = await inner(
+                    const handed = await inner(
                       "protected_result_handoff",
                       { op_id: handle },
                       "call-handoff",
                     );
+                    executeCalls.push({
+                      name: "protected_result_handoff",
+                      args: { op_id: handle },
+                    });
+                    toolResults.push({ name: "protected_result_handoff", result: handed });
+                    handoffResult = handed;
                   }
                 }
                 return result;
@@ -555,15 +658,39 @@ async function runPiRuntimeScenario(options: {
       },
     });
     await f.runTurn(options.runId);
+    const httpByteCounts = stub.rawBodies.map((body) => body.byteLength);
     const http = stub.rawBodies.map((body) => body.toString("utf8")).join("\n");
     const persist = dump(f.effects.map((effect) => effect.result));
     const final = dump(f.finalized);
     const handoff = dump(handoffResult);
+    const executeArgs = dump(executeCalls.map((row) => row.args));
+    const toolResultAfter = dump(toolResults.map((row) => row.result));
+    const firstFinal = f.finalized[0] as
+      | { outcome?: string; error?: string; blocks?: unknown }
+      | undefined;
+    const stubEmittedFinal = stub.servedFinalTexts[0] ?? "";
     return {
       http,
       persist,
       final,
       handoff,
+      httpBytes: httpByteCounts.reduce((sum, n) => sum + n, 0),
+      httpRequestCount: stub.rawBodies.length,
+      httpByteCounts,
+      stubRepliesServed: stub.repliesServed(),
+      stubEmittedFinal,
+      stubEmittedDone: /\bDone\b/.test(stubEmittedFinal),
+      runOutcome: firstFinal?.outcome ?? null,
+      runError: firstFinal?.error ?? null,
+      persistEffectCount: f.effects.length,
+      finalCount: f.finalized.length,
+      executeToolNames: executeCalls.map((row) => row.name),
+      executeArgsHasCurrent: executeArgs.includes(CURRENT_SECRET_SENTINEL),
+      executeArgsHasStale: executeArgs.includes(STALE_SECRET_SENTINEL),
+      toolResultAfterHasCurrent: toolResultAfter.includes(CURRENT_SECRET_SENTINEL),
+      toolResultAfterHasStale: toolResultAfter.includes(STALE_SECRET_SENTINEL),
+      syntheticContextWindow: SYNTHETIC_CAPTURE_CONTEXT_WINDOW,
+      syntheticMaxTokens: SYNTHETIC_CAPTURE_MAX_TOKENS,
       httpHasCurrent: http.includes(CURRENT_SECRET_SENTINEL),
       httpHasStale: http.includes(STALE_SECRET_SENTINEL),
       persistHasCurrent: persist.includes(CURRENT_SECRET_SENTINEL),
@@ -678,11 +805,17 @@ export async function runCandidateCapture(options: { service: string; outDir: st
   };
   const runNamed = async (name: string, work: () => Promise<unknown>, extra: Record<string, unknown> = {}) => {
     try {
-      const value = await work();
-      persist(name, { ok: true, ...extra, ...(value as object) });
+      const value = (await work()) as Record<string, unknown>;
+      const verdict = evaluateNonVacuous(name, { ...extra, ...value });
+      persist(name, { ...extra, ...value, ...verdict });
+      if (!verdict.ok) failed = true;
     } catch (error) {
       failed = true;
-      persist(name, { ...extra, ...errorRecord(error) });
+      persist(name, {
+        ...extra,
+        ...errorRecord(error),
+        ...evaluateNonVacuous(name, { ...extra, ...errorRecord(error) }),
+      });
     }
   };
   try {
@@ -748,11 +881,16 @@ export async function runCandidateCapture(options: { service: string; outDir: st
     const phases = {
       kind: CANDIDATE_CAPTURE_KIND,
       notBaselineAssembler: true,
+      okMeansNonVacuous: true,
+      noThrowIsNotProof: true,
       service: options.service,
       packSha256: process.env.CANDIDATE_PACK_SHA256 ?? "",
       gitHead: process.env.CANDIDATE_GIT_HEAD ?? "",
       ctxmem: process.env.RAKAZO_CTXMEM ?? "",
       ctxmemFacts: process.env.RAKAZO_CTXMEM_FACTS ?? "",
+      syntheticContextWindow: SYNTHETIC_CAPTURE_CONTEXT_WINDOW,
+      syntheticMaxTokens: SYNTHETIC_CAPTURE_MAX_TOKENS,
+      syntheticWindowNote: SYNTHETIC_CAPTURE_WINDOW_NOTE,
       failed,
       imageId:
         process.env[`RAKAZO_${options.service.toUpperCase()}_IMAGE_ID` as keyof NodeJS.ProcessEnv] ??

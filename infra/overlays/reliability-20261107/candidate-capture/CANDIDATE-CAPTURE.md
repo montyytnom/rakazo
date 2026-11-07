@@ -1,6 +1,8 @@
 # Exact candidate-capture commands
 
-Sat Nov 7, 2026. Not production. Parent runs these on the connected Mac after unpacking the pack. This VM does not execute them against live. No pull, no build, no model network. Request only one rerun after the cloud harness smoke proof below.
+Sat Nov 7, 2026. Not production. This VM does not execute against live. No pull, no build, no model network.
+
+Do **not** rerun host capture from `ok` / rc=0 flags. The 729d execute was vacuous (zero HTTP, context-budget failed runs). Cloud smoke plus `check_nonvacuous.py` must pass, including raw HTTP byte counts, before any later isolated image run.
 
 Pinned local images (unchanged):
 

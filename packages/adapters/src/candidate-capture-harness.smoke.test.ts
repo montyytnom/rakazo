@@ -73,8 +73,20 @@ describe("candidate-capture-harness composed-tree smoke", { timeout: 180_000 }, 
           );
         }
       }
+      const metrics = JSON.parse(
+        readFileSync(path.join(out, "nonvacuous-metrics.json"), "utf8"),
+      ) as { ok: boolean; failed: number; rows: Array<{ scenario: string; httpBytes?: number; nonvacuous: boolean }> };
+      expect(metrics.ok).toBe(true);
+      expect(metrics.failed).toBe(0);
+      const executor = metrics.rows.filter((row) =>
+        ["generated-secret", "stale-secret", "protected-handoff-repaired-path", "false-success-done"].includes(
+          row.scenario,
+        ),
+      );
+      expect(executor.length).toBe(16);
+      expect(executor.every((row) => (row.httpBytes ?? 0) > 0 && row.nonvacuous)).toBe(true);
       expect(result.stdout).toContain("LIMIT: not Docker image");
-      expect(result.stdout).toContain("candidate-harness-smoke OK");
+      expect(result.stdout).toContain("nonvacuous checker passed");
     } finally {
       rmSync(out, { recursive: true, force: true });
     }

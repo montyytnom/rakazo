@@ -6,4 +6,6 @@ Not the run13 assembler/compactHistory baseline. Not production. Images stay `47
 
 Harness file: `packages/adapters/src/candidate-capture-harness.ts` (packed beside this launcher). Synthetic scenarios only: generated secret, stale secret, protected handoff (repaired path), unsupported Done, compaction current/stale secret strip. Empty fail-before handoff is a preimage invariant, not leak proof. Production-forwarded `RAKAZO_CTXMEM=1` stays on; the fake DB supplies `memoryDocument.findFirst`, `botMcpServer.findMany`, and `botSecret.findMany`. Each scenario writes `/out/scenario-*.json` before the next. `--execute` still starts api if worker fails. Overlay-orchestration named tests do not exercise this harness.
 
+`ok` is not no-throw. `check_nonvacuous.py` fail-closes on zero HTTP, failed run, missing tool/handoff, persist/final not reached, or a stub that never emitted Done. Synthetic capture window is 131072 / maxTokens 32768 (4×32768, previously accepted for isolated-capture). Not a live encrypted limit. Do not treat rc=0 alone as a host rerun gate.
+
 Exact commands: `CANDIDATE-CAPTURE.md`.
