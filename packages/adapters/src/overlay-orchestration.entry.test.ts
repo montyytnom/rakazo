@@ -1252,10 +1252,22 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
     expect(visible.http).toMatch(/Protected result|\[withheld\]|\[redacted\]/);
   });
 
-  it("pass-after: PiRuntime in-run protected_result_handoff withholds current and stale sentinels", async () => {
+  it("preimage invariant: PiRuntime fail-before has no protected handle so handoff is empty (not a leak proof)", async () => {
+    if (missing.length) return;
+    const visible = await captureSecretBoundary(beforeExecutor, "run-pi-handoff-before");
+    expect(visible.handoffKind).toBe("preimage-invariant-no-handle");
+    expect(visible.failBeforeCausalProof, visible.handoff).toBe(false);
+    expect(visible.handoffHasHandle, visible.handoff).toBe(false);
+    expect(visible.handoff).not.toContain(CURRENT_SECRET_SENTINEL);
+    expect(visible.handoff).not.toContain(STALE_SECRET_SENTINEL);
+  });
+
+  it("repaired path: PiRuntime pass-after protected_result_handoff withholds current and stale sentinels", async () => {
     if (missing.length) return;
     const visible = await captureSecretBoundary(afterExecutor, "run-pi-handoff-after");
+    expect(visible.handoffKind).toBe("repaired-path");
     expect(visible.handoff.length, visible.handoff).toBeGreaterThan(2);
+    expect(visible.handoffHasHandle, visible.handoff).toBe(true);
     expect(visible.handoff).not.toContain(CURRENT_SECRET_SENTINEL);
     expect(visible.handoff).not.toContain(STALE_SECRET_SENTINEL);
     expect(visible.handoff).toMatch(/delivered|op-|secure card|unknown op_id/i);
@@ -1280,6 +1292,27 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
     expect(summary).not.toMatch(/\bAll set\b/);
     expect(summary).not.toMatch(/Successfully changed/);
     expect(summary).not.toMatch(/\bIt is reset\b/);
+  });
+
+  it("fail-before: composed history-compaction keeps current and stale generated-password sentinels", async () => {
+    if (missing.length) return;
+    const summary = await composedCompactSummary(
+      beforeCompaction,
+      `All set. New password: ${CURRENT_SECRET_SENTINEL}. Old password: ${STALE_SECRET_SENTINEL}`,
+    );
+    expect(summary).toContain(CURRENT_SECRET_SENTINEL);
+    expect(summary).toContain(STALE_SECRET_SENTINEL);
+  });
+
+  it("pass-after: composed history-compaction strips current and stale generated-password sentinels", async () => {
+    if (missing.length) return;
+    const summary = await composedCompactSummary(
+      afterCompaction,
+      `All set. New password: ${CURRENT_SECRET_SENTINEL}. Old password: ${STALE_SECRET_SENTINEL}`,
+    );
+    expect(summary).not.toContain(CURRENT_SECRET_SENTINEL);
+    expect(summary).not.toContain(STALE_SECRET_SENTINEL);
+    expect(summary).toMatch(/withheld|not verified/i);
   });
 
   it("claim detection is English regex; allowing success is ledger-only, not a semantic parser", async () => {
@@ -1503,7 +1536,10 @@ async function captureSecretBoundary(executorFile: string, runId: string) {
     const persist = dump(f.effects.map((effect) => effect.result));
     const final = dump(f.finalized);
     const handoff = dump(handoffResult ?? null);
-    const debug = dump({ events: piEvents, error: piError, executeCalls, hasExecute, handoff });
+    const preimage = executorFile.includes("/before/");
+    const handoffHasHandle = Boolean(extractProtectedHandle(handoff));
+    const handoffKind = preimage ? "preimage-invariant-no-handle" : "repaired-path";
+    const debug = dump({ events: piEvents, error: piError, executeCalls, hasExecute, handoff, handoffKind });
     const logPath = process.env.CANDIDATE_PIRUNTIME_LOG;
     if (logPath) {
       const { appendFileSync } = await import("node:fs");
@@ -1527,8 +1563,14 @@ async function captureSecretBoundary(executorFile: string, runId: string) {
           currentSentinelInFinal: final.includes(CURRENT_SECRET_SENTINEL),
           currentSentinelInHandoff: handoff.includes(CURRENT_SECRET_SENTINEL),
           staleSentinelInHandoff: handoff.includes(STALE_SECRET_SENTINEL),
+          handoffKind,
+          handoffHasHandle,
+          failBeforeCausalProof: false,
           measured: ["http", "persist", "final", "handoff"],
           notMeasuredInHttp: ["handoff", "compaction"],
+          handoffNote: preimage
+            ? "Empty fail-before handoff is an invariant (no protected handle). It is not leak proof."
+            : "AFTER protected_result_handoff is the repaired path.",
           httpPreview: stub.parsedBodies.map((body) => ({
             roles: Array.isArray(body?.messages)
               ? (body.messages as Array<{ role?: string }>).map((message) => message.role)
@@ -1550,6 +1592,9 @@ async function captureSecretBoundary(executorFile: string, runId: string) {
       persist,
       final,
       handoff,
+      handoffKind,
+      handoffHasHandle,
+      failBeforeCausalProof: false as const,
       results: dump(f.results),
       debug,
     };
@@ -1571,7 +1616,15 @@ async function composedCompactSummary(file: string, summaryText: string): Promis
   const messages = Array.from({ length: 50 }, (_, i) => ({
     seq: i,
     role: i % 2 === 0 ? "user" : "bot",
-    blocks: [{ kind: "text", text: `message ${i}` }],
+    blocks: [
+      {
+        kind: "text",
+        text:
+          i === 1 && /password/i.test(summaryText)
+            ? `New password: ${CURRENT_SECRET_SENTINEL}. Old password: ${STALE_SECRET_SENTINEL}`
+            : `message ${i}`,
+      },
+    ],
   }));
   const thread = {
     id: "thread-1",

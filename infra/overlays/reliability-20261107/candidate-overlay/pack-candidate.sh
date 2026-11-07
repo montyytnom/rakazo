@@ -235,6 +235,16 @@ cp -a "$HERE/prove-isolated-core.sh" "$STAGE/prove-isolated-core.sh"
 chmod +x "$STAGE/apply-to-scratch.sh" "$STAGE/rollback-to-preimage.sh" "$STAGE/prove-isolated-core.sh"
 cp -a "$HERE/OPERATIONAL-ROLLBACK.md" "$STAGE/OPERATIONAL-ROLLBACK.md"
 cp -a "$HERE/RELEASE-MOUNT-PLAN.md" "$STAGE/RELEASE-MOUNT-PLAN.md"
+
+CAPTURE="$ROOT/infra/overlays/reliability-20261107/candidate-capture"
+mkdir -p "$STAGE/candidate-capture"
+cp -a "$CAPTURE/host-launch.sh" "$CAPTURE/candidate_launch.py" "$CAPTURE/run.sh" \
+  "$CAPTURE/allowlisted-env.txt" "$CAPTURE/README.md" "$CAPTURE/CANDIDATE-CAPTURE.md" \
+  "$CAPTURE/candidate_launch_test.py" "$STAGE/candidate-capture/"
+cp -a "$ROOT/packages/adapters/src/candidate-capture-harness.ts" \
+  "$STAGE/candidate-capture/candidate-capture-harness.ts"
+chmod +x "$STAGE/candidate-capture/host-launch.sh" "$STAGE/candidate-capture/run.sh"
+git -C "$ROOT" rev-parse HEAD > "$STAGE/HEAD.txt"
 cp -a "$ROOT/infra/overlays/reliability-20261107/ROLLBACK.sh" "$STAGE/ROLLBACK.sh"
 chmod +x "$STAGE/ROLLBACK.sh"
 cp -a "$ROOT/infra/overlays/reliability-20261107/HOOKS.md" "$STAGE/HOOKS.md"
@@ -278,7 +288,9 @@ for log in \
   candidate-piruntime-sse-tests.log \
   candidate-piruntime-sse-verbose.log \
   candidate-isolated-core.log \
-  candidate-apply-rollback-selftest.log
+  candidate-apply-rollback-selftest.log \
+  candidate-capture-launcher-tests.log \
+  candidate-capture-dry-run.log
 do
   if [[ -f "/opt/cursor/artifacts/$log" ]]; then
     cp -a "/opt/cursor/artifacts/$log" "$STAGE/logs/$log"
@@ -302,7 +314,8 @@ Releasable files are the composed worker/api AFTER trees in files/
 Claim detection is English regex only; not a multilingual or semantic parser. Allowing success is CompletionLedger-only.
 Live hash-only 6:36 AM EST closed c7e5 preimages (22 match, 18 absent, images 47d34235/c500071f). Isolated capture uses COMPOSE-OVERRIDE.tsv: 15 replace-existing-bind, 22 add-bind, 3 skip-unchanged-image. Not production.
 HEAD vitest adapters/core suites label HEAD workspace, not composed trees.
-PiRuntime stub JSON measures HTTP/persist/final; named tests cover in-run handoff and composed compaction separately.
+PiRuntime stub JSON measures HTTP/persist/final; named tests cover in-run handoff (repaired path vs preimage invariant) and composed compaction including secret strip.
+candidate-capture/ is the composed executor→PiRuntime→stub SSE launcher; run13 assembler harness is not used.
 HISTORICAL_PLAINTEXT_CLEANUP_LOCKED=true
 isolated-capture baseline fixtures unchanged
 no production calls, no model calls, no heldout inspection
@@ -323,7 +336,7 @@ logs = sorted(p.name for p in (stage / "logs").glob("*") if p.is_file())
 index = [
     "# Pack index",
     "",
-    "Sat Nov 7, 2026, 6:36 AM EST. Scratch-only. Not production.",
+    "Sat Nov 7, 2026, 6:48 AM EST. Scratch-only. Not production.",
     "",
     "## Recipe",
     "",
@@ -334,6 +347,8 @@ index = [
     "- `apply-to-scratch.sh` — refuses production roots; `--seed-preimage` or exact before hashes",
     "- `prove-isolated-core.sh` — packed source `completion-artifact` → `irreversible-effect`",
     "- `RUNTIME-LOADING.txt` — tsx + `@rakazo/core` default `./src/index.ts`",
+    "- `candidate-capture/` — composed executor→PiRuntime→stub SSE launcher; dry-run lists 37 binds",
+    "- `CANDIDATE-CAPTURE.md` — authored dry-run / execute / cleanup commands",
     "",
     "## Labels",
     "",
