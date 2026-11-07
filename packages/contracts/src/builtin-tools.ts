@@ -33,6 +33,7 @@ export const BUILTIN_TOOL_NAMES = [
   "ask_user",
   "message_user",
   "request_secret",
+  "protected_result_handoff",
   "list_secrets",
   "secret_request",
   "forget_secret",

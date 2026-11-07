@@ -63,6 +63,9 @@ import {
   botMessageAllowsSilence,
   CALL_CLIENT_NONCE_PREFIX,
   callIdFromClientNonce,
+  classifyBrowserMutation,
+  classifyIrreversibleTool,
+  collectToolEvidence,
   connectorKindFromToolName,
   containsSecret,
   createStreamingRedactor,
@@ -72,12 +75,14 @@ import {
   formatSkillsCatalogInstruction,
   humanizeToolName,
   inferAttachmentMimeType,
+  irreversibleEffectRequest,
   isBackgroundRunTrigger,
   isCallClientNonce,
   isMessagingChannelRun,
   isOneShotRoutineCrons,
   isOwnerStartedRun,
   isTerminal,
+  isThreadIrreversibleEffectKey,
   messagingChannelId,
   messagingChannelPrivacyBlock,
   messagingDmSurfaceNote,
@@ -85,11 +90,18 @@ import {
   nextFence,
   planActionGate,
   promptInvokesSkill,
+  redactProtectedTree,
   redactSecrets,
   renderBotDirectory,
   resolveActionApprovalDetail,
+  resolveTurnIntentId,
+  sameThreadIrreversibleOwner,
   sandboxCommandTimeoutMs,
+  sanitizeFinalText,
+  secretsFromPriorAssistantText,
+  stripSecretEchoes,
   TAKEOVER_COMPUTER_PENDING_STATE,
+  threadIrreversibleEffectKey,
   toolRequiresApproval,
   toolRequiresExplicitApproval,
   truncatedPlainText,
@@ -251,6 +263,7 @@ import { connectedContext, selectRunConnections } from "./connection-context.js"
 import { redactConnectorPayload, sanitizeConnectorError } from "./connector-safety.js";
 import { formatCurrentTimeInstruction } from "./current-time.js";
 import { resolveDeploymentModel } from "./deployment-model.js";
+import { DESKTOP_LAUNCH_UNSUPPORTED, sandboxLaunchUnsupported } from "./desktop-tool-contract.js";
 import type { FleetPrepareDeps, FleetRun } from "./fleet-tools.js";
 import {
   createChildRoutine,
@@ -335,6 +348,11 @@ import {
   searchChartCatalog,
 } from "./plot-tool.js";
 import { actorMayUsePrivateEndpoint } from "./private-endpoint.js";
+import {
+  createProtectedResultStore,
+  handoffProtectedResult,
+  redactToolResultForModel,
+} from "./protected-result.js";
 import type { RemoteTransportDependencies } from "./remote-mcp.js";
 import { assertSafeRemoteUrl } from "./remote-mcp.js";
 import { loadReplyContext, messageToAgentHistoryText } from "./reply-context.js";
@@ -385,6 +403,7 @@ import {
   skillReadFromTool,
   skillUpdateFromTool,
 } from "./skill-tools.js";
+import { browserActLabels, createRefMemory } from "./stale-element-recovery.js";
 import type { TakeoverResumeCheckpoint } from "./takeover-resume.js";
 import {
   continueRunClaimFence,
@@ -4412,6 +4431,16 @@ export function createRunExecutor(deps: ExecutorDeps) {
 
         const mutatingEffectOccurrences = new Map<string, number>();
         const consumedEffectIds = new Set<string>();
+        const pageRefMemory = createRefMemory();
+        const protectedResults = createProtectedResultStore();
+        const turnToolResults: unknown[] = [];
+        const intentId = resolveTurnIntentId(
+          task.prompt,
+          history
+            .filter((message) => message.role === "user")
+            .map((message) => message.content)
+            .filter(Boolean),
+        );
         const nextMutatingEffectOccurrence = (toolName: string, args: Record<string, unknown>) => {
           const fingerprint = toolEffectIdempotencyKey(runId, toolName, args);
           const occurrence = mutatingEffectOccurrences.get(fingerprint) ?? 0;
@@ -4796,8 +4825,24 @@ export function createRunExecutor(deps: ExecutorDeps) {
             name === "request_secret"
               ? 0
               : nextMutatingEffectOccurrence(replayEffectToolName, args);
-          const effectKey =
-            usesApprovalKey && occurrence === 0
+          let irreversible = classifyIrreversibleTool(replayEffectToolName, args);
+          if (!irreversible && replayEffectToolName === "browser_act") {
+            irreversible = classifyBrowserMutation(
+              browserActLabels(args, pageRefMemory),
+              pageRefMemory.lastUrl ?? "",
+            );
+          }
+          if (irreversible) {
+            effectRequest = irreversibleEffectRequest(irreversible, run.threadId, intentId, args);
+          }
+          const effectKey = irreversible
+            ? threadIrreversibleEffectKey({
+                threadId: run.threadId,
+                intentId,
+                class: irreversible.class,
+                subject: irreversible.subject,
+              })
+            : usesApprovalKey && occurrence === 0
               ? approvalEffectKey(runId, replayEffectToolName, args)
               : toolEffectIdempotencyKey(runId, replayEffectToolName, args, occurrence);
           // Connector read-only hints must not bypass approval, review, or replay decisions.
@@ -5183,11 +5228,13 @@ export function createRunExecutor(deps: ExecutorDeps) {
                   deps,
                   applied.effect.id,
                   claimedEffect ? "executing" : "intended",
-                  result,
+                  redactProtectedTree(result, runSecrets),
                 )
               : Promise.resolve(true);
-          const finish = async (result: unknown) =>
-            (await persistEffectResult(result)) ? result : uncertainEffectResult(name, args);
+          const finish = async (result: unknown) => {
+            turnToolResults.push(result);
+            return (await persistEffectResult(result)) ? result : uncertainEffectResult(name, args);
+          };
           const registerRunSecrets = (values: string[]) => {
             const additions = values.filter((value) => !runSecrets.includes(value));
             if (additions.length === 0) return;
@@ -5713,6 +5760,9 @@ export function createRunExecutor(deps: ExecutorDeps) {
                 await recordComputerAction("launch_app", application, {
                   error: error instanceof Error ? error.message : "could not launch app",
                 });
+                if (sandboxLaunchUnsupported(error)) {
+                  return { error: DESKTOP_LAUNCH_UNSUPPORTED };
+                }
                 throw error;
               }
             }, finish);
@@ -5802,12 +5852,15 @@ export function createRunExecutor(deps: ExecutorDeps) {
                   ? browserSnapshotFromTool
                   : null;
             return computerScreenToolResult(async () => {
-              const result = tool
+              const raw = tool
                 ? redactConnectorPayload(
-                    await tool(browser, await runComputer.get(), context, args),
+                    await tool(browser, await runComputer.get(), context, args, {
+                      refMemory: pageRefMemory,
+                    }),
                     redactions(),
                   )
                 : await browserActFromTool(browser, await runComputer.get(), context, args, {
+                    refMemory: pageRefMemory,
                     redactions,
                     // Team bots may send only their own folder or shared/ off the computer; a
                     // private computer's helper already confines uploads to its home folder.
@@ -5832,6 +5885,11 @@ export function createRunExecutor(deps: ExecutorDeps) {
                       return { text: resolved.text, origin: resolved.origin };
                     },
                   });
+              const protectedPage = redactToolResultForModel(raw, protectedResults);
+              if (protectedPage.handle) {
+                registerRunSecrets([...protectedResults.values()].map((row) => row.plaintext));
+              }
+              const result = protectedPage.result;
               unchangedVisualStreak = unchangedVisualStreakAfterPageBrowser(
                 unchangedVisualStreak,
                 name,
@@ -6367,6 +6425,9 @@ export function createRunExecutor(deps: ExecutorDeps) {
                 ? "The call is already closed and now carries your title. The user is reading, not listening: finish any remaining work as a normal chat reply with full formatting."
                 : "Call ended and your farewell was spoken. The user is now reading, not listening: finish any remaining work as a normal chat reply with full formatting.",
             });
+          }
+          if (name === "protected_result_handoff") {
+            return finish(handoffProtectedResult(protectedResults, String(args.op_id ?? "")));
           }
           if (name === "list_secrets") return listBotSecrets(deps.prisma, run);
           if (name === "forget_secret") {
@@ -7860,12 +7921,25 @@ export function createRunExecutor(deps: ExecutorDeps) {
               skipEmptyFallback: publishedTerminalSubagent || publishedMidTurnUserMessage,
             });
           }
+          const priorSecrets = secretsFromPriorAssistantText(
+            history
+              .filter((message) => message.role === "assistant")
+              .map((message) => message.content),
+          );
+          const evidence = collectToolEvidence(turnToolResults);
           const blocks = handedOff
             ? []
             : finalBlocksAfterMidTurnProgress(
                 redactBlocks(completionBlocks, runSecrets),
                 publishedMidTurnUserMessage || runAllowsSilentEmpty(run.trigger),
-              );
+              ).map((block) => {
+                if (block.kind !== "text") return block;
+                const sanitized = sanitizeFinalText(block.text, evidence);
+                return {
+                  ...block,
+                  text: stripSecretEchoes(sanitized, [...runSecrets, ...priorSecrets]).text,
+                };
+              });
           const text = handedOff
             ? ""
             : redactSecrets(completionNotificationBody(silentReply.assembled, blocks), runSecrets);
@@ -9210,6 +9284,26 @@ export async function recordEffect(
     where: { idempotencyKey },
   });
   if (existing && (existing.runId !== run.id || existing.spaceId !== run.spaceId)) {
+    if (
+      isThreadIrreversibleEffectKey(idempotencyKey) &&
+      sameThreadIrreversibleOwner({
+        existingSpaceId: existing.spaceId,
+        existingRequest: existing.request,
+        spaceId: run.spaceId,
+        threadId: run.threadId,
+      })
+    ) {
+      consumedIds?.add(existing.id);
+      await deps.events.append({
+        spaceId: run.spaceId,
+        threadId: run.threadId,
+        botId: run.botId,
+        type: "effect.reconciled",
+        runId: run.id,
+        payload: { executionId: idempotencyKey, kind, threadIntent: true },
+      });
+      return { duplicate: true, effect: existing };
+    }
     throw new Error("Stored tool execution does not belong to this run.");
   }
   if (existing) {

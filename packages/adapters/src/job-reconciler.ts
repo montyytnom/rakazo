@@ -300,7 +300,7 @@ export function createJobReconciler(
             // Loop-guard stops complete without an error; their persisted final text
             // is the only marker available when the executor's outcome delivery fails.
             const loopGuardStop = isLoopGuardStopText(transcript.text);
-            // Same stable delivery key as the executor path (auto-outcome:<runId>), so a
+            // Same stable delivery key as the executor path (source message, then run id), so a
             // concurrent or earlier return is replayed instead of double-posted. Progress-only
             // transcripts (all mid-turn user-progress messages) return as status.
             const intent =

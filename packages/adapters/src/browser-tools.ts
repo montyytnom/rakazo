@@ -8,6 +8,12 @@ import type {
 import { MAX_BROWSER_UPLOAD_FILES } from "@rakazo/adapter-kit";
 import type { LoginField } from "./bot-secrets.js";
 import { redactConnectorPayload } from "./connector-safety.js";
+import {
+  createRefMemory,
+  type RefMemory,
+  recoverStaleBrowserAct,
+  rememberSnapshot,
+} from "./stale-element-recovery.js";
 
 const MAX_BROWSER_ACTIONS = 24;
 
@@ -28,6 +34,7 @@ export async function browserNavigateFromTool(
   computer: ComputerRef,
   context: AdapterContext,
   args: Record<string, unknown>,
+  options: { refMemory?: RefMemory } = {},
 ) {
   const url = String(args.url ?? "").trim();
   try {
@@ -39,6 +46,7 @@ export async function browserNavigateFromTool(
       };
     }
     const result = await browser.navigate(computer, { url, signal: context.signal }, context);
+    if (options.refMemory) options.refMemory.lastUrl = result.url;
     return formatBrowserResult(result);
   } catch (error) {
     context.signal.throwIfAborted();
@@ -54,10 +62,12 @@ export async function browserSnapshotFromTool(
   computer: ComputerRef,
   context: AdapterContext,
   args: Record<string, unknown>,
+  options: { refMemory?: RefMemory } = {},
 ) {
   void args;
   try {
     const result = await browser.snapshot(computer, { signal: context.signal }, context);
+    rememberSnapshot(options.refMemory ?? createRefMemory(), result.elements, result.url);
     return formatBrowserResult(result);
   } catch (error) {
     context.signal.throwIfAborted();
@@ -80,6 +90,7 @@ export async function browserActFromTool(
     resolveUploadPath?: (path: string) => string;
     /** Trusted upload roots relative to the computer home, set by the executor. */
     uploadRoots?: string[];
+    refMemory?: RefMemory;
   } = {},
 ) {
   try {
@@ -105,7 +116,14 @@ export async function browserActFromTool(
       if ("error" in resolved) return { ok: false, completed: 0, error: resolved.error };
       actions.push({ kind: "fill", ref: step.ref, text: resolved.text, origin: resolved.origin });
     }
-    const result = await browser.act(computer, { actions, signal: context.signal }, context);
+    const memory = options.refMemory ?? createRefMemory();
+    const result = await recoverStaleBrowserAct({
+      browser,
+      computer,
+      context,
+      actions,
+      memory,
+    });
     return redactConnectorPayload(formatBrowserResult(result), options.redactions?.() ?? []);
   } catch (error) {
     context.signal.throwIfAborted();

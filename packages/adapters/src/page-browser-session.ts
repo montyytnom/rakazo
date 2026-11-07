@@ -75,6 +75,10 @@ export class PageBrowserSession {
     };
   }
 
+  invalidateRefs(): void {
+    this.refs.clear();
+  }
+
   act(actions: BrowserActStep[]): BrowserActResult {
     let completed = 0;
     for (const action of actions) {

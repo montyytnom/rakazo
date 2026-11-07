@@ -487,6 +487,16 @@ export const builtinAgentTools: ConnectorTool[] = [
     },
   },
   {
+    name: "protected_result_handoff",
+    description:
+      "Deliver a protected result to the user through a secure card. Pass op_id from the protected-result reference. The value is never returned.",
+    inputSchema: {
+      type: "object",
+      properties: { op_id: { type: "string" } },
+      required: ["op_id"],
+    },
+  },
+  {
     name: "list_secrets",
     description:
       "List saved credential names and destinations available to this bot and user, and the environment variable of each command variable. Values are never returned.",

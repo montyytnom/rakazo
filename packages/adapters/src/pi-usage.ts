@@ -18,6 +18,7 @@ import type {
 import { Agent } from "undici";
 import type { ContextBudget } from "./context-selection.js";
 import { estimateModelContextTokens } from "./model-context.js";
+import { extractOpenAiSseError } from "./model-stream-error.js";
 import { requestedPiCacheWriteRetention, resolvePiCacheRetention } from "./pi-cache-retention.js";
 import { recordPiTelemetryContent, withPiTelemetrySpan } from "./pi-telemetry.js";
 import { fetchPairedWithDispatcher } from "./undici-fetch.js";
@@ -109,6 +110,8 @@ export function usageReportingFetch(
         .map((line) => line.slice(5).trimStart())
         .join("\n");
       if (!data || data === "[DONE]") return;
+      const streamError = extractOpenAiSseError(`${frame}\n\n`);
+      if (streamError) throw new Error(streamError.message);
       try {
         const event = JSON.parse(data);
         const usage = event.usage ?? event.response?.usage ?? event.message?.usage;
@@ -169,7 +172,14 @@ export function usageReportingFetch(
           let boundary = buffer.indexOf("\n\n");
           while (boundary >= 0) {
             const frame = buffer.slice(0, boundary);
-            if (!dropping && frame.length <= 262144) observe(frame);
+            if (!dropping && frame.length <= 262144) {
+              try {
+                observe(frame);
+              } catch (error) {
+                controller.error(error);
+                return;
+              }
+            }
             dropping = false;
             buffer = buffer.slice(boundary + 2);
             boundary = buffer.indexOf("\n\n");

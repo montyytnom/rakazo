@@ -1,0 +1,9 @@
+services:
+  worker:
+    environment:
+      RAKAZO_RELIABILITY_LEDGER: "1"
+      RAKAZO_PROTECTED_RESULTS: "1"
+  api:
+    environment:
+      RAKAZO_RELIABILITY_LEDGER: "1"
+      RAKAZO_PROTECTED_RESULTS: "1"
