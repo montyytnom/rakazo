@@ -189,12 +189,15 @@ function harness(
       seq: number;
       blocks: Array<{ kind: string; text: string }>;
     }>;
+    startedAt?: Date;
   },
 ) {
   const effects: Effect[] = options.effects ?? [];
   let executeCount = 0;
   const results: unknown[] = [];
   const finalized: Array<{ blocks?: unknown; outcome?: string }> = [];
+  const publishedMessages: unknown[] = [];
+  const progressEvents: unknown[] = [];
   const run = {
     id: options.runId,
     botId: "bot-1",
@@ -206,6 +209,7 @@ function harness(
     trigger: "user",
     sourceMessageId: options.sourceMessageId,
     leaseFence: 0,
+    startedAt: options.startedAt,
   };
   let calls: Array<{ name: string; args: Record<string, unknown>; executionId: string }> = [];
   const externalEffect = {
@@ -323,7 +327,10 @@ function harness(
         blocks: [{ kind: "text", text: options.prompt }],
       })),
       findFirst: vi.fn(async () => null),
-      create: vi.fn(async ({ data }: { data: unknown }) => ({ id: "message-1", ...(data as object) })),
+      create: vi.fn(async ({ data }: { data: unknown }) => {
+        publishedMessages.push(data);
+        return { id: "message-1", ...(data as object) };
+      }),
     },
     event: { create: vi.fn(async () => ({ seq: 1 })) },
     artifact: { findFirst: vi.fn(async () => null) },
@@ -468,7 +475,9 @@ function harness(
     artifacts: { put: vi.fn(), get: vi.fn() },
     home: { commit: vi.fn(async () => "rev") },
     events: {
-      append: vi.fn(async () => undefined),
+      append: vi.fn(async (event: { type?: string }) => {
+        if (event?.type === "thread.progress") progressEvents.push(event);
+      }),
       notify: vi.fn(async () => undefined),
       claimSteering: vi.fn(async () => []),
       pauseRunForInput: vi.fn(async () => true),
@@ -486,6 +495,8 @@ function harness(
     effects,
     results,
     finalized,
+    publishedMessages,
+    progressEvents,
     run,
     executeCount: () => executeCount,
     setCalls(next: typeof calls) {
@@ -517,7 +528,11 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   beforeAll(() => {
-    if (missing.length) return;
+    if (missing.length) {
+      throw new Error(
+        `overlay compose blocked; missing files/dependencies:\n${missing.join("\n")}`,
+      );
+    }
     compose(false);
     compose(true);
     const apiScript = path.join(repo, "scripts/compose-overlay-trees.py");
@@ -542,7 +557,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   }, 180_000);
 
   it("fail-before: unpatched overlay send is run-scoped, not irr:v1", async () => {
-    if (missing.length) return;
     const createRunExecutor = await loadExecutor(beforeExecutor);
     const f = harness(createRunExecutor, {
       runId: "run-send-before",
@@ -566,7 +580,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("pass-after: patched overlay send uses irr:v1 and Continue reuses it", async () => {
-    if (missing.length) return;
     const createRunExecutor = await loadExecutor(afterExecutor);
     const first = harness(createRunExecutor, {
       runId: "run-send-after-1",
@@ -610,7 +623,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("fail-before: unpatched persist keeps a generated password in the tool result", async () => {
-    if (missing.length) return;
     const createRunExecutor = await loadExecutor(beforeExecutor);
     const f = harness(createRunExecutor, {
       runId: "run-secret-before",
@@ -631,7 +643,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("pass-after: patched persist redacts the generated password on the same scratchpad path", async () => {
-    if (missing.length) return;
     const createRunExecutor = await loadExecutor(afterExecutor);
     const f = harness(createRunExecutor, {
       runId: "run-secret-after",
@@ -653,7 +664,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("fail-before: unpatched launch_app throws unsupported instead of recovering", async () => {
-    if (missing.length) return;
     const createRunExecutor = await loadExecutor(beforeExecutor);
     const f = harness(createRunExecutor, {
       runId: "run-launch-before",
@@ -671,7 +681,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("pass-after: patched launch_app returns the desktop catalog hint and does not retry", async () => {
-    if (missing.length) return;
     const createRunExecutor = await loadExecutor(afterExecutor);
     const f = harness(createRunExecutor, {
       runId: "run-launch-after",
@@ -688,7 +697,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("fail-before: unpatched Flash-Next fetch forwards an HTTP 200 SSE error frame", async () => {
-    if (missing.length) return;
     const previous = process.env.RAKAZO_OPENAI_COMPAT_ALLOW_PUBLIC;
     process.env.RAKAZO_OPENAI_COMPAT_ALLOW_PUBLIC = "1";
     try {
@@ -711,7 +719,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("pass-after: patched Flash-Next fetch fails closed on that SSE error frame", async () => {
-    if (missing.length) return;
     const previous = process.env.RAKAZO_OPENAI_COMPAT_ALLOW_PUBLIC;
     process.env.RAKAZO_OPENAI_COMPAT_ALLOW_PUBLIC = "1";
     try {
@@ -733,7 +740,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("per-service bot-secrets: worker overlay b22b7f69, api remains 926710a", async () => {
-    if (missing.length) return;
     const { createHash } = await import("node:crypto");
     const { readFileSync } = await import("node:fs");
     const worker = createHash("sha256").update(readFileSync(afterBotSecrets)).digest("hex");
@@ -745,7 +751,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("pass-after: lost response / restart reuses irr:v1 and does not send again", async () => {
-    if (missing.length) return;
     const createRunExecutor = await loadExecutor(afterExecutor);
     const effects: Effect[] = [];
     const first = harness(createRunExecutor, {
@@ -781,7 +786,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("pass-after: a new authorized request with the same text is a new irr:v1 and is not suppressed", async () => {
-    if (missing.length) return;
     const createRunExecutor = await loadExecutor(afterExecutor);
     const effects: Effect[] = [];
     const first = harness(createRunExecutor, {
@@ -813,7 +817,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("pass-after: concurrent continueRun hits unique constraint and does not create a second send", async () => {
-    if (missing.length) return;
     const createRunExecutor = await loadExecutor(afterExecutor);
     const effects: Effect[] = [];
     const args = {
@@ -841,7 +844,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("fail-before: unpatched persist has no opaque handle and keeps plaintext", async () => {
-    if (missing.length) return;
     const createRunExecutor = await loadExecutor(beforeExecutor);
     const f = harness(createRunExecutor, {
       runId: "run-vault-before",
@@ -862,7 +864,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("pass-after: fail-closed vault stores handle without plaintext and without inventing a vaultRef", async () => {
-    if (missing.length) return;
     const createRunExecutor = await loadExecutor(afterExecutor);
     const f = harness(createRunExecutor, {
       runId: "run-vault-closed",
@@ -885,7 +886,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("pass-after: encrypted SecretStore vault stores an opaque ref and handoff never returns plaintext", async () => {
-    if (missing.length) return;
     const { EncryptedSecretStore } = await import("./secrets.js");
     const createRunExecutor = await loadExecutor(afterExecutor);
     const secretStore = new EncryptedSecretStore("test-only-protected-result-key");
@@ -935,7 +935,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("fail-before: unpatched api overlay falls back to computer_act on LOGIN_GUARD", async () => {
-    if (missing.length) return;
     const { ComputerBrowserProvider } = await import(
       `${pathToFileURL(beforeApiBrowser).href}?t=${Date.now()}`
     );
@@ -963,7 +962,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("pass-after: patched worker focused never returns a value; LOGIN_GUARD does not fall back to computer_act", async () => {
-    if (missing.length) return;
     const { ComputerBrowserProvider } = await import(
       `${pathToFileURL(afterBrowser).href}?t=${Date.now()}`
     );
@@ -1011,7 +1009,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("pass-after: api overlay LOGIN_GUARD refusal is also final; login-guard focused stays worker-only", async () => {
-    if (missing.length) return;
     const { ComputerBrowserProvider } = await import(
       `${pathToFileURL(afterApiBrowser).href}?t=${Date.now()}`
     );
@@ -1041,7 +1038,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("fail-before: overlay executor persists current generated password in the final reply", async () => {
-    if (missing.length) return;
     const createRunExecutor = await loadExecutor(beforeExecutor);
     const f = harness(createRunExecutor, {
       runId: "run-echo-current-before",
@@ -1063,7 +1059,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("fail-before: overlay executor persists a stale prior password in the final reply", async () => {
-    if (missing.length) return;
     const createRunExecutor = await loadExecutor(beforeExecutor);
     const f = harness(createRunExecutor, {
       runId: "run-echo-stale-before",
@@ -1085,7 +1080,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("fail-before: overlay executor persists Done without an artifact-backed evidence ledger", async () => {
-    if (missing.length) return;
     const createRunExecutor = await loadExecutor(beforeExecutor);
     const f = harness(createRunExecutor, {
       runId: "run-false-done-before",
@@ -1100,7 +1094,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("pass-after: overlay executor never persists current or stale secrets and does not claim Done without evidence", async () => {
-    if (missing.length) return;
     const createRunExecutor = await loadExecutor(afterExecutor);
     const secretStore = opaqueSecretStore();
     const f = harness(createRunExecutor, {
@@ -1141,7 +1134,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("pass-after: overlay executor refuses Done without an artifact-backed evidence ledger", async () => {
-    if (missing.length) return;
     const createRunExecutor = await loadExecutor(afterExecutor);
     const f = harness(createRunExecutor, {
       runId: "run-false-done-after",
@@ -1156,7 +1148,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("fail-before: api overlay executor also persists current generated password in the final reply", async () => {
-    if (missing.length) return;
     const createRunExecutor = await loadExecutor(beforeApiExecutor);
     const f = harness(createRunExecutor, {
       runId: "run-api-echo-before",
@@ -1177,7 +1168,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("pass-after: api overlay executor withholds current and stale secrets and refuses unsupported Done", async () => {
-    if (missing.length) return;
     const createRunExecutor = await loadExecutor(afterApiExecutor);
     const secretStore = opaqueSecretStore();
     const f = harness(createRunExecutor, {
@@ -1216,7 +1206,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("pass-after: api overlay executor refuses Done without an artifact-backed evidence ledger", async () => {
-    if (missing.length) return;
     const createRunExecutor = await loadExecutor(afterApiExecutor);
     const f = harness(createRunExecutor, {
       runId: "run-api-false-done-after",
@@ -1231,7 +1220,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("fail-before: PiRuntime stub HTTP after a generated secret still carries plaintext", async () => {
-    if (missing.length) return;
     const visible = await captureSecretBoundary(beforeExecutor, "run-pi-secret-before");
     expect(visible.captureCount, visible.debug).toBeGreaterThan(1);
     expect(visible.http).toContain(STALE_SECRET_SENTINEL);
@@ -1239,7 +1227,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("pass-after: PiRuntime stub HTTP, persist, and final withhold current and stale sentinels", async () => {
-    if (missing.length) return;
     const visible = await captureSecretBoundary(afterExecutor, "run-pi-secret-after");
     expect(visible.captureCount, visible.debug).toBeGreaterThan(1);
     expect(visible.http, visible.debug).not.toContain(CURRENT_SECRET_SENTINEL);
@@ -1253,7 +1240,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("preimage invariant: PiRuntime fail-before has no protected handle so handoff is empty (not a leak proof)", async () => {
-    if (missing.length) return;
     const visible = await captureSecretBoundary(beforeExecutor, "run-pi-handoff-before");
     expect(visible.handoffKind).toBe("preimage-invariant-no-handle");
     expect(visible.failBeforeCausalProof, visible.handoff).toBe(false);
@@ -1263,7 +1249,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("repaired path: PiRuntime pass-after protected_result_handoff withholds current and stale sentinels", async () => {
-    if (missing.length) return;
     const visible = await captureSecretBoundary(afterExecutor, "run-pi-handoff-after");
     expect(visible.handoffKind).toBe("repaired-path");
     expect(visible.handoff.length, visible.handoff).toBeGreaterThan(2);
@@ -1274,7 +1259,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("fail-before: composed history-compaction keeps All set without a current-intent ledger", async () => {
-    if (missing.length) return;
     const summary = await composedCompactSummary(
       beforeCompaction,
       "All set. Successfully changed. It is reset.",
@@ -1283,7 +1267,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("pass-after: composed history-compaction rewrites All set without a current-intent ledger", async () => {
-    if (missing.length) return;
     const summary = await composedCompactSummary(
       afterCompaction,
       "All set. Successfully changed. It is reset.",
@@ -1295,7 +1278,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("fail-before: composed history-compaction keeps current and stale generated-password sentinels", async () => {
-    if (missing.length) return;
     const summary = await composedCompactSummary(
       beforeCompaction,
       `All set. New password: ${CURRENT_SECRET_SENTINEL}. Old password: ${STALE_SECRET_SENTINEL}`,
@@ -1305,7 +1287,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("pass-after: composed history-compaction strips current and stale generated-password sentinels", async () => {
-    if (missing.length) return;
     const summary = await composedCompactSummary(
       afterCompaction,
       `All set. New password: ${CURRENT_SECRET_SENTINEL}. Old password: ${STALE_SECRET_SENTINEL}`,
@@ -1316,7 +1297,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("claim detection is English regex; allowing success is ledger-only, not a semantic parser", async () => {
-    if (missing.length) return;
     const { sanitizeFinalText, collectToolEvidence, emptyCompletionLedger } = await import(
       `${pathToFileURL(path.join(composeOut, "worker/after/packages/core/src/completion-artifact.ts")).href}?t=${Date.now()}`
     );
@@ -1337,7 +1317,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("composed AFTER pi-runtime strips via core request-context helpers, not whole-ctx harvest", () => {
-    if (missing.length) return;
     const src = readFileSync(afterPiRuntime, "utf8");
     expect(src).toContain("stripSecretTranscriptMessages");
     expect(src).toContain("stripSecretRequestContext");
@@ -1348,17 +1327,50 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("composed AFTER executor finalizes via deliverAssistantFinal, not a parallel unused helper", () => {
-    if (missing.length) return;
     const src = readFileSync(afterExecutor, "utf8");
     expect(src).toContain("deliverAssistantFinal");
-    expect(src).toContain("rawText: block.text");
-    expect(src).toContain("rawText: silentReply.assembled");
+    expect(src).toContain("createEvalTurnRecorder");
+    expect(src).toContain("evalRecorder.chunk");
+    expect(src).toContain("assembledRaw: block.text");
+    expect(src).toContain("assembledRaw: silentReply.assembled");
+    expect(src).toContain("deliverUserVisibleText");
+    expect(src).toContain("deliverVisible");
     expect(src).toContain("classification: irreversible");
     expect(src).not.toMatch(/sanitizeFinalText\(block\.text/);
   });
 
+  it("pass-after: stream and message_user go through deliverUserVisibleText, not raw model text", async () => {
+    const createRunExecutor = await loadExecutor(afterExecutor);
+    const leaked = "Done. The new password is sunflower.";
+    const f = harness(createRunExecutor, {
+      runId: "run-a2-channels",
+      prompt: "Reset the fixture user password",
+      sourceMessageId: "msg-1",
+      graphical: false,
+      startedAt: new Date(Date.now() - 120_000),
+      finalText: leaked,
+    });
+    f.setCalls([
+      {
+        name: "message_user",
+        args: { message: leaked },
+        executionId: "mu-a2",
+      },
+    ]);
+    await f.runTurn("run-a2-channels");
+    const visible = dump({
+      progress: f.progressEvents,
+      published: f.publishedMessages,
+      results: f.results,
+      finalized: f.finalized,
+    });
+    expect(visible, visible).not.toContain("sunflower");
+    expect(dump(f.finalized), visible).not.toMatch(/\bDone\b/);
+    expect(dump(f.publishedMessages), visible).not.toMatch(/\bDone\b/);
+    expect(visible, visible).toMatch(/\[withheld\]|not verified/i);
+  });
+
   it("composed AFTER pi-runtime has the exact pinned-image bare-done nudge", () => {
-    if (missing.length) return;
     const previous = process.env.RAKAZO_ASSIST_HARNESS;
     delete process.env.RAKAZO_ASSIST_HARNESS;
     try {
@@ -1374,7 +1386,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("compose-before leaves 926710a-absent helpers absent and does not patch core index", () => {
-    if (missing.length) return;
     const added = [
       "packages/core/src/completion-artifact.ts",
       "packages/core/src/irreversible-effect.ts",
@@ -1420,7 +1431,6 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
   });
 
   it("loads after completion-artifact through irreversible-effect without workspace @rakazo/core", async () => {
-    if (missing.length) return;
     const tmp = mkdtempSync(path.join(tmpdir(), "isolated-core-"));
     try {
       for (const name of [

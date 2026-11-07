@@ -171,10 +171,13 @@ export function bindOutcomeArtifact(input: {
     const subject =
       (typeof record.subject === "string" && record.subject.trim()) ||
       irreversible?.subject ||
-      toolName;
+      "";
+    if (!subject) return null;
+    const action: OutcomeAction =
+      record.action === "reset" || irreversible?.class === "password-reset" ? "reset" : "change";
     return {
       class: "task-proof",
-      action: irreversible?.class === "password-reset" ? "reset" : "change",
+      action,
       intentId,
       sourceMessageId,
       runId,
@@ -191,16 +194,7 @@ export function bindOutcomeArtifact(input: {
       subject: irreversible.subject,
     };
   }
-  if (irreversible?.class === "password-reset" && record.ok === true && !isInsufficientRead(record)) {
-    return {
-      class: "task-proof",
-      action: "reset",
-      intentId,
-      sourceMessageId,
-      runId,
-      subject: irreversible.subject,
-    };
-  }
+  // A click/mutation attempt (`ok: true` on a Reset control) is not an outcome.
   if (record.verified === true && !isInsufficientRead(record)) {
     const subject = pageSubject(record) || pageBlob(record).trim();
     if (!subject || subject.replace(/\s+/g, "").length < 4) return null;
@@ -316,18 +310,36 @@ export function unsupportedClaims(
   }
   const resetClaims = positiveClaims(finalText, RESET_CLAIM);
   const completedClaims = positiveClaims(finalText, COMPLETED_ACTION);
-  const genericSuccess =
-    positiveClaims(finalText, SUCCESS_CLAIM).length > 0 || hasGluedUnsupportedCompletion(finalText);
-  if (resetClaims.length > 0 && !ledgerHasBoundAction(ledger, "reset")) {
-    violations.push("success-without-artifact");
-  } else if (
-    completedClaims.length > 0 &&
-    !ledgerHasClass(ledger, "task-proof") &&
-    !ledgerHasBoundAction(ledger, "change")
-  ) {
-    violations.push("success-without-artifact");
-  } else if (genericSuccess && !ledgerAllowsGenericSuccess(ledger)) {
-    violations.push("success-without-artifact");
+  const successClaims = positiveClaims(finalText, SUCCESS_CLAIM);
+  const genericSuccess = successClaims.length > 0 || hasGluedUnsupportedCompletion(finalText);
+  if (resetClaims.length > 0) {
+    const resetLicensed = resetClaims.every((claim) => {
+      const subject = successNamedSubject(claim);
+      return (
+        ledgerHasBoundAction(ledger, "reset", subject) &&
+        ledgerHasBoundClass(ledger, "verified-read", subject)
+      );
+    });
+    if (!resetLicensed) violations.push("success-without-artifact");
+  } else if (completedClaims.length > 0) {
+    const changeLicensed = completedClaims.every((claim) =>
+      ledgerHasBoundAction(ledger, "change", successNamedSubject(claim)),
+    );
+    if (!changeLicensed) violations.push("success-without-artifact");
+  } else if (genericSuccess) {
+    const licensed = successClaims.every((claim) => {
+      const named = successNamedSubject(claim);
+      if (named) {
+        return (
+          ledgerHasBoundClass(ledger, "task-proof", named) ||
+          ledgerHasBoundClass(ledger, "delivered-send", named)
+        );
+      }
+      return ledgerAllowsGenericSuccess(ledger);
+    });
+    if (!licensed || (hasGluedUnsupportedCompletion(finalText) && !ledgerAllowsGenericSuccess(ledger))) {
+      violations.push("success-without-artifact");
+    }
   }
   return [...new Set(violations)];
 }
@@ -344,6 +356,11 @@ function claimResourceSubject(claim: string): string | undefined {
         !/^(this|that|been|have|from|with|page|result|outcome|status|been)$/i.test(token),
     );
   return tokens.at(-1);
+}
+
+function successNamedSubject(claim: string): string | undefined {
+  const match = claim.match(/\b(order|license|cart|billing)\b/i);
+  return match?.[1];
 }
 
 function sendClaimSubject(claim: string): string | undefined {

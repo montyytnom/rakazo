@@ -8,9 +8,11 @@ import {
   looksLikeLabeledSecret,
   looksLikeSecretValue,
   protectedResultNote,
+  redactLabeledSecretSpans,
   redactProtectedTree,
   redactThrown,
   secretsFromPriorAssistantText,
+  stripEmbeddedTurnContext,
   stripSecretEchoes,
   stripSecretRequestContext,
   stripSecretTranscriptMessages,
@@ -90,7 +92,8 @@ describe("protected result handles", () => {
     expect(looksLikeSecretValue(FIXTURE_NEW)).toBe(true);
     expect(redactProtectedTree({ item: FIXTURE_NEW })).toEqual({ item: FIXTURE_NEW });
     expect(redactProtectedTree({ password: "item-1" })).toEqual({ password: "[withheld]" });
-    expect(harvestSecretsFromUnknown({ password: "item-1" })).toEqual([]);
+    expect(harvestSecretsFromUnknown({ password: "item-1" })).toContain("item-1");
+    expect(harvestSecretsFromUnknown({ id: "item-1" })).toEqual([]);
     for (const sku of ["REF-A1b2", "SkuA12B"]) {
       expect(looksLikeSecretValue(sku), sku).toBe(false);
       expect(redactProtectedTree({ item: sku })).toEqual({ item: sku });
@@ -183,8 +186,8 @@ describe("protected result handles", () => {
       ],
     };
     const stripped = stripSecretRequestContext(withSecret);
-    expect(JSON.stringify(stripped.systemPrompt)).not.toContain("[withheld]");
-    expect(JSON.stringify(stripped.tools)).toBe(JSON.stringify(request.tools));
+    expect(stripped.systemPrompt).toBe(request.systemPrompt);
+    expect(stripped.tools).toBe(request.tools);
     expect(JSON.stringify(stripped.messages)).not.toContain(FIXTURE_NEW);
     expect(JSON.stringify(stripped.messages)).toContain("[withheld]");
     const twice = stripSecretRequestContext(stripped);
@@ -192,17 +195,96 @@ describe("protected result handles", () => {
     expect(JSON.stringify(twice)).not.toMatch(/withheld\]\]/);
   });
 
+  it("no-harvest and no-rewrite: known secrets never rewrite definition trees", () => {
+    const request = {
+      systemPrompt: `Keep example ${FIXTURE_NEW} and hunter in the prompt.`,
+      tools: [{ name: "request_secret", description: `example ${FIXTURE_NEW} hunter` }],
+      turn_context: `hunter ${FIXTURE_NEW}`,
+      messages: [
+        { role: "system", content: `password is ${FIXTURE_NEW}` },
+        { role: "tool", content: { password: "hunter", note: "signed in as hunter" } },
+        { role: "user", content: `New password: ${FIXTURE_NEW}` },
+      ],
+    };
+    expect(harvestSecretsFromRequestContext(request)).toEqual(["hunter"]);
+    const stripped = stripSecretRequestContext(request);
+    expect(stripped.systemPrompt).toBe(request.systemPrompt);
+    expect(stripped.tools).toBe(request.tools);
+    expect(stripped.turn_context).toBe(request.turn_context);
+    expect(stripped.messages[0]).toBe(request.messages[0]);
+    expect(JSON.stringify(stripped.messages.slice(1))).not.toContain("hunter");
+  });
+
+  it("does not mine embedded <turn_context> or FACTS labelled text in the user envelope", () => {
+    const secret = FIXTURE_NEW;
+    const request = {
+      systemPrompt: `Order ${secret} policy. Use ${secret} slots.`,
+      tools: [{ name: "request_secret", description: `slots ${secret}` }],
+      messages: [
+        {
+          role: "user",
+          content: `Do the reset.\n<turn_context>\nFACTS.md: Wi-Fi password is ${secret}\n</turn_context>`,
+        },
+      ],
+    };
+    expect(stripEmbeddedTurnContext(request.messages[0]!.content)).not.toContain(secret);
+    expect(harvestSecretsFromRequestContext(request)).toEqual([]);
+    const stripped = stripSecretRequestContext(request);
+    expect(stripped.systemPrompt).toBe(request.systemPrompt);
+    expect(stripped.tools).toBe(request.tools);
+    expect(stripped.systemPrompt).toContain(secret);
+  });
+
+  it("untrusted page labelled password is not a known secret and does not rewrite defs", () => {
+    const sku = "REF-A1b2C3";
+    const request = {
+      systemPrompt: `Order ${sku} policy. Use ${sku} slots.`,
+      tools: [{ name: "search", description: `Use ${sku} slots.` }],
+      messages: [{ role: "tool", content: { tree: `New password: ${sku}`, header: sku } }],
+    };
+    expect(harvestSecretsFromRequestContext(request)).toEqual([]);
+    const stripped = stripSecretRequestContext(request);
+    expect(stripped.systemPrompt).toBe(request.systemPrompt);
+    expect(stripped.tools).toBe(request.tools);
+    expect(JSON.stringify(stripped.messages)).not.toContain(`New password: ${sku}`);
+    expect(JSON.stringify(stripped.systemPrompt)).toContain(sku);
+  });
+
+  it("any-shape structured secrets echo-strip unlabelled delivered text", () => {
+    for (const value of ["482913", "sunflower", "item-1"]) {
+      const tree = redactProtectedTree({
+        password: value,
+        note: `Jordan's code is ${value}`,
+      });
+      expect(JSON.stringify(tree)).not.toContain(value);
+      expect(harvestSecretsFromUnknown({ password: value, newPassword: value })).toContain(value);
+    }
+  });
+
+  it("withholds unique-secret fragments, splits, and temp-pw labels", () => {
+    const secret = FIXTURE_NEW;
+    const prefix = secret.slice(0, secret.length - 2);
+    expect(stripSecretEchoes(`It starts ${prefix} then -A`, [secret]).text).not.toContain(prefix);
+    expect(stripSecretEchoes(secret.split("").join(" "), [secret]).text).not.toMatch(/FxNew/);
+    expect(redactLabeledSecretSpans(`Earlier temp pw: ${FIXTURE_OLD}`)).not.toContain(FIXTURE_OLD);
+  });
+
   it("structured fields and known values withhold regardless of shape", () => {
     for (const value of ["hunter", "aaaaaa", "123456", "item-1"]) {
       expect(redactProtectedTree({ password: value })).toEqual({ password: "[withheld]" });
       expect(redactProtectedTree({ otp: value })).toEqual({ otp: "[withheld]" });
       expect(redactProtectedTree({ pin: value })).toEqual({ pin: "[withheld]" });
+      expect(harvestSecretsFromUnknown({ password: value })).toContain(value);
     }
-    expect(harvestSecretsFromUnknown({ password: "hunter" })).toEqual([]);
-    expect(harvestSecretsFromUnknown({ otp: "123456" })).toEqual([]);
     const known = stripSecretEchoes("signed in as hunter on the page", ["hunter"]);
     expect(known.text).toContain("[withheld]");
     expect(known.text).not.toContain("hunter");
+    const echoed = redactProtectedTree({
+      password: "hunter",
+      note: "signed in as hunter",
+    });
+    expect(JSON.stringify(echoed)).not.toContain("hunter");
+    expect(stripSecretEchoes("hunting hunter2", ["hunter"]).text).toBe("hunting hunter2");
   });
 
   it("untrusted page/result/args without secret metadata keep SKU, pin English, and mixed refs", () => {

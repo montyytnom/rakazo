@@ -438,7 +438,7 @@ export async function compactHistory(deps: CompactHistoryDeps, threadId: string)
     return;
   }
   summary = deliverAssistantFinal({
-    rawText: rewriteUnverifiedClaims(summary, transcript),
+    assembledRaw: rewriteUnverifiedClaims(summary, transcript),
     toolResults: [transcript],
     secrets: secretsFromPriorAssistantText([summary, transcript]),
   }).deliveredFinal;

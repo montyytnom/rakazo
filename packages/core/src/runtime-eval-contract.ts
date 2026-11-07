@@ -18,8 +18,10 @@ import {
  * Production overlay finalization, in call order. Each step names the overlay
  * function that actually runs — not a parallel helper.
  *
- * Eval must record `rawFinal` at assistBareDone / model `done` (before
- * sanitize). `deliveredFinal` is finalizeRun blocks + notification body.
+ * Text channels (do not collapse):
+ * - `rawModelChunks` / `rawModelFinish` / `rawModelText`: one provider call
+ * - `assembledRaw`: post-nudge + concat across calls; NOT raw model output
+ * - `deliveredFinal`: sanitize + labeled-span + known-secret strip
  */
 export const PRODUCTION_FINALIZATION_CALL_GRAPH = [
   {
@@ -48,24 +50,29 @@ export const PRODUCTION_FINALIZATION_CALL_GRAPH = [
     records: "turnLedger identity/subject/action",
   },
   {
+    id: "recordModelTurn",
+    site: "executor stream text / tool / done",
+    records: "rawModelChunks+rawModelFinish+rawModelText per provider call, in call order",
+  },
+  {
     id: "assistBareDone",
     site: "packages/adapters/src/pi-runtime.ts overlay local patch",
-    records: "follow-up user turn; not a delivered final",
+    records: "follow-up user turn; starts the next provider call; not a delivered final",
   },
   {
     id: "gluedConcat",
-    site: "sanitizeFinalText stripGluedSuccessPrefix",
-    records: "Done glued onto the next assembled final",
+    site: "executor assembled += separator + event.text; sanitizeFinalText stripGluedSuccessPrefix",
+    records: "assembledRaw only — never labeled raw model output",
   },
   {
     id: "deliverAssistantFinal",
     site: "executor completionBlocks map + notification body",
-    records: "rawFinal vs deliveredFinal",
+    records: "assembledRaw in, deliveredFinal out; modelTurns pass-through",
   },
   {
     id: "finalizeRun",
     site: "deps.events.finalizeRun",
-    records: "persisted blocks",
+    records: "persisted delivered blocks",
   },
   {
     id: "completionNotification",
@@ -96,30 +103,120 @@ export const ADAPTER_RUNTIME_EVAL_ENTRYPOINTS = [
   "handoffProtectedResult",
 ] as const;
 
+export type EvalModelTurn = {
+  /** Streamed model text pieces for one provider call, in arrival order. */
+  rawModelChunks: string[];
+  /** Model `done` text for that call. Empty when the call ended on a tool. */
+  rawModelFinish: string;
+  /** Joined chunks for that call. Not post-nudge, not delivered. */
+  rawModelText: string;
+  callIndex: number;
+};
+
+export type EvalTurnRecorder = {
+  chunk: (text: string) => void;
+  finish: (finishText: string) => boolean;
+  finishOrDone: (finishText: string) => void;
+  snapshot: () => EvalModelTurn[];
+};
+
+export function assembleRawModelText(chunks: readonly string[]): string {
+  return chunks.join("");
+}
+
+export function recordModelTurn(
+  chunks: readonly string[],
+  finish: string,
+  callIndex: number,
+): EvalModelTurn {
+  return {
+    rawModelChunks: [...chunks],
+    rawModelFinish: finish,
+    rawModelText: assembleRawModelText(chunks),
+    callIndex,
+  };
+}
+
+export function createEvalTurnRecorder(): EvalTurnRecorder {
+  const turns: EvalModelTurn[] = [];
+  let chunks: string[] = [];
+  let open = false;
+  const finish = (finishText: string): boolean => {
+    if (!open && chunks.length === 0) return false;
+    turns.push(recordModelTurn(chunks, finishText, turns.length));
+    chunks = [];
+    open = false;
+    return true;
+  };
+  return {
+    chunk(text: string) {
+      chunks.push(text);
+      open = true;
+    },
+    finish,
+    finishOrDone(finishText: string) {
+      if (finish(finishText)) return;
+      if (finishText && turns.length === 0) {
+        turns.push(recordModelTurn([], finishText, 0));
+      }
+    },
+    snapshot() {
+      return turns.map((turn) => ({
+        ...turn,
+        rawModelChunks: [...turn.rawModelChunks],
+      }));
+    },
+  };
+}
+
 export type DeliveredAssistantFinal = {
-  rawFinal: string;
+  /** Post-nudge/concat assembled text. Not raw model output. */
+  assembledRaw: string;
   deliveredFinal: string;
+  modelTurns: EvalModelTurn[];
   evidence: ToolEvidence;
 };
 
 /**
  * Exact text transform used by overlay finalizeRun blocks and compaction.
- * Nudge/persist/notification/handoff wrap this; they are not a second sanitizer.
+ * Input is assembledRaw (post-nudge/concat). Per-turn raw model lives on
+ * `modelTurns` from createEvalTurnRecorder — this helper does not invent it.
  */
 export function deliverAssistantFinal(input: {
-  rawText: string;
+  assembledRaw?: string;
+  /** @deprecated Alias of assembledRaw. Never treat as raw model output. */
+  rawText?: string;
+  modelTurns?: readonly EvalModelTurn[];
   toolResults: readonly unknown[];
   ledger?: CompletionLedger;
   secrets?: readonly string[];
 }): DeliveredAssistantFinal {
+  const assembledRaw = input.assembledRaw ?? input.rawText ?? "";
   const evidence = collectToolEvidence(input.toolResults);
-  let deliveredFinal = sanitizeFinalText(input.rawText, evidence, input.ledger);
+  let deliveredFinal = sanitizeFinalText(assembledRaw, evidence, input.ledger);
   deliveredFinal = redactLabeledSecretSpans(deliveredFinal);
   if (input.secrets?.length) {
     deliveredFinal = stripSecretEchoes(deliveredFinal, input.secrets).text;
   }
   if (!deliveredFinal.trim()) deliveredFinal = "Outcome was not verified.";
-  return { rawFinal: input.rawText, deliveredFinal, evidence };
+  return {
+    assembledRaw,
+    deliveredFinal,
+    modelTurns: input.modelTurns
+      ? input.modelTurns.map((turn) => ({
+          ...turn,
+          rawModelChunks: [...turn.rawModelChunks],
+        }))
+      : [],
+    evidence,
+  };
+}
+
+/** Every user-visible channel (final, stream, message_user, narration) uses this. */
+export function deliverUserVisibleText(
+  input: Parameters<typeof deliverAssistantFinal>[0],
+): string {
+  return deliverAssistantFinal(input).deliveredFinal;
 }
 
 export const EVAL_SCOPE = {
@@ -134,9 +231,15 @@ export const EVAL_SCOPE = {
   liveEval: "blocked-until-offline-contract-and-live-window-attestation",
   tuningExposed: ["L1", "M1", "V1"],
   heldout: "sealed",
-  g1Provenance:
-    "structured-field+SecretStore known values withhold regardless of shape; unlabeled SKU/pin English is not a secret; labeled history does not mine system/tools/context; common words are not globally replaced",
+  g1Invariant:
+    "no-harvest AND no-rewrite of defs; do not mine embedded <turn_context> user envelope or untrusted page labels into the known set; structured-field+SecretStore known values echo-strip context-safe, any shape",
+  g3Channels:
+    "rawModelChunks+rawModelFinish per provider call; assembledRaw is post-nudge+concat; deliveredFinal is sanitized; deliverAssistantFinal input is assembledRaw not raw model",
+  a1:
+    "click ok:true is not reset proof; reset claims need outcomeProof+same-subject verified-read; task-proof for A does not license order/license B",
+  a2: "every user-visible channel including stream/message_user/narration/takeover/loop-guard uses deliverUserVisibleText",
   g6Proof: "identity+subject+action; verified-read A does not license verified B",
+  nonEnglish: "excluded-from-eval-explicit",
 } as const;
 
 export {

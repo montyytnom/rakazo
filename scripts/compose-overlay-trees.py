@@ -249,7 +249,9 @@ def patch_executor(path: Path) -> None:
         "  threadIrreversibleEffectKey,\n"
         "  UNAUTHORIZED_IRREVERSIBLE,\n"
         "  collectToolEvidence,\n"
+        "  createEvalTurnRecorder,\n"
         "  deliverAssistantFinal,\n"
+        "  deliverUserVisibleText,\n"
         "  secretsFromPriorAssistantText,\n"
         "  stripSecretEchoes,\n"
         "  bindOutcomeArtifact,\n"
@@ -278,20 +280,7 @@ def patch_executor(path: Path) -> None:
         "        const consumedEffectIds = new Set<string>();\n",
         "        const pageRefMemory = createRefMemory();\n"
         "        const protectedResults = createProtectedResultStore();\n"
-        "        const protectedVault = resolveProtectedResultVault(deps.secretStore, context);\n"
-        "        const turnToolResults: unknown[] = [];\n"
-        "        const turnIntent = resolveTurnIntent(\n"
-        "          { id: run.sourceMessageId, text: task.prompt },\n"
-        "          history\n"
-        "            .filter((message) => message.role === \"user\")\n"
-        "            .map((message) => ({ id: message.id, text: message.content })),\n"
-        "        );\n"
-        "        const intentId = turnIntent.intentId;\n"
-        "        const turnLedger = emptyCompletionLedger({\n"
-        "          intentId,\n"
-        "          sourceMessageId: turnIntent.sourceMessageId ?? \"\",\n"
-        "          runId,\n"
-        "        });\n",
+        "        const protectedVault = resolveProtectedResultVault(deps.secretStore, context);\n",
         "turn intent + ref memory",
     )
     replace_once(
@@ -554,7 +543,8 @@ def patch_executor(path: Path) -> None:
         "                return {\n"
         "                  ...block,\n"
         "                  text: deliverAssistantFinal({\n"
-        "                    rawText: block.text,\n"
+        "                    assembledRaw: block.text,\n"
+        "                    modelTurns: evalRecorder.snapshot(),\n"
         "                    toolResults: turnToolResults,\n"
         "                    ledger: turnLedger,\n"
         "                    secrets: [...runSecrets, ...priorSecrets],\n"
@@ -566,7 +556,8 @@ def patch_executor(path: Path) -> None:
         "            : redactSecrets(\n"
         "                completionNotificationBody(\n"
         "                  deliverAssistantFinal({\n"
-        "                    rawText: silentReply.assembled,\n"
+        "                    assembledRaw: silentReply.assembled,\n"
+        "                    modelTurns: evalRecorder.snapshot(),\n"
         "                    toolResults: turnToolResults,\n"
         "                    ledger: turnLedger,\n"
         "                    secrets: [...runSecrets, ...priorSecrets],\n"
@@ -586,11 +577,182 @@ def patch_executor(path: Path) -> None:
         "          if (!runSecrets.includes(secret)) runSecrets.push(secret);\n"
         "        }\n"
         "        const runtimeHistory = [...historicalContext, ...historyWithImages].map((message) =>\n"
-        "          typeof message.content === \"string\"\n"
+        "          typeof message.content === \"string\" && message.role !== \"system\"\n"
         "            ? { ...message, content: stripSecretEchoes(message.content, runSecrets).text }\n"
         "            : message,\n"
         "        );\n",
         "history secret strip before model",
+    )
+    replace_once(
+        path,
+        "        let assembled = \"\";\n"
+        "        let currentTextSegment = \"\";\n",
+        "        let assembled = \"\";\n"
+        "        let currentTextSegment = \"\";\n"
+        "        const evalRecorder = createEvalTurnRecorder();\n"
+        "        const turnToolResults: unknown[] = [];\n"
+        "        const turnIntent = resolveTurnIntent(\n"
+        "          { id: run.sourceMessageId, text: task.prompt },\n"
+        "          history\n"
+        "            .filter((message) => message.role === \"user\")\n"
+        "            .map((message) => ({ id: message.id, text: message.content })),\n"
+        "        );\n"
+        "        const intentId = turnIntent.intentId;\n"
+        "        const turnLedger = emptyCompletionLedger({\n"
+        "          intentId,\n"
+        "          sourceMessageId: turnIntent.sourceMessageId ?? \"\",\n"
+        "          runId,\n"
+        "        });\n"
+        "        const deliverVisible = (text: string) =>\n"
+        "          deliverUserVisibleText({\n"
+        "            assembledRaw: text,\n"
+        "            modelTurns: evalRecorder.snapshot(),\n"
+        "            toolResults: turnToolResults,\n"
+        "            ledger: turnLedger,\n"
+        "            secrets: runSecrets,\n"
+        "          });\n",
+        "eval turn recorder",
+    )
+    replace_once(
+        path,
+        "            if (event.type === \"tool\" || event.type === \"takeover\") {\n"
+        "              recordExplicitNoResponse(assistantTurnText);\n"
+        "              assistantTurnText = \"\";\n"
+        "            }\n"
+        "            if (event.type === \"text\") {\n"
+        "              assistantTurnText += event.text;\n",
+        "            if (event.type === \"tool\" || event.type === \"takeover\") {\n"
+        "              evalRecorder.finish(\"\");\n"
+        "              recordExplicitNoResponse(assistantTurnText);\n"
+        "              assistantTurnText = \"\";\n"
+        "            }\n"
+        "            if (event.type === \"text\") {\n"
+        "              evalRecorder.chunk(event.text);\n"
+        "              assistantTurnText += event.text;\n",
+        "eval recorder stream chunk",
+    )
+    replace_once(
+        path,
+        "            } else if (event.type === \"done\") {\n"
+        "              recordExplicitNoResponse(event.text ?? \"\");\n",
+        "            } else if (event.type === \"done\") {\n"
+        "              evalRecorder.finishOrDone(event.text ?? \"\");\n"
+        "              recordExplicitNoResponse(event.text ?? \"\");\n",
+        "eval recorder stream finish",
+    )
+    replace_once(
+        path,
+        "        const flushProgress = async () => {\n"
+        "          if (scripted || !pendingProgress || isBackgroundRunTrigger(run.trigger)) return;\n"
+        "          await deps.events.append({\n"
+        "            spaceId: run.spaceId,\n"
+        "            threadId: thread.id,\n"
+        "            botId: bot.id,\n"
+        "            type: \"thread.progress\",\n"
+        "            runId,\n"
+        "            // The first flush replaces the \"working…\" placeholder outright — a delta here\n"
+        "            // would otherwise get appended straight onto it with no separator.\n"
+        "            payload: hasStreamedText\n"
+        "              ? { delta: pendingProgress, streaming: true }\n"
+        "              : { text: pendingProgress, streaming: true },\n"
+        "          });\n",
+        "        const flushProgress = async (force = false) => {\n"
+        "          if (scripted || !pendingProgress || isBackgroundRunTrigger(run.trigger)) return;\n"
+        "          if (!force && !endsSentence(pendingProgress)) return;\n"
+        "          const safe = deliverVisible(pendingProgress);\n"
+        "          await deps.events.append({\n"
+        "            spaceId: run.spaceId,\n"
+        "            threadId: thread.id,\n"
+        "            botId: bot.id,\n"
+        "            type: \"thread.progress\",\n"
+        "            runId,\n"
+        "            // The first flush replaces the \"working…\" placeholder outright — a delta here\n"
+        "            // would otherwise get appended straight onto it with no separator.\n"
+        "            payload: hasStreamedText\n"
+        "              ? { delta: safe, streaming: true }\n"
+        "              : { text: safe, streaming: true },\n"
+        "          });\n",
+        "flushProgress deliverVisible",
+    )
+    replace_once(
+        path,
+        "          if (name === \"message_user\") {\n"
+        "            const rawMessage = redactSecrets(String(args.message ?? \"\"), runSecrets);\n",
+        "          if (name === \"message_user\") {\n"
+        "            const rawMessage = deliverVisible(String(args.message ?? \"\"));\n",
+        "message_user deliverVisible",
+    )
+    replace_once(
+        path,
+        "          const narration = clampUserProgressMessage(redactSecrets(extracted.text, runSecrets));\n",
+        "          const narration = clampUserProgressMessage(deliverVisible(extracted.text));\n",
+        "midturn deliverVisible",
+    )
+    replace_once(
+        path,
+        "              const safeReason = redactSecrets(event.reason, runSecrets);\n",
+        "              const safeReason = deliverVisible(event.reason);\n",
+        "takeover deliverVisible",
+    )
+    replace_once(
+        path,
+        "                const narration = clampUserProgressMessage(redactSecrets(assembled, runSecrets));\n",
+        "                const narration = clampUserProgressMessage(deliverVisible(assembled));\n",
+        "takeover narration deliverVisible",
+    )
+    replace_once(
+        path,
+        "              if (pendingProgress) {\n"
+        "                await deps.events.append({\n"
+        "                  spaceId: run.spaceId,\n"
+        "                  threadId: thread.id,\n"
+        "                  botId: bot.id,\n"
+        "                  type: \"thread.progress\",\n"
+        "                  runId,\n"
+        "                  payload: { delta: pendingProgress, streaming: true },\n"
+        "                });\n"
+        "                pendingProgress = \"\";\n"
+        "                lastProgressAt = Date.now();\n"
+        "              }\n",
+        "              if (pendingProgress) {\n"
+        "                await flushProgress(true);\n"
+        "              }\n",
+        "progress event flushProgress",
+    )
+    replace_once(
+        path,
+        "              await flushProgress();\n"
+        "              // Promote streamed narration into a durable, replyable chat message before\n",
+        "              await flushProgress(true);\n"
+        "              // Promote streamed narration into a durable, replyable chat message before\n",
+        "tool flushProgress force",
+    )
+    replace_once(
+        path,
+        "          pendingProgress += progressRedactor.finish();\n"
+        "          await flushProgress();\n",
+        "          pendingProgress += progressRedactor.finish();\n"
+        "          await flushProgress(true);\n",
+        "final flushProgress force",
+    )
+    replace_once(
+        path,
+        "                if (messageSegments.length > 0) {\n"
+        "                  await publishMessage(deps, run, \"bot\", redactBlocks(messageSegments, runSecrets));\n"
+        "                }\n",
+        "                if (messageSegments.length > 0) {\n"
+        "                  await publishMessage(\n"
+        "                    deps,\n"
+        "                    run,\n"
+        "                    \"bot\",\n"
+        "                    redactBlocks(messageSegments, runSecrets).map((block) =>\n"
+        "                      block.kind === \"text\"\n"
+        "                        ? { ...block, text: deliverVisible(block.text) }\n"
+        "                        : block,\n"
+        "                    ),\n"
+        "                  );\n"
+        "                }\n",
+        "loop-guard deliverVisible",
     )
 
 
@@ -694,7 +856,7 @@ def patch_history_compaction(path: Path) -> None:
         "    return;\n"
         "  }\n"
         "  summary = deliverAssistantFinal({\n"
-        "    rawText: rewriteUnverifiedClaims(summary, transcript),\n"
+        "    assembledRaw: rewriteUnverifiedClaims(summary, transcript),\n"
         "    toolResults: [transcript],\n"
         "    secrets: secretsFromPriorAssistantText([summary, transcript]),\n"
         "  }).deliveredFinal;\n\n"

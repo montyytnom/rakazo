@@ -10,6 +10,7 @@ import {
   sanitizeFinalText,
   unsupportedClaims,
 } from "./completion-artifact.js";
+import { classifyBrowserMutation } from "./irreversible-effect.js";
 
 const INTENT = {
   intentId: "intent-reset",
@@ -287,11 +288,89 @@ describe("completion artifacts", () => {
       subject: "https://admin.example/reset",
       ...INTENT,
     });
+    resetLedger.artifacts.push({
+      class: "verified-read",
+      action: "read",
+      subject: "https://admin.example/reset",
+      ...INTENT,
+    });
     expect(sanitizeFinalText("It is reset.", collectToolEvidence([]), resetLedger)).toBe(
       "It is reset.",
     );
     expect(sanitizeFinalText("Text sent", collectToolEvidence([]), resetLedger)).toBe(
       "Delivery was not verified.",
+    );
+  });
+
+  it("a Reset click or filter ok:true does not mint reset task-proof", () => {
+    const dialog = classifyBrowserMutation(
+      ["button 'RESET PASSWORD'"],
+      "https://admin.example/users/u-1",
+    );
+    expect(dialog?.class).toBe("password-reset");
+    expect(
+      bindOutcomeArtifact({
+        result: { ok: true, tree: "Dialog OPEN RESET PASSWORD" },
+        toolName: "browser_act",
+        classification: dialog,
+        ...INTENT,
+      }),
+    ).toBeNull();
+    const filter = classifyBrowserMutation(["Reset"], "https://shop.example/search");
+    expect(filter?.class).toBe("password-reset");
+    expect(
+      bindOutcomeArtifact({
+        result: { ok: true },
+        toolName: "browser_act",
+        classification: filter,
+        ...INTENT,
+      }),
+    ).toBeNull();
+  });
+
+  it("reset proof needs outcomeProof plus same-subject verified-read; it does not license order/license claims", () => {
+    const subject = "https://admin.example/users/u-1";
+    const ledger = emptyCompletionLedger(INTENT);
+    const click = classifyBrowserMutation(["button 'RESET PASSWORD'"], subject);
+    expect(
+      bindOutcomeArtifact({
+        result: { ok: true },
+        toolName: "browser_act",
+        classification: click,
+        ...INTENT,
+      }),
+    ).toBeNull();
+    const proof = bindOutcomeArtifact({
+      result: {
+        outcomeProof: true,
+        intentId: INTENT.intentId,
+        sourceMessageId: INTENT.sourceMessageId,
+        runId: INTENT.runId,
+        subject,
+      },
+      toolName: "browser_snapshot",
+      classification: { class: "password-reset", subject },
+      ...INTENT,
+    });
+    expect(proof?.class).toBe("task-proof");
+    expect(proof?.action).toBe("reset");
+    ledger.artifacts.push(proof!);
+    expect(sanitizeFinalText("It is reset.", collectToolEvidence([]), ledger)).toBe(
+      "Outcome was not verified.",
+    );
+    const read = bindOutcomeArtifact({
+      result: { verified: true, url: subject, tree: "Password was changed." },
+      toolName: "browser_snapshot",
+      ...INTENT,
+    });
+    expect(read?.class).toBe("verified-read");
+    ledger.artifacts.push(read!);
+    expect(sanitizeFinalText("It is reset.", collectToolEvidence([]), ledger)).toBe("It is reset.");
+    expect(sanitizeFinalText("All set, your order is placed.", collectToolEvidence([]), ledger)).toBe(
+      "Outcome was not verified.",
+    );
+    expect(sanitizeFinalText("License reassigned to j.rivera.", collectToolEvidence([]), ledger)).toBe(
+      "Outcome was not verified.",
     );
   });
 

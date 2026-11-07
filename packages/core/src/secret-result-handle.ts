@@ -14,6 +14,8 @@ export type HarvestSecretsOptions = {
   skipKeys?: ReadonlySet<string>;
   /** Skip chat messages whose role is system. */
   skipSystemRole?: boolean;
+  /** Skip labelled-prose harvest (user envelopes, untrusted page blobs). */
+  skipLabeledText?: boolean;
 };
 
 /** Tool-declared / JSON secret fields. Values are withheld regardless of shape. */
@@ -22,7 +24,7 @@ export const STRUCTURED_SECRET_KEY =
 
 const PASSWORD_KEY = STRUCTURED_SECRET_KEY;
 const GENERATED_PASSWORD_SOURCE =
-  String.raw`\b(?:temporary password|new password|generated password|old password|current password)\s*[:=]\s*["']{0,2}([^\s"'*<>]+)`;
+  String.raw`\b(?:temporary password|new password|generated password|old password|current password|temp(?:orary)? pw)\s*[:=]\s*["']{0,2}([^\s"'*<>]+)`;
 /**
  * History fallback only. Bare `password through` is not a secret. `pin:` / `otp:`
  * in untrusted page text is not metadata and must not harvest.
@@ -78,6 +80,23 @@ export const REQUEST_HARVEST_SKIP_KEYS: ReadonlySet<string> = new Set([
   "toolDefinitions",
   "tool_choice",
 ]);
+
+/** Untrusted page blobs: labelled "new password: X" is not structured provenance. */
+export const UNTRUSTED_PAGE_KEYS: ReadonlySet<string> = new Set([
+  "tree",
+  "header",
+  "title",
+  "url",
+  "html",
+  "snapshot",
+]);
+
+const TURN_CONTEXT_BLOCK = /<turn_context\b[^>]*>[\s\S]*?(<\/turn_context>|$)/gi;
+
+/** Production turn_context is embedded in the user envelope, not a JSON key. */
+export function stripEmbeddedTurnContext(text: string): string {
+  return text.replace(TURN_CONTEXT_BLOCK, " ");
+}
 
 export function hashSecret(value: string): string {
   return `sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`;
@@ -169,7 +188,8 @@ export function shouldGlobalReplaceSecret(value: string): boolean {
 }
 
 export function redactProtectedTree(value: unknown, extras: readonly string[] = []): unknown {
-  const banned = new Set(extras.filter(Boolean));
+  const harvested = harvestSecretsFromUnknown(value, [], undefined);
+  const banned = new Set([...extras.filter(Boolean), ...harvested]);
   return walk(value, banned, undefined);
 }
 
@@ -222,9 +242,54 @@ function harvestLabeledValuesFromText(text: string, globalOnly = false): string[
   return found;
 }
 
-/** Global-replace harvest. Dictionary/numeric/hyphenated structured values are not listed. */
+/**
+ * Labeled-history harvest for global replace. Dictionary/numeric values in prose
+ * are not listed. Structured JSON fields still join the known-echo set via
+ * harvestSecretsFromUnknown (any shape, context-safe replace).
+ */
 export function harvestSecretsFromText(text: string): string[] {
   return harvestLabeledValuesFromText(text, true);
+}
+
+/** Structured-field / SecretStore echo membership: any shape, not tiny tokens. */
+export function isKnownEchoSecret(value: string): boolean {
+  const trimmed = value.trim();
+  if (!isStructuredSecretValue(trimmed)) return false;
+  if (STOP_WORDS.has(trimmed.toLowerCase())) return false;
+  if (trimmed.length < 4) return false;
+  return true;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Context-safe known-secret replace. Unique mixed-shape secrets use substring
+ * (they may be glued). Dictionary/numeric/hyphenated secrets use token bounds
+ * so `hunter` does not rewrite `hunting` / `hunter2`.
+ */
+export function replaceKnownSecret(text: string, secret: string): string {
+  if (!secret) return text;
+  if (!shouldGlobalReplaceSecret(secret)) {
+    if (!text.includes(secret)) return text;
+    return text.replace(
+      new RegExp(`(?<![A-Za-z0-9_-])${escapeRegExp(secret)}(?![A-Za-z0-9_-])`, "g"),
+      "[withheld]",
+    );
+  }
+  let next = text.split(secret).join("[withheld]");
+  next = next.replace(new RegExp(escapeRegExp(secret), "gi"), "[withheld]");
+  if (secret.length >= 8) {
+    const keep = Math.max(6, secret.length - 2);
+    const prefix = secret.slice(0, keep);
+    const suffix = secret.slice(-keep);
+    next = next.split(prefix).join("[withheld]");
+    if (suffix !== prefix) next = next.split(suffix).join("[withheld]");
+  }
+  const spaced = secret.split("").map(escapeRegExp).join("\\s*");
+  next = next.replace(new RegExp(spaced, "g"), "[withheld]");
+  return next;
 }
 
 export function redactLabeledSecretSpans(text: string): string {
@@ -252,7 +317,19 @@ export function harvestSecretsFromUnknown(
   globalOnly = true,
 ): string[] {
   if (typeof value === "string") {
-    for (const secret of harvestLabeledValuesFromText(value, globalOnly)) {
+    const source = stripEmbeddedTurnContext(value);
+    if (options?.skipLabeledText) {
+      const trimmed = source.trim();
+      if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+        try {
+          harvestSecretsFromUnknown(JSON.parse(trimmed), into, options, globalOnly);
+        } catch {
+          // not JSON
+        }
+      }
+      return into;
+    }
+    for (const secret of harvestLabeledValuesFromText(source, globalOnly)) {
       if (!into.includes(secret)) into.push(secret);
     }
     return into;
@@ -264,12 +341,17 @@ export function harvestSecretsFromUnknown(
   if (value && typeof value === "object") {
     const record = value as Record<string, unknown>;
     if (options?.skipSystemRole && record.role === "system") return into;
+    if (record.role === "user") {
+      harvestSecretsFromUnknown(record.content, into, { ...options, skipLabeledText: true }, globalOnly);
+      return into;
+    }
     for (const [key, item] of Object.entries(record)) {
       if (options?.skipKeys?.has(key)) continue;
+      if (UNTRUSTED_PAGE_KEYS.has(key) && typeof item === "string") continue;
       if (isStructuredSecretKey(key) && typeof item === "string") {
-        if (isStructuredSecretValue(item) && shouldGlobalReplaceSecret(item) && !into.includes(item)) {
-          into.push(item);
-        }
+        // Structured provenance: any shape joins the known-echo set. Shape is
+        // not a gate. Definition trees never reach here (skipKeys / skipSystemRole).
+        if (isKnownEchoSecret(item) && !into.includes(item)) into.push(item);
         continue;
       }
       harvestSecretsFromUnknown(item, into, options, globalOnly);
@@ -286,8 +368,8 @@ export function harvestSecretsFromRequestContext(value: unknown, into: string[] 
 }
 
 /**
- * Global replace of caller-supplied known secrets (SecretStore / runSecrets).
- * Dictionary known values ARE replaced because they arrived as structured provenance.
+ * Replace caller-supplied known secrets (SecretStore extras + structured-field
+ * values of any shape). Visibility is context-safe, not shape-gated.
  */
 export function stripSecretEchoes(
   text: string,
@@ -296,9 +378,10 @@ export function stripSecretEchoes(
   let next = text;
   let echoed = false;
   for (const secret of secrets) {
-    if (!secret || !next.includes(secret)) continue;
+    const replaced = replaceKnownSecret(next, secret);
+    if (replaced === next) continue;
     echoed = true;
-    next = next.split(secret).join("[withheld]");
+    next = replaced;
   }
   return { text: next, echoed };
 }
@@ -350,13 +433,11 @@ function walk(
   if (typeof value === "string") {
     if (banned.has(value)) return "[withheld]";
     let next = value;
-    for (const secret of banned) {
-      if (secret && next.includes(secret)) next = next.split(secret).join("[withheld]");
-    }
+    for (const secret of banned) next = replaceKnownSecret(next, secret);
     if (mode !== "echo-only") {
       next = redactLabeledSecretSpans(next);
       for (const generated of harvestSecretsFromText(next)) {
-        next = next.split(generated).join("[withheld]");
+        next = replaceKnownSecret(next, generated);
       }
     }
     return next;
@@ -374,7 +455,8 @@ function walk(
     if (value instanceof Date) return value;
     const record = value as Record<string, unknown>;
     if (options?.skipSystemRole && record.role === "system") {
-      return walkObject(record, banned, options, "echo-only");
+      // No-rewrite: system-role definition text is identity.
+      return value;
     }
     return walkObject(record, banned, options, mode);
   }
@@ -389,15 +471,16 @@ function walkObject(
 ): unknown {
   let changed = false;
   const entries = Object.entries(record).map(([key, item]) => {
+    if (options?.skipKeys?.has(key) || (mode === "request" && REQUEST_HARVEST_SKIP_KEYS.has(key))) {
+      // No-rewrite: definition trees stay byte-identical even when a known
+      // secret from messages also appears in system/tools/turn_context.
+      return [key, item];
+    }
     if (isStructuredSecretKey(key) && typeof item === "string" && isStructuredSecretValue(item)) {
       changed = true;
       return [key, "[withheld]"];
     }
-    const childMode =
-      options?.skipKeys?.has(key) || (mode === "request" && REQUEST_HARVEST_SKIP_KEYS.has(key))
-        ? "echo-only"
-        : mode;
-    const next = walk(item, banned, options, childMode);
+    const next = walk(item, banned, options, mode);
     if (next !== item) changed = true;
     return [key, next];
   });

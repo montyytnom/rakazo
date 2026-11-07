@@ -96,7 +96,9 @@ import {
   resolveTurnIntent,
   sameThreadIrreversibleOwner,
   sandboxCommandTimeoutMs,
+  createEvalTurnRecorder,
   deliverAssistantFinal,
+  deliverUserVisibleText,
   secretsFromPriorAssistantText,
   stripSecretEchoes,
   bindOutcomeArtifact,
@@ -4270,6 +4272,28 @@ export function createRunExecutor(deps: ExecutorDeps) {
 
         let assembled = "";
         let currentTextSegment = "";
+        const evalRecorder = createEvalTurnRecorder();
+        const turnToolResults: unknown[] = [];
+        const turnIntent = resolveTurnIntent(
+          { id: run.sourceMessageId, text: task.prompt },
+          history
+            .filter((message) => message.role === "user")
+            .map((message) => ({ id: message.id, text: message.content })),
+        );
+        const intentId = turnIntent.intentId;
+        const turnLedger = emptyCompletionLedger({
+          intentId,
+          sourceMessageId: turnIntent.sourceMessageId ?? "",
+          runId,
+        });
+        const deliverVisible = (text: string) =>
+          deliverUserVisibleText({
+            assembledRaw: text,
+            modelTurns: evalRecorder.snapshot(),
+            toolResults: turnToolResults,
+            ledger: turnLedger,
+            secrets: runSecrets,
+          });
         let messageSegments: MessageBlock[] = [];
         // Terminal subagent rows are published as their own messages (not appended to
         // messageSegments). Treat that like tool/step durable activity so we do not invent
@@ -4349,8 +4373,10 @@ export function createRunExecutor(deps: ExecutorDeps) {
         let progressRedactor = createStreamingRedactor(runSecrets);
         const scripted = deps.runtime.describe().capabilities.scripted;
         const script = scripted ? inferScript(task.prompt, takeoverResume?.checkpoint) : undefined;
-        const flushProgress = async () => {
+        const flushProgress = async (force = false) => {
           if (scripted || !pendingProgress || isBackgroundRunTrigger(run.trigger)) return;
+          if (!force && !endsSentence(pendingProgress)) return;
+          const safe = deliverVisible(pendingProgress);
           await deps.events.append({
             spaceId: run.spaceId,
             threadId: thread.id,
@@ -4360,8 +4386,8 @@ export function createRunExecutor(deps: ExecutorDeps) {
             // The first flush replaces the "working…" placeholder outright — a delta here
             // would otherwise get appended straight onto it with no separator.
             payload: hasStreamedText
-              ? { delta: pendingProgress, streaming: true }
-              : { text: pendingProgress, streaming: true },
+              ? { delta: safe, streaming: true }
+              : { text: safe, streaming: true },
           });
           hasStreamedText = true;
           pendingProgress = "";
@@ -4369,7 +4395,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
         };
         const publishMidTurnNarration = async () => {
           const extracted = extractNarrationText(messageSegments, currentTextSegment);
-          const narration = clampUserProgressMessage(redactSecrets(extracted.text, runSecrets));
+          const narration = clampUserProgressMessage(deliverVisible(extracted.text));
           const canPublish = canPublishDurableNarration();
           if (
             narration &&
@@ -4437,19 +4463,6 @@ export function createRunExecutor(deps: ExecutorDeps) {
         const consumedEffectIds = new Set<string>();
         const pageRefMemory = createRefMemory();
         const protectedResults = createProtectedResultStore();
-        const turnToolResults: unknown[] = [];
-        const turnIntent = resolveTurnIntent(
-          { id: run.sourceMessageId, text: task.prompt },
-          history
-            .filter((message) => message.role === "user")
-            .map((message) => ({ id: message.id, text: message.content })),
-        );
-        const intentId = turnIntent.intentId;
-        const turnLedger = emptyCompletionLedger({
-          intentId,
-          sourceMessageId: turnIntent.sourceMessageId ?? "",
-          runId,
-        });
         const nextMutatingEffectOccurrence = (toolName: string, args: Record<string, unknown>) => {
           const fingerprint = toolEffectIdempotencyKey(runId, toolName, args);
           const occurrence = mutatingEffectOccurrences.get(fingerprint) ?? 0;
@@ -6959,12 +6972,12 @@ export function createRunExecutor(deps: ExecutorDeps) {
             });
           }
           if (name === "message_user") {
-            const rawMessage = redactSecrets(String(args.message ?? ""), runSecrets);
+            const rawMessage = deliverVisible(String(args.message ?? ""));
             const maxLength = messageUserMaxLength();
             const text = clampUserProgressMessage(rawMessage, maxLength);
             if (!text) return finish({ error: "message is required" });
             const truncated = isProgressMessageTruncated(rawMessage, maxLength);
-            await flushProgress();
+            await flushProgress(true);
             await publishMidTurnNarration();
             if (!canPublishDurableProgress()) {
               return finish({
@@ -7257,7 +7270,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
           if (!runSecrets.includes(secret)) runSecrets.push(secret);
         }
         const runtimeHistory = [...historicalContext, ...historyWithImages].map((message) =>
-          typeof message.content === "string"
+          typeof message.content === "string" && message.role !== "system"
             ? { ...message, content: stripSecretEchoes(message.content, runSecrets).text }
             : message,
         );
@@ -7569,10 +7582,12 @@ export function createRunExecutor(deps: ExecutorDeps) {
             // Check complete assistant turns so split sentinel chunks are recognized
             // without treating a partial identifier (NO_RESPONSE_POLICY) as silence.
             if (event.type === "tool" || event.type === "takeover") {
+              evalRecorder.finish("");
               recordExplicitNoResponse(assistantTurnText);
               assistantTurnText = "";
             }
             if (event.type === "text") {
+              evalRecorder.chunk(event.text);
               assistantTurnText += event.text;
               if (assistantTurnBreakPending && event.text) {
                 assistantTurnBreakPending = false;
@@ -7598,16 +7613,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
               // Flush batched text deltas first so an activity line cannot land
               // ahead of text the model streamed before the tool call.
               if (pendingProgress) {
-                await deps.events.append({
-                  spaceId: run.spaceId,
-                  threadId: thread.id,
-                  botId: bot.id,
-                  type: "thread.progress",
-                  runId,
-                  payload: { delta: pendingProgress, streaming: true },
-                });
-                pendingProgress = "";
-                lastProgressAt = Date.now();
+                await flushProgress(true);
               }
               await deps.events.append({
                 spaceId: run.spaceId,
@@ -7616,7 +7622,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
                 type: "thread.progress",
                 runId,
                 payload: {
-                  text: redactSecrets(event.text, runSecrets),
+                  text: deliverVisible(event.text),
                   ...(event.activity ? { activity: true } : {}),
                 },
               });
@@ -7664,12 +7670,12 @@ export function createRunExecutor(deps: ExecutorDeps) {
               if (!(await renewRunLease(deps, runId, workerId, fence))) return;
               // The user takes over the computer's screen, so it must be up before the run waits.
               await runComputer.get();
-              const safeReason = redactSecrets(event.reason, runSecrets);
+              const safeReason = deliverVisible(event.reason);
               // Publish pending narration as tagged mid-turn progress so reconciliation
               // does not treat pre-takeover text as the delegated final result.
               await publishMidTurnNarration();
               if (assembled.trim()) {
-                const narration = clampUserProgressMessage(redactSecrets(assembled, runSecrets));
+                const narration = clampUserProgressMessage(deliverVisible(assembled));
                 if (narration && canPublishDurableNarration()) {
                   await publishMessage(
                     deps,
@@ -7724,7 +7730,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
             } else if (event.type === "tool") {
               // Preserve event ordering when the throttle still holds recent narration: the
               // client must see that text before the tool call it describes.
-              await flushProgress();
+              await flushProgress(true);
               // Promote streamed narration into a durable, replyable chat message before
               // tools continue, so long turns do not look stalled and stay replyable.
               if (event.name !== "message_user") {
@@ -7748,7 +7754,16 @@ export function createRunExecutor(deps: ExecutorDeps) {
                 flushPendingTools();
                 if (!(await renewRunLease(deps, runId, workerId, fence))) return;
                 if (messageSegments.length > 0) {
-                  await publishMessage(deps, run, "bot", redactBlocks(messageSegments, runSecrets));
+                  await publishMessage(
+                    deps,
+                    run,
+                    "bot",
+                    redactBlocks(messageSegments, runSecrets).map((block) =>
+                      block.kind === "text"
+                        ? { ...block, text: deliverVisible(block.text) }
+                        : block,
+                    ),
+                  );
                 }
                 await workspaceCheckpoint.flush();
                 terminalCheckpointComplete = true;
@@ -7892,6 +7907,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
                 operationId: runId,
               });
             } else if (event.type === "done") {
+              evalRecorder.finishOrDone(event.text ?? "");
               recordExplicitNoResponse(event.text ?? "");
               if (!assembled && event.text) {
                 if (publishedMidTurnUserMessage || discardedMidTurnNarration) {
@@ -7911,7 +7927,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
           if (approvalPausePending || !leaseValid) return;
           approvedEffectReplays.assertDrained();
           pendingProgress += progressRedactor.finish();
-          await flushProgress();
+          await flushProgress(true);
 
           for (const turn of script ?? []) {
             for (const file of turn.files ?? []) {
@@ -8001,7 +8017,8 @@ export function createRunExecutor(deps: ExecutorDeps) {
                 return {
                   ...block,
                   text: deliverAssistantFinal({
-                    rawText: block.text,
+                    assembledRaw: block.text,
+                    modelTurns: evalRecorder.snapshot(),
                     toolResults: turnToolResults,
                     ledger: turnLedger,
                     secrets: [...runSecrets, ...priorSecrets],
@@ -8013,7 +8030,8 @@ export function createRunExecutor(deps: ExecutorDeps) {
             : redactSecrets(
                 completionNotificationBody(
                   deliverAssistantFinal({
-                    rawText: silentReply.assembled,
+                    assembledRaw: silentReply.assembled,
+                    modelTurns: evalRecorder.snapshot(),
                     toolResults: turnToolResults,
                     ledger: turnLedger,
                     secrets: [...runSecrets, ...priorSecrets],
