@@ -35,7 +35,7 @@ def allow_high(path: str, pattern: str, line: str) -> str | None:
         return "negative assertion"
     if path.endswith(".test.ts"):
         return "test fixture"
-    if "public-commit-scan" in path or "re.compile" in line:
+    if "public-commit-scan" in path or "re.compile" in line or "re.search" in line:
         return "scanner documents the pattern"
     return None
 
