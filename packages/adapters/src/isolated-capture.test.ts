@@ -10,6 +10,7 @@ import {
   CAPTURE_CLOCK_DEFAULT,
   CAPTURE_DEFAULT_DISABLED_TOOLS,
   CAPTURE_MODEL_ID,
+  classifyCapturePhase,
   captureCompactionPass,
   captureContextStrategy,
   captureDisabledBuiltinTools,
@@ -18,7 +19,14 @@ import {
   capturePhaseTurn,
   collectProvenance,
   deriveProductionModelMetadata,
+  ERROR_GUARD_PREFIX,
+  GUARD_HALT_MARK,
+  IDENTICAL_TOOL_ERROR,
+  identicalToolErrorCount,
   ISOLATED_CAPTURE_KIND,
+  LOOP_GUARD_PREFIX,
+  LOOP_GUARD_WARN_MARK,
+  loopGuardSignals,
   offeredToolsFromDeployedBuilder,
   pinPiAiVersion,
   pinToolCallGuardHash,
@@ -30,18 +38,66 @@ import {
   secretStoreCapabilityReport,
   VOLATILE_FIELDS,
 } from "./isolated-capture.js";
-import * as piRuntime from "./pi-runtime.js";
 
 process.env.RAKAZO_ASSIST_DEFAULT_DISABLED_TOOLS ??= CAPTURE_DEFAULT_DISABLED_TOOLS;
 process.env.RAKAZO_DEFAULT_TIMEZONE ??= "America/New_York";
 process.env.RAKAZO_GUARD_FINAL_SUMMARY ??= "1";
 delete process.env.ISOLATED_CAPTURE_CONTEXT_STRATEGY;
 
-const overlaySameErrorGuard =
-  typeof (piRuntime as { assistErrorGuardObserve?: unknown }).assistErrorGuardObserve ===
-  "function";
-
 describe("isolated capture harness", () => {
+  it("classifies LOOP GUARD warn/halt and does not treat halt-with-tools as tool-free", () => {
+    const warnBody = {
+      tools: [{ function: { name: "browser_act" } }],
+      messages: [
+        {
+          role: "tool",
+          content: `${LOOP_GUARD_PREFIX}: click had no effect 3 times. ${LOOP_GUARD_WARN_MARK}`,
+        },
+      ],
+    };
+    const haltBody = {
+      tools: [{ function: { name: "browser_act" } }, { function: { name: "browser_snapshot" } }],
+      messages: [
+        {
+          role: "tool",
+          content: `${LOOP_GUARD_PREFIX}: click had no effect 4 times. ${GUARD_HALT_MARK}`,
+        },
+      ],
+    };
+    const toolFree = { tools: [], messages: [{ role: "user", content: "summary" }] };
+    expect(classifyCapturePhase("phases", 5, warnBody)).toBe("guard-warning");
+    expect(classifyCapturePhase("phases", 6, haltBody)).toBe("guard-halt");
+    expect(classifyCapturePhase("phases", 7, toolFree)).toBe("guard-final");
+    expect(classifyCapturePhase("phases", 6, haltBody) === "guard-final").toBe(false);
+    const errorOnly = {
+      tools: [{ function: { name: "browser_act" } }],
+      messages: [{ role: "tool", content: `${ERROR_GUARD_PREFIX}: ignored` }],
+    };
+    expect(classifyCapturePhase("phases", 5, errorOnly)).toBe("turn-5");
+    const login = IDENTICAL_TOOL_ERROR.error;
+    const bodies = [
+      { tools: [{ function: { name: "browser_act" } }], messages: [{ role: "tool", content: login }] },
+      {
+        tools: [{ function: { name: "browser_act" } }],
+        messages: [{ role: "tool", content: login }],
+      },
+      {
+        tools: [{ function: { name: "browser_act" } }],
+        messages: [{ role: "tool", content: login }],
+      },
+      {
+        tools: [{ function: { name: "browser_act" } }],
+        messages: [{ role: "tool", content: login }],
+      },
+      { tools: [], messages: [{ role: "user", content: "runtidy" }] },
+    ];
+    expect(identicalToolErrorCount(bodies)).toBe(4);
+    expect(loopGuardSignals([warnBody]).warning).toBe(true);
+    expect(loopGuardSignals([haltBody]).halt).toBe(true);
+    expect(loopGuardSignals([errorOnly]).errorGuard).toBe(true);
+    expect(loopGuardSignals([warnBody, haltBody]).errorGuard).toBe(false);
+  });
+
   it("uses the code-default retrieval strategy and merged env disabled tools", async () => {
     expect(captureContextStrategy().value).toBe("retrieval");
     expect(captureContextStrategy().source).toMatch(/DEFAULT_CONTEXT_STRATEGY/);
@@ -96,15 +152,16 @@ describe("isolated capture harness", () => {
     expect(result.captures[0]!.phase).toBe("first");
     expect(result.captures.some((row) => row.phase === "postbrowser")).toBe(true);
     expect(result.captures[0]!.stubSseByteLength).toBeGreaterThan(0);
-    if (overlaySameErrorGuard) {
+    const hay = result.parsedBodies.map((body) => JSON.stringify(body ?? {})).join("\n");
+    // HEAD runtime has no loop-guard. Overlay 4-act+stop warns/halts but still advertises tools;
+    // tool-free final is overlay-guard-final.entry.test.ts via the post-halt execute path.
+    if (hay.includes(LOOP_GUARD_PREFIX)) {
       expect(result.guardWarning).toBe(true);
       expect(result.guardHalt).toBe(true);
-      expect(result.guardFinalToolFree).toBe(true);
       expect(result.captures.some((row) => row.phase === "guard-warning")).toBe(true);
       expect(result.captures.some((row) => row.phase === "guard-halt")).toBe(true);
-      const guardFinal = result.captures.find((row) => row.phase === "guard-final");
-      expect(guardFinal?.toolNames ?? ["x"]).toEqual([]);
     }
+    expect(hay.includes(ERROR_GUARD_PREFIX)).toBe(false);
     const inventory = await offeredToolsFromDeployedBuilder();
     expect(result.offeredToolNames).toEqual(inventory.tools.map((tool) => tool.name));
     expect([...result.captures[0]!.toolNames].sort()).toEqual(
@@ -210,11 +267,7 @@ describe("isolated capture harness", () => {
     expect(paths.pruningDistinctNavigate).toBe(4);
     expect(paths.pruningStaleNote).toBe(true);
     expect(paths.compactionInvoked).toBe(true);
-    if (overlaySameErrorGuard) {
-      expect(paths.guardWarning).toBe(true);
-      expect(paths.guardHalt).toBe(true);
-      expect(paths.guardFinalToolFree).toBe(true);
-    }
+    expect(manifest).not.toContain("historical-unverified.md");
     expect(manifest).toContain("compaction/invoked.json");
     expect(summary.blocks.map((block) => block.name)).toEqual([
       "baseComputerInstruction",

@@ -857,17 +857,34 @@ function lastToolResultNames(body: Record<string, unknown> | null): string[] {
   return messageToolCalls(assistant).map((call) => call.name);
 }
 
-function classifyPhase(
+export const LOOP_GUARD_PREFIX = "LOOP GUARD";
+export const ERROR_GUARD_PREFIX = "ERROR GUARD";
+export const GUARD_HALT_MARK = "Tools are now stopped";
+export const LOOP_GUARD_WARN_MARK = "STOP repeating these actions";
+export const ERROR_GUARD_WARN_MARK = "One more identical failure";
+export const ERROR_GUARD_DESKTOP_WARN_MARK = "One more desktop failure";
+
+export function classifyCapturePhase(
   caseName: string,
   seq: number,
   parsed: Record<string, unknown> | null,
 ): string {
-  if (caseName !== "phases") return caseName;
+  if (caseName !== "phases" && caseName !== "guard-orchestration") return caseName;
   const tools = Array.isArray(parsed?.tools) ? parsed.tools : [];
   const hay = JSON.stringify(parsed ?? {});
+  // Tool-free is the runtidy request only. Halt text can still advertise tools.
   if (tools.length === 0) return "guard-final";
-  if (hay.includes("ERROR GUARD") && hay.includes("Tools are now stopped")) return "guard-halt";
-  if (hay.includes("ERROR GUARD") && hay.includes("One more identical failure")) {
+  if (
+    (hay.includes(LOOP_GUARD_PREFIX) || hay.includes(ERROR_GUARD_PREFIX)) &&
+    hay.includes(GUARD_HALT_MARK)
+  ) {
+    return "guard-halt";
+  }
+  if (
+    (hay.includes(LOOP_GUARD_PREFIX) && hay.includes(LOOP_GUARD_WARN_MARK)) ||
+    (hay.includes(ERROR_GUARD_PREFIX) &&
+      (hay.includes(ERROR_GUARD_WARN_MARK) || hay.includes(ERROR_GUARD_DESKTOP_WARN_MARK)))
+  ) {
     return "guard-warning";
   }
   const lastTools = lastToolResultNames(parsed);
@@ -976,7 +993,6 @@ export async function startCaptureStub(options: {
         parsed = null;
       }
       parsedBodies.push(parsed);
-      const phase = classifyPhase(options.caseName, seq, parsed);
       const reply = options.replies[seq];
       let stubSse: string | undefined;
       if (reply?.kind === "sse") {
@@ -986,7 +1002,7 @@ export async function startCaptureStub(options: {
       captures.push({
         seq,
         caseName: options.caseName,
-        phase,
+        phase: classifyCapturePhase(options.caseName, seq, parsed),
         method: request.method ?? "POST",
         url: request.url ?? "",
         nonAuthHeaders: nonAuthHeaders(request),
@@ -1080,11 +1096,15 @@ function executeSyntheticTool(
   return { ok: true, synthetic: true, tool: name };
 }
 
-function messageToolCalls(message: Record<string, unknown>): Array<{ name: string; args: unknown }> {
+function messageToolCalls(
+  message: Record<string, unknown>,
+): Array<{ id?: string; name: string; args: unknown }> {
   const calls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
   return calls.flatMap((call) => {
     if (!call || typeof call !== "object") return [];
-    const fn = (call as { function?: { name?: string; arguments?: unknown } }).function;
+    const fn = (call as { id?: unknown; function?: { name?: string; arguments?: unknown } })
+      .function;
+    const id = (call as { id?: unknown }).id;
     if (!fn?.name) return [];
     let args: unknown = fn.arguments;
     if (typeof args === "string") {
@@ -1094,38 +1114,183 @@ function messageToolCalls(message: Record<string, unknown>): Array<{ name: strin
         args = fn.arguments;
       }
     }
-    return [{ name: fn.name, args }];
+    return [
+      {
+        ...(typeof id === "string" ? { id } : {}),
+        name: fn.name,
+        args,
+      },
+    ];
   });
 }
 
-function identicalToolErrorCount(bodies: Array<Record<string, unknown> | null>): number {
-  const needle = IDENTICAL_TOOL_ERROR.error;
+function toolsBearingBodies(
+  bodies: Array<Record<string, unknown> | null>,
+): Array<Record<string, unknown>> {
+  return bodies.filter((body): body is Record<string, unknown> => {
+    if (!body || typeof body !== "object") return false;
+    return Array.isArray(body.tools) && body.tools.length > 0;
+  });
+}
+
+export function identicalToolErrorCount(bodies: Array<Record<string, unknown> | null>): number {
+  // Overlay Pi often sends only the latest tool result per HTTP body. Count each
+  // tools-bearing request whose latest tool message is the identical LOGIN_GUARD error.
   let count = 0;
-  for (const body of bodies) {
-    const text = JSON.stringify(body ?? {});
-    const matches = text.split(needle).length - 1;
-    if (matches > count) count = matches;
+  for (const body of toolsBearingBodies(bodies)) {
+    const messages = Array.isArray(body.messages) ? body.messages : [];
+    const lastTool = [...messages]
+      .reverse()
+      .find((message) => message && typeof message === "object" && message.role === "tool");
+    const text =
+      lastTool && typeof lastTool === "object" ? String((lastTool as { content?: unknown }).content ?? "") : "";
+    if (text.includes(IDENTICAL_TOOL_ERROR.error)) count += 1;
   }
   return count;
 }
 
+export function loopGuardSignals(bodies: Array<Record<string, unknown> | null>): {
+  warning: boolean;
+  halt: boolean;
+  errorGuard: boolean;
+} {
+  let warning = false;
+  let halt = false;
+  let errorGuard = false;
+  for (const body of bodies) {
+    const hay = JSON.stringify(body ?? {});
+    if (hay.includes(ERROR_GUARD_PREFIX)) errorGuard = true;
+    if (hay.includes(LOOP_GUARD_PREFIX) && hay.includes(LOOP_GUARD_WARN_MARK)) warning = true;
+    if (
+      hay.includes(ERROR_GUARD_PREFIX) &&
+      (hay.includes(ERROR_GUARD_WARN_MARK) || hay.includes(ERROR_GUARD_DESKTOP_WARN_MARK))
+    ) {
+      warning = true;
+    }
+    if (
+      (hay.includes(LOOP_GUARD_PREFIX) || hay.includes(ERROR_GUARD_PREFIX)) &&
+      hay.includes(GUARD_HALT_MARK)
+    ) {
+      halt = true;
+    }
+  }
+  return { warning, halt, errorGuard };
+}
+
 function validBrowserActCallCount(bodies: Array<Record<string, unknown> | null>): number {
-  let count = 0;
+  const ids = new Set<string>();
   for (const body of bodies) {
     const messages = Array.isArray(body?.messages) ? body.messages : [];
-    let inBody = 0;
     for (const message of messages) {
       if (!message || typeof message !== "object") continue;
       if ((message as { role?: string }).role !== "assistant") continue;
       for (const call of messageToolCalls(message as Record<string, unknown>)) {
         if (call.name !== "browser_act") continue;
         const args = call.args as { actions?: Array<{ kind?: string; ref?: string }> } | null;
-        if (args?.actions?.[0]?.kind === "click" && args.actions[0]?.ref === "e1") inBody += 1;
+        if (args?.actions?.[0]?.kind !== "click" || args.actions[0]?.ref !== "e1") continue;
+        ids.add(call.id ?? `${ids.size}:${JSON.stringify(call.args)}`);
       }
     }
-    if (inBody > count) count = inBody;
   }
-  return count;
+  return ids.size;
+}
+
+export const GUARD_ORCHESTRATION_TOOL: ConnectorTool = {
+  name: "browser_act",
+  description: "synthetic page act for loop-guard orchestration",
+  inputSchema: {
+    type: "object",
+    properties: {
+      actions: { type: "array", items: { type: "object" } },
+    },
+  },
+};
+
+export type GuardOrchestrationResult = {
+  captures: CapturedHttp[];
+  parsedBodies: Array<Record<string, unknown> | null>;
+  identicalToolErrors: number;
+  validBrowserActCalls: number;
+  guardWarning: boolean;
+  guardHalt: boolean;
+  errorGuardPresent: boolean;
+  haltAdvertisesTools: boolean;
+  guardFinalToolFree: boolean;
+};
+
+export async function captureLoopGuardOrchestration(options: {
+  runtime: PiAgentRuntime;
+  runId: string;
+  extraIgnoredHaltCall: boolean;
+}): Promise<GuardOrchestrationResult> {
+  process.env.RAKAZO_GUARD_FINAL_SUMMARY ??= "1";
+  const meta = loadCaptureModelMetadata();
+  const actReplies: StubReply[] = [1, 2, 3, 4].map((index) => ({
+    kind: "sse",
+    finish: "tool_calls",
+    events: toolCallDelta(
+      `call_guard_act_${index}`,
+      "browser_act",
+      VALID_BROWSER_ACT_ARGS as unknown as Record<string, unknown>,
+    ),
+  }));
+  if (options.extraIgnoredHaltCall) {
+    actReplies.push({
+      kind: "sse",
+      finish: "tool_calls",
+      events: toolCallDelta(
+        "call_guard_act_ignored_halt",
+        "browser_act",
+        VALID_BROWSER_ACT_ARGS as unknown as Record<string, unknown>,
+      ),
+    });
+  }
+  const stub = await startCaptureStub({
+    modelId: meta.id,
+    caseName: "guard-orchestration",
+    replies: [
+      ...actReplies,
+      {
+        kind: "sse",
+        finish: "stop",
+        events: [{ content: "guard-orchestration-stop" }],
+      },
+      ...extraStopReplies(8),
+    ],
+  });
+  try {
+    await drainRuntime(options.runtime, {
+      botId: "bot-guard-orchestration",
+      threadId: "thread-guard-orchestration",
+      runId: options.runId,
+      prompt: "Synthetic loop-guard orchestration. No live accounts or browsing.",
+      instructions: "Follow tool results. Do not invent side effects.",
+      history: [],
+      tools: [GUARD_ORCHESTRATION_TOOL],
+      contextStrategy: "retrieval",
+      allowSilentEmpty: true,
+      model: captureRunModel(stub.baseUrl),
+      executeTool: async (name, args) =>
+        executeSyntheticTool(name, args as Record<string, unknown>, { value: 0 }),
+    });
+    const signals = loopGuardSignals(stub.parsedBodies);
+    const haltCapture = stub.captures.find((row) => row.phase === "guard-halt");
+    return {
+      captures: stub.captures,
+      parsedBodies: stub.parsedBodies,
+      identicalToolErrors: identicalToolErrorCount(stub.parsedBodies),
+      validBrowserActCalls: validBrowserActCallCount(stub.parsedBodies),
+      guardWarning: signals.warning,
+      guardHalt: signals.halt,
+      errorGuardPresent: signals.errorGuard,
+      haltAdvertisesTools: Boolean(haltCapture && haltCapture.toolNames.length > 0),
+      guardFinalToolFree: stub.captures.some(
+        (capture) => capture.phase === "guard-final" && capture.toolNames.length === 0,
+      ),
+    };
+  } finally {
+    await stub.close();
+  }
 }
 
 export async function capturePhaseTurn(service: string): Promise<{
@@ -1226,8 +1391,9 @@ export async function capturePhaseTurn(service: string): Promise<{
         capture.phase === "thinking-reenable" &&
         capture.sampling.included.enable_thinking === true,
     );
-    const guardWarning = stub.captures.some((capture) => capture.phase === "guard-warning");
-    const guardHalt = stub.captures.some((capture) => capture.phase === "guard-halt");
+    const signals = loopGuardSignals(stub.parsedBodies);
+    const guardWarning = signals.warning;
+    const guardHalt = signals.halt;
     const guardFinalToolFree = stub.captures.some(
       (capture) => capture.phase === "guard-final" && capture.toolNames.length === 0,
     );
@@ -2086,18 +2252,6 @@ export async function runIsolatedCapture(options: {
     join(outDir, "volatile-fields.json"),
     `${JSON.stringify({ fields: VOLATILE_FIELDS }, null, 2)}\n`,
   );
-  writeFileSync(
-    join(outDir, "historical-unverified.md"),
-    [
-      "# Historical exact requests (not a baseline blocker)",
-      "",
-      "Production raw request bytes from prior live turns are unavailable in this checkout.",
-      "Deployed-code synthetic capture is the accepted baseline.",
-      "This file is an unverified explanation, not a capture artifact to byte-diff.",
-      "",
-    ].join("\n"),
-  );
-
   const hashManifest: Record<string, string> = {};
   hashTree(outDir, outDir, hashManifest);
   writeFileSync(join(outDir, "HASHMANIFEST.tsv"), renderManifest(hashManifest));
