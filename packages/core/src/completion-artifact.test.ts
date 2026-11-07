@@ -30,6 +30,19 @@ describe("completion artifacts", () => {
     expect(headlineAllowsDone(collectToolEvidence([{ ok: true }]))).toBe(false);
   });
 
+  it("strips a done/complete claim without verified or delivered artifact evidence", () => {
+    const unsupported = collectToolEvidence([{ error: "unsupported computer action", ok: false }]);
+    expect(headlineAllowsDone(unsupported)).toBe(false);
+    expect(unsupportedClaims("Done", unsupported)).toContain("success-without-artifact");
+    expect(sanitizeFinalText("Done", unsupported)).toBe("Outcome was not verified.");
+    expect(sanitizeFinalText("Reset complete.", collectToolEvidence([{ ok: true }]))).toBe(
+      "Outcome was not verified.",
+    );
+    expect(
+      sanitizeFinalText("Done", collectToolEvidence([{ sent: true, state: "Delivered" }])),
+    ).toBe("Done");
+  });
+
   it("does not treat a credit limit as a payment", () => {
     const evidence = collectToolEvidence([
       { text: "Credit limit $17,000.00. ACH PAYMENT -$4,245.52." },

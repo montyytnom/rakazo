@@ -49,6 +49,44 @@ const afterApiBotSecrets = path.join(
   composeOut,
   "api/after/packages/adapters/src/bot-secrets.ts",
 );
+const beforeApiExecutor = path.join(
+  composeOut,
+  "api/before/packages/adapters/src/executor.ts",
+);
+const afterApiExecutor = path.join(
+  composeOut,
+  "api/after/packages/adapters/src/executor.ts",
+);
+
+const CURRENT_SECRET_SENTINEL = "Cur#Rpr7xQ2mN9kL";
+const STALE_SECRET_SENTINEL = "Old#Stl4pW8vB3yH";
+
+function opaqueSecretStore() {
+  return {
+    describe: () => ({
+      id: "opaque-test",
+      contractVersion: "1",
+      adapterVersion: "1",
+      capabilities: { rotate: false },
+    }),
+    put: vi.fn(async (plaintext: string) => {
+      expect(plaintext).toContain(CURRENT_SECRET_SENTINEL);
+      return { id: "rec-1", ref: "opaque:v1:test", ciphertext: "opaque-ciphertext" };
+    }),
+    load: vi.fn(async () => {
+      throw new Error("opaque store load is not model-visible");
+    }),
+    delete: vi.fn(async () => undefined),
+    redact: (value: string) => value,
+    onChange: () => () => undefined,
+    start: async () => undefined,
+    close: async () => undefined,
+  };
+}
+
+function dump(value: unknown): string {
+  return JSON.stringify(value);
+}
 
 function missingOverlay(): string[] {
   const required = [
@@ -121,11 +159,19 @@ function harness(
     connectorExecute?: () => AsyncGenerator<unknown>;
     effects?: Effect[];
     secretStore?: unknown;
+    finalText?: string;
+    history?: Array<{
+      id: string;
+      role: "user" | "bot";
+      seq: number;
+      blocks: Array<{ kind: string; text: string }>;
+    }>;
   },
 ) {
   const effects: Effect[] = options.effects ?? [];
   let executeCount = 0;
   const results: unknown[] = [];
+  const finalized: Array<{ blocks?: unknown; outcome?: string }> = [];
   const run = {
     id: options.runId,
     botId: "bot-1",
@@ -235,6 +281,19 @@ function harness(
           replyTo: null,
           blocks: [{ kind: "text", text: "Text Pat: running late" }],
         },
+        ...(options.history ?? []).map((row) => ({
+          id: row.id,
+          threadId: "thread-1",
+          role: row.role,
+          seq: row.seq,
+          botId: row.role === "bot" ? "bot-1" : null,
+          runId: row.role === "bot" ? "run-prior" : null,
+          createdAt: new Date("2026-11-06T00:00:00.000Z"),
+          replyToMessageId: null,
+          replyQuote: null,
+          replyTo: null,
+          blocks: row.blocks,
+        })),
       ]),
       findUnique: vi.fn(async () => ({
         id: options.sourceMessageId,
@@ -335,7 +394,9 @@ function harness(
       const result = await request.executeTool!(call.name, call.args, call.executionId);
       results.push(result);
     }
-    yield { type: "done" as const, text: "Done" };
+    const finalText = options.finalText ?? "Done";
+    if (finalText) yield { type: "text" as const, text: finalText };
+    yield { type: "done" as const, text: finalText };
   });
   const executor = createRunExecutor({
     prisma: prisma as never,
@@ -377,7 +438,10 @@ function harness(
       append: vi.fn(async () => undefined),
       notify: vi.fn(async () => undefined),
       pauseRunForInput: vi.fn(async () => true),
-      finalizeRun: vi.fn(async () => ({ continuationRunId: null })),
+      finalizeRun: vi.fn(async (input: { blocks?: unknown; outcome?: string }) => {
+        finalized.push(input);
+        return { continuationRunId: null };
+      }),
     },
     jobs: { enqueue: vi.fn(async () => undefined) },
     secrets: [],
@@ -387,6 +451,7 @@ function harness(
   return {
     effects,
     results,
+    finalized,
     run,
     executeCount: () => executeCount,
     setCalls(next: typeof calls) {
@@ -404,7 +469,7 @@ function harness(
   };
 }
 
-describe("overlay compose + orchestration entry path", () => {
+describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () => {
   const missing = missingOverlay();
 
   it("has the supplied overlay archive required to compose production-effective trees", () => {
@@ -440,7 +505,7 @@ describe("overlay compose + orchestration entry path", () => {
     if (api.status !== 0) {
       throw new Error(`api compose failed (${api.status}):\n${api.stdout}\n${api.stderr}`);
     }
-  });
+  }, 180_000);
 
   it("fail-before: unpatched overlay send is run-scoped, not irr:v1", async () => {
     if (missing.length) return;
@@ -939,5 +1004,195 @@ describe("overlay compose + orchestration entry path", () => {
     expect(act.fallback).toBeUndefined();
     expect(act.error).toMatch(/LOGIN_GUARD refused/);
     expect(typeof provider.focused).toBe("undefined");
+  });
+
+  it("fail-before: overlay executor persists current generated password in the final reply", async () => {
+    if (missing.length) return;
+    const createRunExecutor = await loadExecutor(beforeExecutor);
+    const f = harness(createRunExecutor, {
+      runId: "run-echo-current-before",
+      prompt: "Save the generated password",
+      sourceMessageId: "msg-1",
+      graphical: false,
+      finalText: `Reset complete. New password: ${CURRENT_SECRET_SENTINEL}`,
+    });
+    f.setCalls([
+      {
+        name: "scratchpad_add",
+        args: { title: `New password: ${CURRENT_SECRET_SENTINEL}` },
+        executionId: "call-echo-current-b",
+      },
+    ]);
+    await f.runTurn("run-echo-current-before");
+    expect(dump(f.results)).toContain(CURRENT_SECRET_SENTINEL);
+    expect(dump(f.finalized)).toContain(CURRENT_SECRET_SENTINEL);
+  });
+
+  it("fail-before: overlay executor persists a stale prior password in the final reply", async () => {
+    if (missing.length) return;
+    const createRunExecutor = await loadExecutor(beforeExecutor);
+    const f = harness(createRunExecutor, {
+      runId: "run-echo-stale-before",
+      prompt: "Continue the reset",
+      sourceMessageId: "msg-1",
+      graphical: false,
+      finalText: `Done. Old password: ${STALE_SECRET_SENTINEL}`,
+      history: [
+        {
+          id: "msg-prior",
+          role: "bot",
+          seq: 1,
+          blocks: [{ kind: "text", text: `Temporary password: ${STALE_SECRET_SENTINEL}` }],
+        },
+      ],
+    });
+    await f.runTurn("run-echo-stale-before");
+    expect(dump(f.finalized)).toContain(STALE_SECRET_SENTINEL);
+  });
+
+  it("fail-before: overlay executor persists Done without an artifact-backed evidence ledger", async () => {
+    if (missing.length) return;
+    const createRunExecutor = await loadExecutor(beforeExecutor);
+    const f = harness(createRunExecutor, {
+      runId: "run-false-done-before",
+      prompt: "Finish the reset",
+      sourceMessageId: "msg-1",
+      graphical: false,
+      finalText: "Done",
+    });
+    await f.runTurn("run-false-done-before");
+    expect(dump(f.finalized)).toMatch(/\bDone\b/);
+    expect(dump(f.finalized)).not.toMatch(/not verified/i);
+  });
+
+  it("pass-after: overlay executor never persists current or stale secrets and does not claim Done without evidence", async () => {
+    if (missing.length) return;
+    const createRunExecutor = await loadExecutor(afterExecutor);
+    const secretStore = opaqueSecretStore();
+    const f = harness(createRunExecutor, {
+      runId: "run-echo-after",
+      prompt: "Save the generated password",
+      sourceMessageId: "msg-1",
+      graphical: false,
+      secretStore,
+      finalText: `Done. New password: ${CURRENT_SECRET_SENTINEL}. Old password: ${STALE_SECRET_SENTINEL}`,
+      history: [
+        {
+          id: "msg-prior",
+          role: "bot",
+          seq: 1,
+          blocks: [{ kind: "text", text: `Old password: ${STALE_SECRET_SENTINEL}` }],
+        },
+      ],
+    });
+    f.setCalls([
+      {
+        name: "scratchpad_add",
+        args: { title: `New password: ${CURRENT_SECRET_SENTINEL}` },
+        executionId: "call-echo-after",
+      },
+    ]);
+    await f.runTurn("run-echo-after");
+    const visible = dump({
+      results: f.results,
+      effects: f.effects.map((effect) => effect.result),
+      finalized: f.finalized,
+    });
+    expect(f.finalized.length, visible).toBeGreaterThan(0);
+    expect(visible).not.toContain(CURRENT_SECRET_SENTINEL);
+    expect(visible).not.toContain(STALE_SECRET_SENTINEL);
+    expect(dump(f.results)).toContain("Protected result");
+    expect(dump(f.effects.map((effect) => effect.result))).toContain("protectedVaultRef");
+    expect(dump(f.finalized)).not.toMatch(/\bDone\b/);
+  });
+
+  it("pass-after: overlay executor refuses Done without an artifact-backed evidence ledger", async () => {
+    if (missing.length) return;
+    const createRunExecutor = await loadExecutor(afterExecutor);
+    const f = harness(createRunExecutor, {
+      runId: "run-false-done-after",
+      prompt: "Finish the reset",
+      sourceMessageId: "msg-1",
+      graphical: false,
+      finalText: "Done",
+    });
+    await f.runTurn("run-false-done-after");
+    expect(dump(f.finalized)).not.toMatch(/\bDone\b/);
+    expect(dump(f.finalized)).toMatch(/not verified/i);
+  });
+
+  it("fail-before: api overlay executor also persists current generated password in the final reply", async () => {
+    if (missing.length) return;
+    const createRunExecutor = await loadExecutor(beforeApiExecutor);
+    const f = harness(createRunExecutor, {
+      runId: "run-api-echo-before",
+      prompt: "Save the generated password",
+      sourceMessageId: "msg-1",
+      graphical: false,
+      finalText: `Reset complete. New password: ${CURRENT_SECRET_SENTINEL}`,
+    });
+    f.setCalls([
+      {
+        name: "scratchpad_add",
+        args: { title: `New password: ${CURRENT_SECRET_SENTINEL}` },
+        executionId: "call-api-echo-b",
+      },
+    ]);
+    await f.runTurn("run-api-echo-before");
+    expect(dump(f.finalized)).toContain(CURRENT_SECRET_SENTINEL);
+  });
+
+  it("pass-after: api overlay executor withholds current and stale secrets and refuses unsupported Done", async () => {
+    if (missing.length) return;
+    const createRunExecutor = await loadExecutor(afterApiExecutor);
+    const secretStore = opaqueSecretStore();
+    const f = harness(createRunExecutor, {
+      runId: "run-api-echo-after",
+      prompt: "Save the generated password",
+      sourceMessageId: "msg-1",
+      graphical: false,
+      secretStore,
+      finalText: `Done. New password: ${CURRENT_SECRET_SENTINEL}. Old password: ${STALE_SECRET_SENTINEL}`,
+      history: [
+        {
+          id: "msg-prior",
+          role: "bot",
+          seq: 1,
+          blocks: [{ kind: "text", text: `Old password: ${STALE_SECRET_SENTINEL}` }],
+        },
+      ],
+    });
+    f.setCalls([
+      {
+        name: "scratchpad_add",
+        args: { title: `New password: ${CURRENT_SECRET_SENTINEL}` },
+        executionId: "call-api-echo-a",
+      },
+    ]);
+    await f.runTurn("run-api-echo-after");
+    const visible = dump({
+      results: f.results,
+      effects: f.effects.map((effect) => effect.result),
+      finalized: f.finalized,
+    });
+    expect(f.finalized.length, visible).toBeGreaterThan(0);
+    expect(visible).not.toContain(CURRENT_SECRET_SENTINEL);
+    expect(visible).not.toContain(STALE_SECRET_SENTINEL);
+    expect(dump(f.finalized)).not.toMatch(/\bDone\b/);
+  });
+
+  it("pass-after: api overlay executor refuses Done without an artifact-backed evidence ledger", async () => {
+    if (missing.length) return;
+    const createRunExecutor = await loadExecutor(afterApiExecutor);
+    const f = harness(createRunExecutor, {
+      runId: "run-api-false-done-after",
+      prompt: "Finish the reset",
+      sourceMessageId: "msg-1",
+      graphical: false,
+      finalText: "Done",
+    });
+    await f.runTurn("run-api-false-done-after");
+    expect(dump(f.finalized)).not.toMatch(/\bDone\b/);
+    expect(dump(f.finalized)).toMatch(/not verified/i);
   });
 });

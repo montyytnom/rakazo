@@ -78,8 +78,7 @@ export function unsupportedClaims(finalText: string, evidence: ToolEvidence): Cl
   }
   if (
     positiveClaims(finalText, SUCCESS_CLAIM).length > 0 &&
-    evidence.texts.length === 0 &&
-    !evidence.verified
+    !headlineAllowsDone(evidence)
   ) {
     violations.push("success-without-artifact");
   }
@@ -113,6 +112,13 @@ export function sanitizeFinalText(finalText: string, evidence: ToolEvidence): st
   }
   if (violations.has("identity") && !/not signed in|signed out|guest/i.test(text)) {
     text = `${text} Sign-in identity was not on the page.`.trim();
+  }
+  if (violations.has("success-without-artifact")) {
+    const keptSuccess = clauses(text).filter(
+      (clause) => !(SUCCESS_CLAIM.test(clause) && !NEGATIVE.test(clause)),
+    );
+    text = keptSuccess.join(". ").replace(/\s+/g, " ").trim();
+    if (!text) text = "Outcome was not verified.";
   }
   return text.replace(/\s+/g, " ").trim();
 }

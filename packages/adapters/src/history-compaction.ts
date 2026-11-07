@@ -1,7 +1,13 @@
 import type { AgentRunRequest, AgentRuntime, JobPublisher } from "@rakazo/adapter-kit";
 import { historyCompactJob } from "@rakazo/adapter-kit";
 import type { MessageBlock } from "@rakazo/contracts";
-import { blocksToAgentHistoryText, escapePromptData, rewriteUnverifiedClaims } from "@rakazo/core";
+import {
+  blocksToAgentHistoryText,
+  escapePromptData,
+  rewriteUnverifiedClaims,
+  secretsFromPriorAssistantText,
+  stripSecretEchoes,
+} from "@rakazo/core";
 import type { PrismaClient } from "@rakazo/db";
 import { recordUsage } from "@rakazo/db";
 import { getLogger, unwrapJobPayload } from "@rakazo/logging";
@@ -431,7 +437,10 @@ export async function compactHistory(deps: CompactHistoryDeps, threadId: string)
     logHistoryCompactPermanentFailure(threadId, "summary_too_large");
     return;
   }
-  summary = rewriteUnverifiedClaims(summary, transcript);
+  summary = stripSecretEchoes(
+    rewriteUnverifiedClaims(summary, transcript),
+    secretsFromPriorAssistantText([summary, transcript]),
+  ).text;
 
   const lastSeq = batch[batch.length - 1]!.seq;
   const advanced = await deps.prisma.thread.updateMany({

@@ -229,6 +229,10 @@ def patch_executor(path: Path) -> None:
         "  sameThreadIrreversibleOwner,\n"
         "  threadIrreversibleEffectKey,\n"
         "  UNAUTHORIZED_IRREVERSIBLE,\n"
+        "  collectToolEvidence,\n"
+        "  sanitizeFinalText,\n"
+        "  secretsFromPriorAssistantText,\n"
+        "  stripSecretEchoes,\n"
         "} from \"@rakazo/core\";\n",
         "core irreversible imports",
     )
@@ -253,6 +257,7 @@ def patch_executor(path: Path) -> None:
         "        const pageRefMemory = createRefMemory();\n"
         "        const protectedResults = createProtectedResultStore();\n"
         "        const protectedVault = resolveProtectedResultVault(deps.secretStore, context);\n"
+        "        const turnToolResults: unknown[] = [];\n"
         "        const turnIntent = resolveTurnIntent(\n"
         "          { id: run.sourceMessageId, text: task.prompt },\n"
         "          history\n"
@@ -328,6 +333,13 @@ def patch_executor(path: Path) -> None:
         "              store: protectedResults,\n"
         "              vault: protectedVault,\n"
         "            });\n"
+        "            for (const secret of secretsFromPriorAssistantText([\n"
+        "              typeof result === \"string\" ? result : JSON.stringify(result ?? \"\"),\n"
+        "              JSON.stringify(args ?? {}),\n"
+        "            ])) {\n"
+        "              if (!runSecrets.includes(secret)) runSecrets.push(secret);\n"
+        "            }\n"
+        "            turnToolResults.push(protectedPage.model);\n"
         "            return (await persistEffectResult(protectedPage.stored))\n"
         "              ? protectedPage.model\n"
         "              : uncertainEffectResult(name, args);\n"
@@ -458,6 +470,57 @@ def patch_executor(path: Path) -> None:
         '          if (name === "list_secrets") return listBotSecrets(deps.prisma, run);\n',
         "protected_result_handoff",
     )
+    replace_once(
+        path,
+        "          const blocks = handedOff\n"
+        "            ? []\n"
+        "            : runtidyDropRepeatedFinalText(\n"
+        "                finalBlocksAfterMidTurnProgress(\n"
+        "                  redactBlocks(completionBlocks, runSecrets),\n"
+        "                  publishedMidTurnUserMessage || runAllowsSilentEmpty(run.trigger),\n"
+        "                ),\n"
+        "                midTurnUserTexts,\n"
+        "              );\n"
+        "          const text = handedOff\n"
+        "            ? \"\"\n"
+        "            : redactSecrets(completionNotificationBody(silentReply.assembled, blocks), runSecrets);\n",
+        "          const priorSecrets = secretsFromPriorAssistantText([\n"
+        "            ...history\n"
+        "              .filter((message) => message.role === \"assistant\")\n"
+        "              .map((message) => message.content),\n"
+        "            silentReply.assembled,\n"
+        "          ]);\n"
+        "          const evidence = collectToolEvidence(turnToolResults);\n"
+        "          const blocks = handedOff\n"
+        "            ? []\n"
+        "            : runtidyDropRepeatedFinalText(\n"
+        "                finalBlocksAfterMidTurnProgress(\n"
+        "                  redactBlocks(completionBlocks, runSecrets),\n"
+        "                  publishedMidTurnUserMessage || runAllowsSilentEmpty(run.trigger),\n"
+        "                ),\n"
+        "                midTurnUserTexts,\n"
+        "              ).map((block) => {\n"
+        "                if (block.kind !== \"text\") return block;\n"
+        "                const sanitized = sanitizeFinalText(block.text, evidence);\n"
+        "                return {\n"
+        "                  ...block,\n"
+        "                  text: stripSecretEchoes(sanitized, [...runSecrets, ...priorSecrets]).text,\n"
+        "                };\n"
+        "              });\n"
+        "          const text = handedOff\n"
+        "            ? \"\"\n"
+        "            : redactSecrets(\n"
+        "                completionNotificationBody(\n"
+        "                  stripSecretEchoes(sanitizeFinalText(silentReply.assembled, evidence), [\n"
+        "                    ...runSecrets,\n"
+        "                    ...priorSecrets,\n"
+        "                  ]).text,\n"
+        "                  blocks,\n"
+        "                ),\n"
+        "                runSecrets,\n"
+        "              );\n",
+        "final reply secret/completion sanitization",
+    )
 
 
 def patch_browser_tools_worker(path: Path) -> None:
@@ -545,7 +608,7 @@ def patch_history_compaction(path: Path) -> None:
     replace_once(
         path,
         "import { blocksToAgentHistoryText, escapePromptData } from \"@rakazo/core\";\n",
-        "import { blocksToAgentHistoryText, escapePromptData, rewriteUnverifiedClaims } from \"@rakazo/core\";\n",
+        "import { blocksToAgentHistoryText, escapePromptData, rewriteUnverifiedClaims, secretsFromPriorAssistantText, stripSecretEchoes } from \"@rakazo/core\";\n",
         "rewriteUnverifiedClaims import",
     )
     replace_once(
@@ -559,7 +622,10 @@ def patch_history_compaction(path: Path) -> None:
         "    logHistoryCompactPermanentFailure(threadId, \"summary_too_large\");\n"
         "    return;\n"
         "  }\n"
-        "  summary = rewriteUnverifiedClaims(summary, transcript);\n\n"
+        "  summary = stripSecretEchoes(\n"
+        "    rewriteUnverifiedClaims(summary, transcript),\n"
+        "    secretsFromPriorAssistantText([summary, transcript]),\n"
+        "  ).text;\n\n"
         "  const lastSeq = batch[batch.length - 1]!.seq;",
         "compaction transcript evidence",
     )

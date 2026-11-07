@@ -41,5 +41,9 @@ describe("protected result handles", () => {
     const stripped = stripSecretEchoes(`The password is ${FIXTURE_OLD}`, prior);
     expect(stripped.echoed).toBe(true);
     expect(stripped.text).not.toContain(FIXTURE_OLD);
+    const both = secretsFromPriorAssistantText([
+      `Old password: ${FIXTURE_OLD}. New password: ${FIXTURE_NEW}`,
+    ]);
+    expect(both).toEqual([FIXTURE_OLD, FIXTURE_NEW]);
   });
 });

@@ -10,8 +10,8 @@ export type ProtectedResultHandle = {
 };
 
 const PASSWORD_KEY = /^(password|passwd|pwd|temporaryPassword|newPassword|secret|otp)$/i;
-const GENERATED_PASSWORD =
-  /\b(?:temporary password|new password|generated password)\s*[:=]\s*(\S+)/i;
+const GENERATED_PASSWORD_SOURCE =
+  String.raw`\b(?:temporary password|new password|generated password|old password|current password)\s*[:=]\s*(\S+)`;
 
 export function hashSecret(value: string): string {
   return `sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`;
@@ -56,10 +56,20 @@ export function redactProtectedTree(value: unknown, extras: readonly string[] = 
   return walk(value, banned);
 }
 
+export function extractGeneratedPasswords(text: string): string[] {
+  const found: string[] = [];
+  const re = new RegExp(GENERATED_PASSWORD_SOURCE, "gi");
+  for (const match of text.matchAll(re)) {
+    const candidate = match[1]?.replace(/[.,;}"']+$/, "");
+    if (candidate && looksLikeSecretValue(candidate) && !found.includes(candidate)) {
+      found.push(candidate);
+    }
+  }
+  return found;
+}
+
 export function extractGeneratedPassword(text: string): string | undefined {
-  const match = GENERATED_PASSWORD.exec(text);
-  const candidate = match?.[1]?.replace(/[.,;}"']+$/, "");
-  return candidate && looksLikeSecretValue(candidate) ? candidate : undefined;
+  return extractGeneratedPasswords(text)[0];
 }
 
 export function stripSecretEchoes(
@@ -79,8 +89,9 @@ export function stripSecretEchoes(
 export function secretsFromPriorAssistantText(texts: readonly string[]): string[] {
   const found: string[] = [];
   for (const text of texts) {
-    const generated = extractGeneratedPassword(text);
-    if (generated) found.push(generated);
+    for (const generated of extractGeneratedPasswords(text)) {
+      if (!found.includes(generated)) found.push(generated);
+    }
   }
   return found;
 }
@@ -92,8 +103,7 @@ function walk(value: unknown, banned: Set<string>): unknown {
     for (const secret of banned) {
       if (secret && next.includes(secret)) next = next.split(secret).join("[withheld]");
     }
-    const generated = extractGeneratedPassword(next);
-    if (generated) {
+    for (const generated of extractGeneratedPasswords(next)) {
       next = next.split(generated).join("[withheld]");
     }
     return next;

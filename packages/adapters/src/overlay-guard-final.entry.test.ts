@@ -126,9 +126,9 @@ describe("overlay guard-final orchestration boundary", () => {
     expect(headPiSrc).not.toContain("runtidyGuardSummaryEnabled");
     expect(headPiSrc).not.toContain("assistErrorGuardObserve");
 
-    // overlay-orchestration.entry.test.ts mocks runtime.run, so it never enters this path.
+    // overlay-orchestration.entry.test.ts still mocks the model stream, not continueRun.
     expect(harnessSrc).toContain("run: runtimeRun");
-    expect(harnessSrc).toContain("yield { type: \"done\" as const, text: \"Done\" }");
+    expect(harnessSrc).toContain('yield { type: "done" as const, text: finalText }');
   });
 
   it("fail-before: HEAD has no LoopGuard module", () => {

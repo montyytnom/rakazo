@@ -473,6 +473,18 @@ describe("recordHistoryCompactAttemptsExhausted", () => {
 });
 
 describe("compactHistory", () => {
+  it("strips generated-password plaintext from the saved summary", async () => {
+    const harness = compactionHarness({ deploymentModelKey: "openrouter-key" });
+    harness.runtime.run = vi.fn<AgentRuntime["run"]>(async function* () {
+      yield { type: "done", text: "Reset finished. New password: Cur#Rpr7xQ2mN9kL" };
+    });
+    await compactHistory(harness.deps, "thread-1");
+    expect(JSON.stringify(harness.saveMemory.mock.calls)).not.toContain("Cur#Rpr7xQ2mN9kL");
+    expect(JSON.stringify(harness.prisma.thread.updateMany.mock.calls)).not.toContain(
+      "Cur#Rpr7xQ2mN9kL",
+    );
+  });
+
   it("summarizes the next batch, saves it through the provider, and advances the cursor", async () => {
     const harness = compactionHarness({ deploymentModelKey: "openrouter-key" });
 

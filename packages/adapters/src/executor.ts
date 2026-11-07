@@ -5247,6 +5247,12 @@ export function createRunExecutor(deps: ExecutorDeps) {
               : Promise.resolve(true);
           const finish = async (result: unknown) => {
             turnToolResults.push(result);
+            for (const secret of secretsFromPriorAssistantText([
+              typeof result === "string" ? result : JSON.stringify(result ?? ""),
+              JSON.stringify(args ?? {}),
+            ])) {
+              if (!runSecrets.includes(secret)) runSecrets.push(secret);
+            }
             return (await persistEffectResult(result)) ? result : uncertainEffectResult(name, args);
           };
           const registerRunSecrets = (values: string[]) => {
@@ -7939,11 +7945,12 @@ export function createRunExecutor(deps: ExecutorDeps) {
               skipEmptyFallback: publishedTerminalSubagent || publishedMidTurnUserMessage,
             });
           }
-          const priorSecrets = secretsFromPriorAssistantText(
-            history
+          const priorSecrets = secretsFromPriorAssistantText([
+            ...history
               .filter((message) => message.role === "assistant")
               .map((message) => message.content),
-          );
+            silentReply.assembled,
+          ]);
           const evidence = collectToolEvidence(turnToolResults);
           const blocks = handedOff
             ? []
