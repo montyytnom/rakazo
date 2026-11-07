@@ -107,6 +107,23 @@ class EnvPrivacyTests(unittest.TestCase):
         self.assertNotIn("DATABASE_URL", classified["forwarded"])
         self.assertNotIn("OPENROUTER_API_KEY", classified["forwarded"])
 
+    def test_timezone_and_disabled_tools_forward_exact_literals(self) -> None:
+        classified = host_launch.classify_env(
+            {
+                "RAKAZO_DEFAULT_TIMEZONE": "America/New_York",
+                "RAKAZO_ASSIST_DEFAULT_DISABLED_TOOLS": host_launch.DISABLED_TOOL_CSV,
+            },
+            self.policy,
+        )
+        self.assertEqual(classified["forwarded"]["RAKAZO_DEFAULT_TIMEZONE"], "America/New_York")
+        self.assertEqual(
+            classified["forwarded"]["RAKAZO_ASSIST_DEFAULT_DISABLED_TOOLS"],
+            host_launch.DISABLED_TOOL_CSV,
+        )
+        ok, cleaned = host_launch.parse_typed_value("disabled_tool_csv", "render_plot,other")
+        self.assertFalse(ok)
+        self.assertIsNone(cleaned)
+
     def test_plan_forwards_assist_1_and_keeps_hardening(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)
@@ -161,6 +178,19 @@ class IsolatedSourcesTests(unittest.TestCase):
         dests = [row["destination"] for row in rows]
         self.assertEqual(dests, ["/app/packages/adapters/src/isolated-capture.ts"])
         self.assertTrue(Path(rows[0]["source"]).name == "isolated-capture.ts")
+
+    def test_flat_bundle_does_not_indexerror_on_parents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp) / "isolated-capture-bundle"
+            bundle.mkdir()
+            (bundle / "isolated-sources.txt").write_text(
+                "isolated-capture.ts\t/app/packages/adapters/src/isolated-capture.ts\n"
+            )
+            (bundle / "isolated-capture.ts").write_text("// bundled harness\n")
+            rows = host_launch.load_isolated_sources(bundle)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(Path(rows[0]["source"]).name, "isolated-capture.ts")
+            self.assertTrue(Path(rows[0]["source"]).exists())
 
 
 if __name__ == "__main__":

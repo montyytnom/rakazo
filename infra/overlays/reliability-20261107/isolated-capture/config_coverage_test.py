@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import unittest
 from copy import deepcopy
 from pathlib import Path
@@ -12,6 +13,20 @@ import config_coverage
 import host_launch
 
 BUNDLE = Path(__file__).resolve().parent
+
+COMPOSED = ":".join(
+    str(path)
+    for path in (
+        Path("/tmp/compose-check/worker/after/packages/adapters/src"),
+        Path("/tmp/compose-check/api/after/packages/adapters/src"),
+    )
+    if path.is_dir()
+)
+
+
+def setUpModule() -> None:
+    if COMPOSED:
+        os.environ["ISOLATED_CAPTURE_COMPOSED_SOURCE"] = COMPOSED
 
 
 class ExactFailureTests(unittest.TestCase):
@@ -140,6 +155,37 @@ class ExactFailureTests(unittest.TestCase):
         self.assertTrue(report["ok"], msg=str(report))
         self.assertIn("RAKAZO_ASSIST_PROMPT", report["forwarded"])
         self.assertIn("medium_effort", report["modelJsonKnownFields"])
+
+    def test_composed_source_required_not_silent_excerpts(self) -> None:
+        previous = os.environ.pop("ISOLATED_CAPTURE_COMPOSED_SOURCE", None)
+        try:
+            report = config_coverage.preflight(
+                BUNDLE,
+                consumed={"RAKAZO_ASSIST_PROMPT": ["promptbuilder"]},
+                model_json_keys=host_launch.MODEL_JSON_KEYS,
+                never_forward=host_launch.NEVER_FORWARD,
+            )
+            self.assertFalse(report["ok"])
+            self.assertTrue(
+                any("composed source required" in item for item in report["mismatches"]),
+                msg=str(report["mismatches"]),
+            )
+        finally:
+            if previous is not None:
+                os.environ["ISOLATED_CAPTURE_COMPOSED_SOURCE"] = previous
+
+    def test_timezone_and_disabled_tools_are_forwarded_literals(self) -> None:
+        schema = config_coverage.load_schema()
+        self.assertEqual(schema["fields"]["RAKAZO_DEFAULT_TIMEZONE"]["kind"], "iana_timezone")
+        self.assertEqual(schema["fields"]["RAKAZO_DEFAULT_TIMEZONE"]["disposition"], "forward")
+        self.assertEqual(
+            schema["fields"]["RAKAZO_ASSIST_DEFAULT_DISABLED_TOOLS"]["kind"],
+            "disabled_tool_csv",
+        )
+        self.assertEqual(
+            schema["fields"]["RAKAZO_ASSIST_DEFAULT_DISABLED_TOOLS"]["disposition"],
+            "forward",
+        )
 
     def test_never_forward_assist_blocks_preflight(self) -> None:
         report = config_coverage.preflight(

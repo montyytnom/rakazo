@@ -10,7 +10,21 @@ import unittest
 from pathlib import Path
 
 BUNDLE = Path(__file__).resolve().parent
-REPO_HARNESS = BUNDLE.parents[3] / "packages" / "adapters" / "src" / "isolated-capture.ts"
+
+
+def find_repo_harness() -> Path:
+    cur = BUNDLE.resolve()
+    for _ in range(8):
+        candidate = cur / "packages" / "adapters" / "src" / "isolated-capture.ts"
+        if candidate.exists():
+            return candidate
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    return BUNDLE / "isolated-capture.ts"
+
+
+REPO_HARNESS = find_repo_harness()
 IMPORT_RE = re.compile(r"""from\s+["'](\./[^"']+)["']""")
 
 
@@ -61,7 +75,10 @@ class DependencyClosureTests(unittest.TestCase):
         imports = relative_imports(harness)
         self.assertTrue(imports)
         self.assertFalse(any("capture-harness" in spec for spec in imports))
-        self.assertFalse(any("history-compaction" in spec for spec in imports))
+        self.assertTrue(
+            any("history-compaction" in spec for spec in imports),
+            "isolated-capture must import deployed compactHistory",
+        )
 
         isolated_dests = []
         for raw in (BUNDLE / "isolated-sources.txt").read_text().splitlines():

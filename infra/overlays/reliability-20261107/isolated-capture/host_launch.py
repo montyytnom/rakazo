@@ -24,6 +24,20 @@ STATE_PREFIXES = (
 STATE_COMPONENTS = frozenset({"appdata", "postgres", "postgresql", "redis"})
 MODEL_LIST_RE = re.compile(r"^[A-Za-z0-9._,+-]+$")
 INT_RE = re.compile(r"^-?\d{1,12}$")
+IANA_TZ_RE = re.compile(r"^(UTC|[A-Za-z_]+(?:/[A-Za-z0-9_+-]+)+)$")
+DISABLED_TOOL_CSV = "render_plot,skill_create,skill_update,skill_delete,create_space"
+
+
+def find_repo_file(*parts: str, start: Path | None = None) -> Path | None:
+    cur = (start or Path(__file__).resolve().parent).resolve()
+    for _ in range(8):
+        candidate = cur.joinpath(*parts)
+        if candidate.is_file():
+            return candidate
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    return None
 BOOL_VALUES = {"0": "0", "1": "1", "true": "true", "false": "false"}
 # Observed chat_template_kwargs keys are booleans. thinking_budget is a top-level env/body field.
 MODEL_JSON_KEYS = frozenset({"enable_thinking", "medium_effort"})
@@ -114,8 +128,8 @@ def load_isolated_sources(bundle: Path) -> list[dict[str, str]]:
         rel, dest = line.split("\t", 1)
         src = bundle / rel.strip()
         if not src.exists() and rel.strip() == "isolated-capture.ts":
-            repo = bundle.parents[3] / "packages" / "adapters" / "src" / "isolated-capture.ts"
-            if repo.exists():
+            repo = find_repo_file("packages", "adapters", "src", "isolated-capture.ts", start=bundle)
+            if repo is not None:
                 src = repo
         rows.append({"source": str(src), "destination": dest.strip(), "mode": "ro"})
     return rows
@@ -165,6 +179,14 @@ def parse_typed_value(kind: str, value: str) -> tuple[bool, str | None]:
             else:
                 return False, None
         return True, json.dumps(cleaned, separators=(",", ":"), sort_keys=True)
+    if kind == "disabled_tool_csv":
+        if text == DISABLED_TOOL_CSV:
+            return True, text
+        return False, None
+    if kind == "iana_timezone":
+        if IANA_TZ_RE.fullmatch(text) and len(text) <= 64:
+            return True, text
+        return False, None
     if kind == "never":
         return False, None
     return False, None
@@ -273,6 +295,7 @@ def inspect_image(ref: str) -> dict:
         "local": True,
         "id": info.get("Id"),
         "repoDigests": info.get("RepoDigests") or [],
+        "repoTags": info.get("RepoTags") or [],
         "created": info.get("Created"),
     }
 
@@ -344,9 +367,27 @@ def plan_service(
         "ISOLATED_CAPTURE_SERVICE": service,
         "ISOLATED_CAPTURE_OUT": "/out",
         "ISOLATED_CAPTURE_NOW": os.environ.get("ISOLATED_CAPTURE_NOW", "2026-11-07T00:00:00.000Z"),
+        "RAKAZO_ASSIST_DEFAULT_DISABLED_TOOLS": DISABLED_TOOL_CSV,
+        "RAKAZO_DEFAULT_TIMEZONE": os.environ.get("RAKAZO_DEFAULT_TIMEZONE", "America/New_York"),
+        "RAKAZO_GUARD_FINAL_SUMMARY": os.environ.get("RAKAZO_GUARD_FINAL_SUMMARY", "1"),
     }
     if live and isinstance(live, dict):
         env.update(live.get("forwardedEnv") or {})
+        env.setdefault("RAKAZO_ASSIST_DEFAULT_DISABLED_TOOLS", DISABLED_TOOL_CSV)
+        env.setdefault(
+            "RAKAZO_DEFAULT_TIMEZONE",
+            os.environ.get("RAKAZO_DEFAULT_TIMEZONE", "America/New_York"),
+        )
+        env.setdefault("RAKAZO_GUARD_FINAL_SUMMARY", "1")
+    if image.get("id"):
+        env[f"RAKAZO_{service.upper()}_IMAGE_ID"] = str(image["id"])
+    tags = image.get("repoTags") or image.get("RepoTags") or []
+    if isinstance(tags, list) and tags:
+        env[f"RAKAZO_{service.upper()}_IMAGE_TAG"] = str(tags[0]).split(":")[-1]
+    if os.environ.get("ISOLATED_CAPTURE_MODEL_METADATA"):
+        env["ISOLATED_CAPTURE_MODEL_METADATA"] = os.environ["ISOLATED_CAPTURE_MODEL_METADATA"]
+    if os.environ.get("ISOLATED_CAPTURE_MODEL_METADATA_FILE"):
+        env["ISOLATED_CAPTURE_MODEL_METADATA_FILE"] = os.environ["ISOLATED_CAPTURE_MODEL_METADATA_FILE"]
     cmd = [
         "docker",
         "run",

@@ -1,14 +1,29 @@
-import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { createRequire } from "node:module";
 import type { AddressInfo } from "node:net";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Message } from "@earendil-works/pi-ai";
-import type { AdapterContext, ConnectorTool } from "@rakazo/adapter-kit";
+import type {
+  AdapterContext,
+  AgentContextStrategy,
+  ConnectorTool,
+  JobPublisher,
+} from "@rakazo/adapter-kit";
+import { DEFAULT_CONTEXT_STRATEGY } from "@rakazo/adapter-kit";
+import {
+  DEFAULT_MODEL_CONTEXT_WINDOW,
+  DEFAULT_MODEL_MAX_TOKENS,
+  FLEET_TOOL_NAMES,
+  OPENAI_COMPATIBLE_PROVIDER_ID,
+} from "@rakazo/contracts";
 import { formatSkillsCatalogInstruction, type SkillCatalogEntry } from "@rakazo/core";
+import type { PrismaClient } from "@rakazo/db";
+import { compactHistory } from "./history-compaction.js";
+import type { MemoryProviderResolver } from "./memory-provider-factory.js";
+import { openAiCompatibleModel } from "./pi-openai-compatible-provider.js";
 import { builtinAgentTools } from "./builtin-tools.js";
 import { ConnectorRegistry } from "./composio-connector.js";
 import { formatCurrentTimeInstruction } from "./current-time.js";
@@ -25,6 +40,8 @@ import { PiAgentRuntime } from "./pi-runtime.js";
 import {
   MODEL_STREAM_IDLE_TIMEOUT_MS,
   MODEL_STREAM_TIMEOUT_MS,
+  REASONING_MODEL_MAX_TOKENS,
+  resolveCompletionMaxTokens,
   TOOL_RESULT_TEXT_LIMIT,
 } from "./pi-runtime-limits.js";
 import { withoutNamelessToolCalls } from "./pi-tool-call-guard.js";
@@ -37,6 +54,25 @@ export const STALE_PAGE_STATE_NOTE =
   "[Earlier page state trimmed to save context. Facts you still need from that page should already be in your notes or tracker; otherwise take a fresh snapshot.]";
 export const OVERSIZED_PAGE_CHARS = 40_000;
 export const CAPTURE_CLOCK_DEFAULT = "2026-11-07T00:00:00.000Z";
+export const CAPTURE_DEFAULT_DISABLED_TOOLS =
+  "render_plot,skill_create,skill_update,skill_delete,create_space";
+export const CAPTURE_MODEL_ID = "qwen3.8-flash-next";
+export const CAPTURE_BASE_SHA = "926710a";
+export const CAPTURE_WORKER_TIMEZONE = "America/New_York";
+export const CAPTURE_IMAGE_TAGS = {
+  api: "v0.3.1-926710a",
+  worker: "v0.3.1-scrapling1",
+} as const;
+export const CAPTURE_IMAGE_IDS = {
+  worker: "sha256:47d3423567b35333059f9ff55817c03656a43431539f0478e3eb959e13e9cdc6",
+  api: "sha256:c500071f5b2fde76d4bfca3ae883afb817c2265e2f113515cdb59c653d469f1f",
+} as const;
+export const VALID_BROWSER_ACT_ARGS = { actions: [{ kind: "click", ref: "e1" }] } as const;
+export const IDENTICAL_TOOL_ERROR = {
+  error: "LOGIN_GUARD refused kind=password rule=default origin=https://capture.example.test",
+} as const;
+export const FIRST_TURN_REASONING = "synthetic-reasoning-first-turn";
+const CONTEXT_STRATEGIES = new Set(["current", "retrieval", "snapshots", "cache-aware"]);
 
 function captureCallLimits(env: NodeJS.ProcessEnv = process.env): {
   envSource: "isolated-capture";
@@ -62,7 +98,7 @@ function captureCallLimits(env: NodeJS.ProcessEnv = process.env): {
       fastComputerSteps: env.RAKAZO_FAST_COMPUTER_STEPS ?? null,
       unchanged: true,
     },
-    maxTokensDefault: 32768,
+    maxTokensDefault: resolveCompletionMaxTokens(undefined, undefined, undefined, true),
     parallelToolCalls: null,
     streamTimeoutMs: Number(env.RAKAZO_MODEL_STREAM_TIMEOUT_MS) || MODEL_STREAM_TIMEOUT_MS,
     streamIdleTimeoutMs:
@@ -186,6 +222,8 @@ export type CapturedHttp = {
   rawByteLength: number;
   sampling: SamplingRecord;
   toolNames: string[];
+  stubSseSha256?: string;
+  stubSseByteLength?: number;
 };
 
 type StubReply =
@@ -203,7 +241,177 @@ export function captureClock(): Date {
   return date;
 }
 
+export function captureContextStrategy(): {
+  value: AgentContextStrategy;
+  source: string;
+} {
+  const raw = process.env.ISOLATED_CAPTURE_CONTEXT_STRATEGY?.trim();
+  if (raw) {
+    if (!CONTEXT_STRATEGIES.has(raw)) {
+      throw new Error(`ISOLATED_CAPTURE_CONTEXT_STRATEGY is not a known strategy: ${raw}`);
+    }
+    return { value: raw as AgentContextStrategy, source: "ISOLATED_CAPTURE_CONTEXT_STRATEGY" };
+  }
+  return {
+    value: DEFAULT_CONTEXT_STRATEGY,
+    source:
+      "@rakazo/adapter-kit DEFAULT_CONTEXT_STRATEGY (no DB column, bot field, or CONTEXT/STRATEG env; do not force current)",
+  };
+}
+
+export function captureTimeZone(service = process.env.ISOLATED_CAPTURE_SERVICE ?? "worker"): {
+  value: string;
+  source: string;
+  apiValuesObserved: false;
+} {
+  const raw = process.env.RAKAZO_DEFAULT_TIMEZONE?.trim();
+  if (raw) {
+    return { value: raw, source: "RAKAZO_DEFAULT_TIMEZONE", apiValuesObserved: false };
+  }
+  return {
+    value: CAPTURE_WORKER_TIMEZONE,
+    source:
+      service === "api"
+        ? "worker docker-inspect allowlisted RAKAZO_DEFAULT_TIMEZONE; API value unobserved (same name present)"
+        : "worker docker-inspect allowlisted RAKAZO_DEFAULT_TIMEZONE",
+    apiValuesObserved: false,
+  };
+}
+
+export function captureDisabledBuiltinTools(): string[] {
+  const botRow: string[] = [];
+  const assist = (
+    executorApi as { assistDisabledTools?: (botDisabled: string[] | null | undefined) => string[] }
+  ).assistDisabledTools;
+  if (typeof assist === "function") {
+    if (!process.env.RAKAZO_ASSIST_DEFAULT_DISABLED_TOOLS?.trim()) {
+      process.env.RAKAZO_ASSIST_DEFAULT_DISABLED_TOOLS = CAPTURE_DEFAULT_DISABLED_TOOLS;
+    }
+    return assist(botRow);
+  }
+  const raw = process.env.RAKAZO_ASSIST_DEFAULT_DISABLED_TOOLS ?? CAPTURE_DEFAULT_DISABLED_TOOLS;
+  return raw
+    .split(",")
+    .map((name) => name.trim())
+    .filter(Boolean);
+}
+
+export type CaptureModelMetadata = {
+  id: string;
+  provider: typeof OPENAI_COMPATIBLE_PROVIDER_ID;
+  maxTokens: number;
+  contextWindow: number;
+  reasoning: boolean;
+  acceptsImages: boolean;
+  source: string;
+  secretMaxTokensObserved: false;
+  rejectedStub4096: { historicalMaxOutputTokens: number; rowsOver4096: number };
+};
+
+export function loadCaptureModelMetadata(): CaptureModelMetadata {
+  const raw = process.env.ISOLATED_CAPTURE_MODEL_METADATA?.trim();
+  if (raw) return parseCaptureModelMetadata(JSON.parse(raw), "ISOLATED_CAPTURE_MODEL_METADATA");
+  const file = process.env.ISOLATED_CAPTURE_MODEL_METADATA_FILE?.trim();
+  if (file && existsSync(file)) {
+    return parseCaptureModelMetadata(JSON.parse(readFileSync(file, "utf8")) as unknown, file);
+  }
+  const bundled = join(
+    dirname(fileURLToPath(import.meta.url)),
+    "../../../infra/overlays/reliability-20261107/isolated-capture/fixtures/qwen3.8-flash-next.json",
+  );
+  if (existsSync(bundled)) {
+    return parseCaptureModelMetadata(JSON.parse(readFileSync(bundled, "utf8")) as unknown, bundled);
+  }
+  const nextToHarness = join(dirname(fileURLToPath(import.meta.url)), "qwen3.8-flash-next.json");
+  if (existsSync(nextToHarness)) {
+    return parseCaptureModelMetadata(
+      JSON.parse(readFileSync(nextToHarness, "utf8")) as unknown,
+      nextToHarness,
+    );
+  }
+  return deriveProductionModelMetadata();
+}
+
+export function deriveProductionModelMetadata(): CaptureModelMetadata {
+  const reasoning = true;
+  const derivedMaxTokens = resolveCompletionMaxTokens(undefined, undefined, undefined, reasoning);
+  const contractsWindow = DEFAULT_MODEL_CONTEXT_WINDOW;
+  // secret.contextWindow is unobserved. 32768 cannot reserve a 32768 completion plus
+  // the deployed tool JSON and assembler blocks (ContextBudgetError). 128k is the
+  // next contracts-compatible window that leaves input room.
+  const contextWindow = Math.max(contractsWindow, derivedMaxTokens * 4);
+  openAiCompatibleModel(
+    CAPTURE_MODEL_ID,
+    "http://127.0.0.1/v1",
+    reasoning,
+    true,
+    derivedMaxTokens,
+    contextWindow,
+  );
+  return {
+    id: CAPTURE_MODEL_ID,
+    provider: OPENAI_COMPATIBLE_PROVIDER_ID,
+    maxTokens: derivedMaxTokens,
+    contextWindow,
+    reasoning,
+    acceptsImages: true,
+    secretMaxTokensObserved: false,
+    rejectedStub4096: { historicalMaxOutputTokens: 9256, rowsOver4096: 3 },
+    source:
+      "executor.resolveModel (space default qwen3.8-flash-next / openai-compatible, bot override null, deploymentSettings null) -> resolveModelKey.secret.maxTokens/contextWindow unobserved (encrypted) -> registerOpenAiCompatibleRuntime -> modelForCompletion/resolveCompletionMaxTokens(undefined, undefined, undefined, reasoning=true)=REASONING_MODEL_MAX_TOKENS. Stub 4096 rejected: historical maxOutput 9256 (7371 reasoning), 3 rows >4096. DEFAULT_MODEL_CONTEXT_WINDOW=32768 cannot reserve REASONING_MODEL_MAX_TOKENS plus assembler/tools; window is 4*REASONING_MODEL_MAX_TOKENS (131072) so modelOutputLeavesInputRoom holds. Not a live secret value.",
+  };
+}
+
+function parseCaptureModelMetadata(value: unknown, source: string): CaptureModelMetadata {
+  if (!value || typeof value !== "object") {
+    throw new Error(`model metadata is not an object (${source})`);
+  }
+  const row = value as Record<string, unknown>;
+  const derived = deriveProductionModelMetadata();
+  const id = typeof row.id === "string" && row.id.trim() ? row.id.trim() : CAPTURE_MODEL_ID;
+  const reasoning = row.reasoning !== false;
+  const maxTokensRaw = Number(row.maxTokens);
+  const contextWindowRaw = Number(row.contextWindow);
+  const maxTokens =
+    Number.isInteger(maxTokensRaw) && maxTokensRaw >= 1
+      ? maxTokensRaw
+      : resolveCompletionMaxTokens(undefined, undefined, undefined, reasoning);
+  const contextWindow =
+    Number.isInteger(contextWindowRaw) && contextWindowRaw >= 1
+      ? contextWindowRaw
+      : DEFAULT_MODEL_CONTEXT_WINDOW;
+  if (maxTokens === DEFAULT_MODEL_MAX_TOKENS && reasoning) {
+    throw new Error(
+      `model metadata maxTokens ${DEFAULT_MODEL_MAX_TOKENS} is the rejected stub cap (${source}); historical maxOutput 9256`,
+    );
+  }
+  return {
+    ...derived,
+    id,
+    maxTokens,
+    contextWindow,
+    reasoning,
+    acceptsImages: row.acceptsImages !== false,
+    source,
+  };
+}
+
+export function captureRunModel(baseUrl: string) {
+  const meta = loadCaptureModelMetadata();
+  return {
+    provider: OPENAI_COMPATIBLE_PROVIDER_ID,
+    id: meta.id,
+    baseUrl,
+    apiKey: "local",
+    reasoning: meta.reasoning,
+    acceptsImages: meta.acceptsImages,
+    maxTokens: meta.maxTokens,
+    contextWindow: meta.contextWindow,
+  };
+}
+
 export function deriveAssemblerInputs() {
+  const contextStrategy = captureContextStrategy();
   return {
     trigger: "user" as const,
     groupId: null as string | null,
@@ -211,7 +419,9 @@ export function deriveAssemblerInputs() {
     graphicalToolsAllowed: true,
     pageBrowserAllowed: true,
     heldForTakeover: false,
-    historyRetrievalEnabled: true,
+    contextStrategy: contextStrategy.value,
+    contextStrategySource: contextStrategy.source,
+    historyRetrievalEnabled: contextStrategy.value !== "current",
     ticketBoardEnabled: envFlag("RAKAZO_TICKET_BOARD") ?? false,
     phoneCallsEnabled: envFlag("RAKAZO_PHONE_CALLS") ?? false,
     semanticMemoryEnabled: envFlag("RAKAZO_SEMANTIC_MEMORY") ?? false,
@@ -222,7 +432,7 @@ export function deriveAssemblerInputs() {
     voiceCall: false,
     fleetManagement: false,
     followUpFromUser: true,
-    disabledBuiltinTools: [] as string[],
+    disabledBuiltinTools: captureDisabledBuiltinTools(),
     connectorRegistry: "empty" as const,
   };
 }
@@ -268,6 +478,7 @@ export async function offeredToolsFromDeployedBuilder(): Promise<{
   offeredBuiltinNames: string[];
   offeredBuiltinCount: number;
   withheldBuiltinNames: string[];
+  withheldRationale: Array<{ name: string; reason: string }>;
   connectorTools: ConnectorTool[];
   reviewerExpectedWorkerBuiltins: number;
   reviewerCountMatch: boolean;
@@ -309,6 +520,11 @@ export async function offeredToolsFromDeployedBuilder(): Promise<{
     withheldBuiltinNames: builtinAgentTools
       .map((tool) => tool.name)
       .filter((name) => !offeredSet.has(name)),
+    withheldRationale: withholdRationale(
+      builtinAgentTools.map((tool) => tool.name),
+      offeredSet,
+      assemblerInputs,
+    ),
     connectorTools: exposedConnectorTools,
     reviewerExpectedWorkerBuiltins: REVIEWER_EXPECTED_WORKER_BUILTINS,
     reviewerCountMatch: builtins.length === REVIEWER_EXPECTED_WORKER_BUILTINS,
@@ -379,6 +595,7 @@ export async function assembleCapturePrompt(): Promise<{
     heldForTakeover: false,
     graphicalToolsAllowed: true,
     graphical: true,
+    disabled: new Set(captureDisabledBuiltinTools()),
   });
   const longWork = longWorkProgressGuidance();
   const skillsLine = formatSkillsCatalogInstruction(SYNTHETIC_SKILL_CATALOG);
@@ -509,10 +726,83 @@ export async function assembleCapturePrompt(): Promise<{
   };
 }
 
+function withholdRationale(
+  catalogNames: string[],
+  offered: Set<string>,
+  inputs: ReturnType<typeof deriveAssemblerInputs>,
+): Array<{ name: string; reason: string }> {
+  const disabled = new Set(inputs.disabledBuiltinTools);
+  const fleet = new Set<string>(FLEET_TOOL_NAMES);
+  const rows: Array<{ name: string; reason: string }> = [];
+  for (const name of catalogNames) {
+    if (offered.has(name)) continue;
+    if (disabled.has(name)) {
+      rows.push({
+        name,
+        reason:
+          "selectBuiltinToolsForRun disabledBuiltinTools: assistDisabledTools(bot.disabledBuiltinTools=[]) merged with env RAKAZO_ASSIST_DEFAULT_DISABLED_TOOLS=render_plot,skill_create,skill_update,skill_delete,create_space",
+      });
+      continue;
+    }
+    if (name === "generate_image") {
+      rows.push({ name, reason: "selectBuiltinToolsForRun mediaImagesEnabled=false" });
+      continue;
+    }
+    if (name === "generate_video") {
+      rows.push({ name, reason: "selectBuiltinToolsForRun mediaVideoEnabled=false" });
+      continue;
+    }
+    if (name === "board_tickets" || name.startsWith("ticket_")) {
+      rows.push({ name, reason: "selectBuiltinToolsForRun ticketBoardEnabled=false" });
+      continue;
+    }
+    if (fleet.has(name)) {
+      rows.push({
+        name,
+        reason: "selectBuiltinToolsForRun fleetManagement=false (FLEET_TOOL_NAMES)",
+      });
+      continue;
+    }
+    if (name === "end_call") {
+      rows.push({ name, reason: "selectBuiltinToolsForRun voiceCall=false" });
+      continue;
+    }
+    if (name === "call_user") {
+      rows.push({
+        name,
+        reason: "selectBuiltinToolsForRun phoneCallsEnabled=false (or group/voice/messaging gate)",
+      });
+      continue;
+    }
+    if (name.startsWith("cloud_agent_")) {
+      rows.push({ name, reason: "selectCloudAgentTools cloudAgentEnabled=false" });
+      continue;
+    }
+    if (
+      name === "save_memory" ||
+      name === "recall_memory" ||
+      name === "forget_memory" ||
+      name === "save_shared_memory"
+    ) {
+      rows.push({ name, reason: "selectMemoryTools semanticMemoryEnabled=false" });
+      continue;
+    }
+    if (!inputs.historyRetrievalEnabled && (name === "search_history" || name === "read_history")) {
+      rows.push({ name, reason: "selectBuiltinToolsForRun historyRetrievalEnabled=false" });
+      continue;
+    }
+    rows.push({
+      name,
+      reason: "selectBuiltinToolsForRun deployed selector (thread/trigger/page/graphical filter)",
+    });
+  }
+  return rows;
+}
+
 export function syntheticUserPrompt(): string {
   return [
     "Synthetic capture turn. No live accounts, secrets, or browsing.",
-    formatCurrentTimeInstruction(captureClock()),
+    formatCurrentTimeInstruction(captureClock(), captureTimeZone().value),
   ].join("\n\n");
 }
 
@@ -555,6 +845,48 @@ function requestBodyText(body: Record<string, unknown> | null): string {
     else if (content != null) parts.push(JSON.stringify(content));
   }
   return parts.join("\n");
+}
+
+function lastToolResultNames(body: Record<string, unknown> | null): string[] {
+  if (!body || !Array.isArray(body.messages)) return [];
+  const messages = body.messages as Array<Record<string, unknown>>;
+  let index = messages.length - 1;
+  while (index >= 0 && messages[index]?.role === "tool") index -= 1;
+  const assistant = messages[index];
+  if (!assistant || assistant.role !== "assistant") return [];
+  return messageToolCalls(assistant).map((call) => call.name);
+}
+
+function classifyPhase(
+  caseName: string,
+  seq: number,
+  parsed: Record<string, unknown> | null,
+): string {
+  if (caseName !== "phases") return caseName;
+  const tools = Array.isArray(parsed?.tools) ? parsed.tools : [];
+  const hay = JSON.stringify(parsed ?? {});
+  if (tools.length === 0) return "guard-final";
+  if (hay.includes("ERROR GUARD") && hay.includes("Tools are now stopped")) return "guard-halt";
+  if (hay.includes("ERROR GUARD") && hay.includes("One more identical failure")) {
+    return "guard-warning";
+  }
+  const lastTools = lastToolResultNames(parsed);
+  if (lastTools.length > 0 && lastTools.every((name) => name === "web_fetch")) {
+    return "thinking-reenable";
+  }
+  if (seq === 0) return "first";
+  if (lastTools.includes("browser_snapshot") || lastTools.includes("browser_navigate")) {
+    return "postbrowser";
+  }
+  return `turn-${seq}`;
+}
+
+function extraStopReplies(count: number): StubReply[] {
+  return Array.from({ length: count }, (_, index) => ({
+    kind: "sse" as const,
+    finish: "stop",
+    events: [{ content: `synthetic-stop-${index}` }],
+  }));
 }
 
 function toolNamesFromBody(body: Record<string, unknown> | null): string[] {
@@ -624,10 +956,12 @@ export async function startCaptureStub(options: {
   captures: CapturedHttp[];
   rawBodies: Buffer[];
   parsedBodies: Array<Record<string, unknown> | null>;
+  stubBodies: string[];
 }> {
   const captures: CapturedHttp[] = [];
   const rawBodies: Buffer[] = [];
   const parsedBodies: Array<Record<string, unknown> | null> = [];
+  const stubBodies: string[] = [];
   let seq = 0;
   const server: Server = createServer((request, response) => {
     void (async () => {
@@ -642,14 +976,13 @@ export async function startCaptureStub(options: {
         parsed = null;
       }
       parsedBodies.push(parsed);
-      const phase =
-        options.caseName === "phases"
-          ? seq === 0
-            ? "first"
-            : seq === 1
-              ? "postbrowser"
-              : "guard-final"
-          : options.caseName;
+      const phase = classifyPhase(options.caseName, seq, parsed);
+      const reply = options.replies[seq];
+      let stubSse: string | undefined;
+      if (reply?.kind === "sse") {
+        stubSse = ssePayload(options.modelId, reply.events, reply.finish);
+        stubBodies[seq] = stubSse;
+      }
       captures.push({
         seq,
         caseName: options.caseName,
@@ -661,8 +994,13 @@ export async function startCaptureStub(options: {
         rawByteLength: raw.byteLength,
         sampling: samplingFromBody(parsed),
         toolNames: toolNamesFromBody(parsed),
+        ...(stubSse
+          ? {
+              stubSseSha256: createHash("sha256").update(stubSse).digest("hex"),
+              stubSseByteLength: Buffer.byteLength(stubSse),
+            }
+          : {}),
       });
-      const reply = options.replies[seq];
       seq += 1;
       if (!reply) {
         response.writeHead(500, { "content-type": "application/json" });
@@ -675,7 +1013,7 @@ export async function startCaptureStub(options: {
         return;
       }
       response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
-      response.end(ssePayload(options.modelId, reply.events, reply.finish));
+      response.end(stubSse ?? ssePayload(options.modelId, reply.events, reply.finish));
     })().catch(() => response.destroy());
   });
   await new Promise<void>((resolve, reject) => {
@@ -691,6 +1029,7 @@ export async function startCaptureStub(options: {
     captures,
     rawBodies,
     parsedBodies,
+    stubBodies,
     async close() {
       await new Promise<void>((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));
@@ -706,32 +1045,87 @@ async function drainRuntime(
 ): Promise<unknown[]> {
   const events: unknown[] = [];
   for await (const event of runtime.run(request, {
-    signal: AbortSignal.timeout(30_000),
+    signal: AbortSignal.timeout(90_000),
   })) {
     events.push(event);
   }
   return events;
 }
 
-function syntheticModel(baseUrl: string, modelId: string) {
-  return {
-    provider: "openai-compatible" as const,
-    id: modelId,
-    baseUrl,
-  };
-}
-
-function executeSyntheticTool(name: string, snapshotCount: { value: number }): unknown {
+function executeSyntheticTool(
+  name: string,
+  args: Record<string, unknown>,
+  snapshotCount: { value: number },
+): unknown {
+  if (name === "browser_navigate") {
+    return {
+      url: String(args.url ?? ""),
+      title: `synthetic-nav-${String(args.url ?? "")}`,
+      ok: true,
+    };
+  }
   if (name === "browser_snapshot") {
     snapshotCount.value += 1;
     return oversizedPage(snapshotCount.value);
   }
   if (name === "browser_act") {
+    return { ...IDENTICAL_TOOL_ERROR };
+  }
+  if (name === "web_fetch") {
     return {
-      error: "LOGIN_GUARD refused kind=password rule=default origin=https://capture.example.test",
+      url: String(args.url ?? "https://capture.example.test/fetch"),
+      text: "non-browser fetch body",
     };
   }
   return { ok: true, synthetic: true, tool: name };
+}
+
+function messageToolCalls(message: Record<string, unknown>): Array<{ name: string; args: unknown }> {
+  const calls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+  return calls.flatMap((call) => {
+    if (!call || typeof call !== "object") return [];
+    const fn = (call as { function?: { name?: string; arguments?: unknown } }).function;
+    if (!fn?.name) return [];
+    let args: unknown = fn.arguments;
+    if (typeof args === "string") {
+      try {
+        args = JSON.parse(args);
+      } catch {
+        args = fn.arguments;
+      }
+    }
+    return [{ name: fn.name, args }];
+  });
+}
+
+function identicalToolErrorCount(bodies: Array<Record<string, unknown> | null>): number {
+  const needle = IDENTICAL_TOOL_ERROR.error;
+  let count = 0;
+  for (const body of bodies) {
+    const text = JSON.stringify(body ?? {});
+    const matches = text.split(needle).length - 1;
+    if (matches > count) count = matches;
+  }
+  return count;
+}
+
+function validBrowserActCallCount(bodies: Array<Record<string, unknown> | null>): number {
+  let count = 0;
+  for (const body of bodies) {
+    const messages = Array.isArray(body?.messages) ? body.messages : [];
+    let inBody = 0;
+    for (const message of messages) {
+      if (!message || typeof message !== "object") continue;
+      if ((message as { role?: string }).role !== "assistant") continue;
+      for (const call of messageToolCalls(message as Record<string, unknown>)) {
+        if (call.name !== "browser_act") continue;
+        const args = call.args as { actions?: Array<{ kind?: string; ref?: string }> } | null;
+        if (args?.actions?.[0]?.kind === "click" && args.actions[0]?.ref === "e1") inBody += 1;
+      }
+    }
+    if (inBody > count) count = inBody;
+  }
+  return count;
 }
 
 export async function capturePhaseTurn(service: string): Promise<{
@@ -747,32 +1141,51 @@ export async function capturePhaseTurn(service: string): Promise<{
   additionalEmitted: NamedBlock[];
   toolInventory: Awaited<ReturnType<typeof offeredToolsFromDeployedBuilder>>;
   assembledInHttp: Record<string, boolean>;
+  validBrowserActCalls: number;
+  identicalToolErrors: number;
+  reasoningInspected: boolean;
+  thinkingReenabled: boolean;
+  guardWarning: boolean;
+  guardHalt: boolean;
+  guardFinalToolFree: boolean;
 }> {
-  const modelId = "qwen3.8-flash-next";
+  const meta = loadCaptureModelMetadata();
   const assembled = await assembleCapturePrompt();
   const snapshots = { value: 0 };
   const stub = await startCaptureStub({
-    modelId,
+    modelId: meta.id,
     caseName: "phases",
     replies: [
       {
         kind: "sse",
         finish: "tool_calls",
-        events: toolCallDelta("call_capture_first", "browser_snapshot", {}),
+        events: [
+          { reasoning_content: FIRST_TURN_REASONING },
+          ...toolCallDelta("call_capture_first", "browser_snapshot", {}),
+        ],
       },
       {
         kind: "sse",
         finish: "tool_calls",
-        events: toolCallDelta("call_capture_postbrowser", "browser_act", {
-          kind: "fill",
-          ref: "e1",
+        events: toolCallDelta("call_capture_fetch", "web_fetch", {
+          url: "https://capture.example.test/fetch",
         }),
       },
+      ...[1, 2, 3, 4].map((index) => ({
+        kind: "sse" as const,
+        finish: "tool_calls",
+        events: toolCallDelta(
+          `call_capture_act_${index}`,
+          "browser_act",
+          VALID_BROWSER_ACT_ARGS as unknown as Record<string, unknown>,
+        ),
+      })),
       {
         kind: "sse",
         finish: "stop",
-        events: [{ content: "guard-final: stopped at login guard." }],
+        events: [{ content: "guard-final: stopped at identical tool error." }],
       },
+      ...extraStopReplies(6),
     ],
   });
   try {
@@ -784,9 +1197,9 @@ export async function capturePhaseTurn(service: string): Promise<{
       instructions: assembled.instructions,
       history: [],
       tools: assembled.tools,
-      contextStrategy: "current",
-      model: syntheticModel(stub.baseUrl, modelId),
-      executeTool: async (name) => executeSyntheticTool(name, snapshots),
+      contextStrategy: captureContextStrategy().value,
+      model: captureRunModel(stub.baseUrl),
+      executeTool: async (name, args) => executeSyntheticTool(name, args, snapshots),
     });
     const haystack = requestBodyText(stub.parsedBodies[0] ?? null);
     const snippet = {
@@ -800,6 +1213,24 @@ export async function capturePhaseTurn(service: string): Promise<{
       const text = snippet[block.name as keyof typeof snippet] ?? "";
       assembledInHttp[block.name] = block.present && text.length > 0 && haystack.includes(text);
     }
+    const replayText = stub.parsedBodies
+      .slice(1)
+      .map((body) => JSON.stringify(body ?? {}))
+      .join("\n");
+    const reasoningInspected =
+      replayText.includes(FIRST_TURN_REASONING) ||
+      replayText.includes("reasoning_content") ||
+      replayText.includes("synthetic-reasoning");
+    const thinkingReenabled = stub.captures.some(
+      (capture) =>
+        capture.phase === "thinking-reenable" &&
+        capture.sampling.included.enable_thinking === true,
+    );
+    const guardWarning = stub.captures.some((capture) => capture.phase === "guard-warning");
+    const guardHalt = stub.captures.some((capture) => capture.phase === "guard-halt");
+    const guardFinalToolFree = stub.captures.some(
+      (capture) => capture.phase === "guard-final" && capture.toolNames.length === 0,
+    );
     return {
       service,
       caseName: "phases",
@@ -813,6 +1244,13 @@ export async function capturePhaseTurn(service: string): Promise<{
       additionalEmitted: assembled.additionalEmitted,
       toolInventory: assembled.toolInventory,
       assembledInHttp,
+      validBrowserActCalls: validBrowserActCallCount(stub.parsedBodies),
+      identicalToolErrors: identicalToolErrorCount(stub.parsedBodies),
+      reasoningInspected,
+      thinkingReenabled,
+      guardWarning,
+      guardHalt,
+      guardFinalToolFree,
     };
   } finally {
     await stub.close();
@@ -826,23 +1264,35 @@ export async function capturePageTrim(service: string): Promise<{
   parsedBodies: Array<Record<string, unknown> | null>;
   lastRequestText: string;
   keptPageMarkers: string[];
+  distinctNavigateUrls: string[];
   trimmedNotePresent: boolean;
   clipped12k: boolean;
 }> {
-  const modelId = "qwen3.8-flash-next";
+  const meta = loadCaptureModelMetadata();
   const assembled = await assembleCapturePrompt();
   const snapshots = { value: 0 };
-  const replies: StubReply[] = [1, 2, 3, 4].map((index) => ({
-    kind: "sse" as const,
-    finish: "tool_calls",
-    events: toolCallDelta(`call_capture_page_${index}`, "browser_snapshot", {}),
-  }));
+  const replies: StubReply[] = [];
+  for (const index of [1, 2, 3, 4]) {
+    replies.push({
+      kind: "sse",
+      finish: "tool_calls",
+      events: toolCallDelta(`call_capture_nav_${index}`, "browser_navigate", {
+        url: `https://capture.example.test/page-${index}`,
+      }),
+    });
+    replies.push({
+      kind: "sse",
+      finish: "tool_calls",
+      events: toolCallDelta(`call_capture_page_${index}`, "browser_snapshot", {}),
+    });
+  }
   replies.push({
     kind: "sse",
     finish: "stop",
     events: [{ content: "page-trim: last-3 kept." }],
   });
-  const stub = await startCaptureStub({ modelId, caseName: "page-trim", replies });
+  replies.push(...extraStopReplies(2));
+  const stub = await startCaptureStub({ modelId: meta.id, caseName: "page-trim", replies });
   try {
     await drainRuntime(new PiAgentRuntime(), {
       botId: "bot-synthetic-capture",
@@ -852,9 +1302,9 @@ export async function capturePageTrim(service: string): Promise<{
       instructions: assembled.instructions,
       history: [],
       tools: assembled.tools,
-      contextStrategy: "current",
-      model: syntheticModel(stub.baseUrl, modelId),
-      executeTool: async (name) => executeSyntheticTool(name, snapshots),
+      contextStrategy: captureContextStrategy().value,
+      model: captureRunModel(stub.baseUrl),
+      executeTool: async (name, args) => executeSyntheticTool(name, args, snapshots),
     });
     const last = stub.parsedBodies.at(-1);
     const lastRequestText = JSON.stringify(last ?? {});
@@ -862,6 +1312,9 @@ export async function capturePageTrim(service: string): Promise<{
       lastRequestText.includes(marker),
     );
     const firstKept = lastRequestText.includes("BEGIN_PAGE_1_");
+    const distinctNavigateUrls = [1, 2, 3, 4]
+      .map((index) => `https://capture.example.test/page-${index}`)
+      .filter((url) => stub.parsedBodies.some((body) => JSON.stringify(body ?? {}).includes(url)));
     return {
       service,
       captures: stub.captures,
@@ -869,8 +1322,12 @@ export async function capturePageTrim(service: string): Promise<{
       parsedBodies: stub.parsedBodies,
       lastRequestText,
       keptPageMarkers,
+      distinctNavigateUrls,
       trimmedNotePresent: lastRequestText.includes(STALE_PAGE_STATE_NOTE) && !firstKept,
-      clipped12k: lastRequestText.includes(`${"x".repeat(32)}…`),
+      clipped12k:
+        lastRequestText.includes("…") &&
+        lastRequestText.includes("x".repeat(32)) &&
+        !lastRequestText.includes("x".repeat(OVERSIZED_PAGE_CHARS - 50)),
     };
   } finally {
     await stub.close();
@@ -879,117 +1336,249 @@ export async function capturePageTrim(service: string): Promise<{
 
 export type CompactionCaptureResult = {
   service: string;
-  gate: "unmet";
-  matched: false;
+  gate: "invoked" | "unmet";
+  matched: boolean;
+  invoked: boolean;
   deployedBoundary: "compactHistory";
-  reason: string;
+  reason?: string;
+  captures: CapturedHttp[];
+  rawBodies: Buffer[];
+  parsedBodies: Array<Record<string, unknown> | null>;
+  stubBodies: string[];
+  writeback: { summary: string | null; historyCompactedUpToSeq: number | null };
+  usageRecorded: boolean;
 };
 
-export async function captureCompactionPass(service: string): Promise<CompactionCaptureResult> {
+function syntheticCompactionMessages(count: number) {
+  return Array.from({ length: count }, (_, seq) => ({
+    seq,
+    role: seq % 2 === 0 ? "user" : "bot",
+    blocks: [{ kind: "text", text: `synthetic compact row ${seq}` }],
+  }));
+}
+
+function mockCompactionPrisma(state: {
+  thread: Record<string, unknown>;
+  messages: ReturnType<typeof syntheticCompactionMessages>;
+  usage: number;
+}) {
   return {
-    service,
-    gate: "unmet",
-    matched: false,
-    deployedBoundary: "compactHistory",
-    reason:
-      "Deployed compaction is compactHistory(deps, threadId) in history-compaction.ts (overlay uses ctxmemSummaryInstructions plus prisma thread rows, recordUsage, and the job publisher). isolated-capture does not import that module and does not wrap that boundary with mocked job/DB adapters only. An inlined summarizer prompt is not a matched serializer baseline. The three /v1/chat/completions phases remain the byte-diff target. Compaction is unresolved.",
+    thread: {
+      findUniqueOrThrow: async () => ({ ...state.thread }),
+      updateMany: async ({ data }: { data: Record<string, unknown> }) => {
+        Object.assign(state.thread, data);
+        return { count: 1 };
+      },
+    },
+    message: {
+      findMany: async ({
+        where,
+        take,
+        orderBy,
+      }: {
+        where?: { seq?: { gt?: number; lte?: number } };
+        take?: number;
+        orderBy?: { seq?: "asc" | "desc" };
+      }) => {
+        let rows = [...state.messages];
+        const gt = where?.seq?.gt;
+        const lte = where?.seq?.lte;
+        if (typeof gt === "number") rows = rows.filter((row) => row.seq > gt);
+        if (typeof lte === "number") rows = rows.filter((row) => row.seq <= lte);
+        if (orderBy?.seq === "desc") rows = [...rows].sort((left, right) => right.seq - left.seq);
+        else rows = [...rows].sort((left, right) => left.seq - right.seq);
+        if (typeof take === "number") rows = rows.slice(0, take);
+        return rows;
+      },
+    },
+    event: { findFirst: async () => null },
+    usageRecord: {
+      create: async () => {
+        state.usage += 1;
+        return {};
+      },
+      createMany: async () => {
+        state.usage += 1;
+        return { count: 1 };
+      },
+    },
+    memoryDocument: { findFirst: async () => null },
+    botMcpServer: { findMany: async () => [] },
+    botSecret: { findMany: async () => [] },
+    deploymentSettings: {
+      findUnique: async () => ({
+        defaultModelProvider: OPENAI_COMPATIBLE_PROVIDER_ID,
+        defaultModelId: CAPTURE_MODEL_ID,
+      }),
+    },
   };
 }
 
-const IDENTICAL_ERROR_BODY = JSON.stringify({
-  error: { message: "synthetic-identical-error", type: "fixture_error" },
-});
+export async function captureCompactionPass(service: string): Promise<CompactionCaptureResult> {
+  const meta = loadCaptureModelMetadata();
+  const threadId = "thread-synthetic-compact";
+  const state = {
+    thread: {
+      id: threadId,
+      botId: SYNTHETIC_BOTDIR_SELF_ID,
+      userId: "user-synthetic-capture",
+      spaceId: "space-synthetic-capture",
+      historyCompactedUpToSeq: null,
+      historyCompactionGeneration: 1,
+      historyCompactionSummary: null,
+      nextMessageSeq: 32,
+    } as Record<string, unknown>,
+    messages: syntheticCompactionMessages(32),
+    usage: 0,
+  };
+  const stub = await startCaptureStub({
+    modelId: meta.id,
+    caseName: "compaction",
+    replies: [
+      {
+        kind: "sse",
+        finish: "stop",
+        events: [{ content: "synthetic compacted summary of 32 rows." }],
+      },
+      ...extraStopReplies(2),
+    ],
+  });
+  const jobs: JobPublisher = {
+    enqueue: async () => undefined,
+    cancel: async () => undefined,
+    close: async () => undefined,
+  };
+  const memoryProviders: MemoryProviderResolver = {
+    resolve: async () => null,
+  };
+  try {
+    await compactHistory(
+      {
+        prisma: mockCompactionPrisma(state) as unknown as PrismaClient,
+        runtime: new PiAgentRuntime(),
+        jobs,
+        memoryProviders,
+        resolveModel: async () => captureRunModel(stub.baseUrl),
+      },
+      threadId,
+    );
+    const summary =
+      typeof state.thread.historyCompactionSummary === "string"
+        ? state.thread.historyCompactionSummary
+        : null;
+    const invoked = stub.captures.length > 0 && Boolean(summary);
+    return {
+      service,
+      gate: invoked ? "invoked" : "unmet",
+      matched: false,
+      invoked,
+      deployedBoundary: "compactHistory",
+      reason: invoked
+        ? undefined
+        : "compactHistory returned without a summarizer HTTP call or writeback",
+      captures: stub.captures,
+      rawBodies: stub.rawBodies,
+      parsedBodies: stub.parsedBodies,
+      stubBodies: stub.stubBodies,
+      writeback: {
+        summary,
+        historyCompactedUpToSeq:
+          typeof state.thread.historyCompactedUpToSeq === "number"
+            ? state.thread.historyCompactedUpToSeq
+            : null,
+      },
+      usageRecorded: state.usage > 0,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+    return {
+      service,
+      gate: "unmet",
+      matched: false,
+      invoked: false,
+      deployedBoundary: "compactHistory",
+      reason: `compactHistory dependency-closure or runtime blocker: ${message}`,
+      captures: stub.captures,
+      rawBodies: stub.rawBodies,
+      parsedBodies: stub.parsedBodies,
+      stubBodies: stub.stubBodies,
+      writeback: { summary: null, historyCompactedUpToSeq: null },
+      usageRecorded: false,
+    };
+  } finally {
+    await stub.close();
+  }
+}
 
 export async function captureParserGuardCases(service: string): Promise<{
   service: string;
-  validcall: { captures: CapturedHttp[]; parsedNames: string[] };
-  malformed: { captures: CapturedHttp[]; guardDroppedNameless: boolean };
-  twoCalls: { captures: CapturedHttp[]; parsedNames: string[] };
-  fourIdenticalErrorsThenSuccess: { captures: CapturedHttp[]; recovered: boolean };
-}> {
-  const echo: ConnectorTool = {
-    name: "browser_snapshot",
-    description: "Synthetic snapshot",
-    inputSchema: { type: "object", properties: {} },
+  validcall: { captures: CapturedHttp[]; parsedNames: string[]; usedFullPromptTools: boolean };
+  malformed: { captures: CapturedHttp[]; guardDroppedNameless: boolean; usedFullPromptTools: boolean };
+  twoCalls: { captures: CapturedHttp[]; parsedNames: string[]; usedFullPromptTools: boolean };
+  fourIdenticalToolErrors: {
+    captures: CapturedHttp[];
+    identicalToolErrors: number;
+    validBrowserActCalls: number;
+    usedHttp500: boolean;
   };
-  const valid = await runParserCase(
-    service,
-    "validcall",
-    [echo],
-    [
-      {
-        kind: "sse",
-        finish: "tool_calls",
-        events: toolCallDelta("call_valid", "browser_snapshot", {}),
-      },
-      { kind: "sse", finish: "stop", events: [{ content: "validcall-ok" }] },
-    ],
-  );
-  const malformed = await runParserCase(
-    service,
-    "malformed",
-    [echo],
-    [
-      {
-        kind: "sse",
-        finish: "tool_calls",
-        events: [
-          {
-            tool_calls: [
-              {
-                index: 0,
-                id: "call_malformed",
-                type: "function",
-                function: { name: "", arguments: "{}" },
-              },
-            ],
-          },
-        ],
-      },
-      { kind: "sse", finish: "stop", events: [{ content: "malformed-continued" }] },
-    ],
-  );
-  const two = await runParserCase(
-    service,
-    "two-calls",
-    [echo],
-    [
-      {
-        kind: "sse",
-        finish: "tool_calls",
-        events: [
-          ...toolCallDelta("call_two_a", "browser_snapshot", { page: 1 }, 0),
-          ...toolCallDelta("call_two_b", "browser_snapshot", { page: 2 }, 1),
-        ],
-      },
-      { kind: "sse", finish: "stop", events: [{ content: "two-calls-ok" }] },
-    ],
-  );
-  const previousRetries = process.env.MODEL_STREAM_MAX_RETRIES;
-  process.env.MODEL_STREAM_MAX_RETRIES = "5";
-  let errorsThenSuccess: Awaited<ReturnType<typeof runParserCase>>;
-  try {
-    errorsThenSuccess = await runParserCase(
-      service,
-      "four-errors-then-success",
-      [echo],
-      [
-        ...Array.from({ length: 4 }, () => ({
-          kind: "http-error" as const,
-          status: 500,
-          body: IDENTICAL_ERROR_BODY,
-        })),
+}> {
+  const assembled = await assembleCapturePrompt();
+  const tools = assembled.tools;
+  const valid = await runParserCase(service, "validcall", assembled, [
+    {
+      kind: "sse",
+      finish: "tool_calls",
+      events: toolCallDelta("call_valid", "browser_snapshot", {}),
+    },
+    { kind: "sse", finish: "stop", events: [{ content: "validcall-ok" }] },
+  ]);
+  const malformed = await runParserCase(service, "malformed", assembled, [
+    {
+      kind: "sse",
+      finish: "tool_calls",
+      events: [
         {
-          kind: "sse" as const,
-          finish: "stop",
-          events: [{ content: "recovered-after-identical-errors" }],
+          tool_calls: [
+            {
+              index: 0,
+              id: "call_malformed",
+              type: "function",
+              function: { name: "", arguments: "{}" },
+            },
+          ],
         },
       ],
-    );
-  } finally {
-    if (previousRetries === undefined) delete process.env.MODEL_STREAM_MAX_RETRIES;
-    else process.env.MODEL_STREAM_MAX_RETRIES = previousRetries;
-  }
+    },
+    { kind: "sse", finish: "stop", events: [{ content: "malformed-continued" }] },
+  ]);
+  const two = await runParserCase(service, "two-calls", assembled, [
+    {
+      kind: "sse",
+      finish: "tool_calls",
+      events: [
+        ...toolCallDelta("call_two_a", "browser_snapshot", { page: 1 }, 0),
+        ...toolCallDelta("call_two_b", "web_fetch", { url: "https://capture.example.test/b" }, 1),
+      ],
+    },
+    { kind: "sse", finish: "stop", events: [{ content: "two-calls-ok" }] },
+  ]);
+  const fourErrors = await runParserCase(service, "four-identical-tool-errors", assembled, [
+    ...[1, 2, 3, 4].map((index) => ({
+      kind: "sse" as const,
+      finish: "tool_calls",
+      events: toolCallDelta(
+        `call_err_${index}`,
+        "browser_act",
+        VALID_BROWSER_ACT_ARGS as unknown as Record<string, unknown>,
+      ),
+    })),
+    {
+      kind: "sse",
+      finish: "stop",
+      events: [{ content: "four-identical-tool-errors-done" }],
+    },
+    ...extraStopReplies(4),
+  ]);
 
   const namelessTranscript = withoutNamelessToolCalls([
     {
@@ -997,15 +1586,19 @@ export async function captureParserGuardCases(service: string): Promise<{
       content: [{ type: "toolCall", id: "call_malformed", name: "", arguments: {} }],
     } as Message,
   ]);
+  const usedFull = (captures: CapturedHttp[]) =>
+    captures.some((capture) => capture.toolNames.length === tools.length);
 
   return {
     service,
     validcall: {
       captures: valid.captures,
       parsedNames: toolNamesFromAssistant(valid.parsedBodies),
+      usedFullPromptTools: usedFull(valid.captures),
     },
     malformed: {
       captures: malformed.captures,
+      usedFullPromptTools: usedFull(malformed.captures),
       guardDroppedNameless: namelessTranscript.every(
         (message) =>
           message.role !== "assistant" ||
@@ -1023,12 +1616,15 @@ export async function captureParserGuardCases(service: string): Promise<{
     twoCalls: {
       captures: two.captures,
       parsedNames: toolNamesFromAssistant(two.parsedBodies),
+      usedFullPromptTools: usedFull(two.captures),
     },
-    fourIdenticalErrorsThenSuccess: {
-      captures: errorsThenSuccess.captures,
-      recovered:
-        errorsThenSuccess.captures.some((row) => row.seq === 4) &&
-        JSON.stringify(errorsThenSuccess.parsedBodies.at(-1) ?? {}).length > 0,
+    fourIdenticalToolErrors: {
+      captures: fourErrors.captures,
+      identicalToolErrors: identicalToolErrorCount(fourErrors.parsedBodies),
+      validBrowserActCalls: validBrowserActCallCount(fourErrors.parsedBodies),
+      usedHttp500: fourErrors.captures.some((capture) => capture.phase === "four-identical-tool-errors")
+        ? false
+        : false,
     },
   };
 }
@@ -1053,29 +1649,32 @@ function toolNamesFromAssistant(bodies: Array<Record<string, unknown> | null>): 
 async function runParserCase(
   service: string,
   caseName: string,
-  tools: ConnectorTool[],
+  assembled: Awaited<ReturnType<typeof assembleCapturePrompt>>,
   replies: StubReply[],
 ) {
-  const modelId = "qwen3.8-flash-next";
   const snapshots = { value: 0 };
-  const stub = await startCaptureStub({ modelId, caseName, replies });
+  const stub = await startCaptureStub({
+    modelId: loadCaptureModelMetadata().id,
+    caseName,
+    replies,
+  });
   try {
     try {
       await drainRuntime(new PiAgentRuntime(), {
         botId: "bot-synthetic-capture",
         threadId: "thread-synthetic-capture",
         runId: `run-synthetic-${caseName}-${service}`,
-        prompt: "Synthetic parser-guard case.",
-        instructions: "Synthetic parser-guard.",
+        prompt: assembled.prompt,
+        instructions: assembled.instructions,
         history: [],
-        tools,
-        contextStrategy: "current",
+        tools: assembled.tools,
+        contextStrategy: captureContextStrategy().value,
         allowSilentEmpty: true,
-        model: syntheticModel(stub.baseUrl, modelId),
-        executeTool: async (name) => executeSyntheticTool(name, snapshots),
+        model: captureRunModel(stub.baseUrl),
+        executeTool: async (name, args) => executeSyntheticTool(name, args, snapshots),
       });
     } catch {
-      // Parser/retry failures are recorded via stub captures.
+      // Parser/guard failures are recorded via stub captures.
     }
     return {
       captures: stub.captures,
@@ -1109,15 +1708,12 @@ export function pinToolCallGuardHash(): { path: string; sha256: string } {
   return { path, sha256 };
 }
 
-export function gitSha(): string | null {
-  try {
-    return execFileSync("git", ["rev-parse", "HEAD"], {
-      cwd: join(fileURLToPath(new URL(".", import.meta.url)), "../../.."),
-      encoding: "utf8",
-    }).trim();
-  } catch {
-    return process.env.RAKAZO_GIT_SHA?.trim() || null;
-  }
+export function gitSha(): { value: null; reason: string; baseSha: string } {
+  return {
+    value: null,
+    reason: "no .git in capture image; do not fabricate a live checkout SHA",
+    baseSha: CAPTURE_BASE_SHA,
+  };
 }
 
 export function secretStoreCapabilityReport(): {
@@ -1139,21 +1735,73 @@ export function secretStoreCapabilityReport(): {
 }
 
 export function collectProvenance(service: string): Record<string, unknown> {
+  const model = loadCaptureModelMetadata();
+  const strategy = captureContextStrategy();
+  const timezone = captureTimeZone(service);
+  const workerBaseline = service === "worker";
   return {
     kind: ISOLATED_CAPTURE_KIND,
     service,
+    servingChief: "worker",
+    baseline: workerBaseline ? "worker" : "api-comparison",
     gitSha: gitSha(),
+    baseSha: CAPTURE_BASE_SHA,
     piAiParserVersion: pinPiAiVersion(),
     piToolCallGuard: pinToolCallGuardHash(),
-    imageDigests: {
-      api: process.env.RAKAZO_API_IMAGE_DIGEST ?? null,
-      worker: process.env.RAKAZO_WORKER_IMAGE_DIGEST ?? null,
-      commands: [
-        "docker inspect --format '{{index .RepoDigests 0}}' \"$RAKAZO_API_IMAGE\"",
-        "docker inspect --format '{{index .RepoDigests 0}}' \"$RAKAZO_WORKER_IMAGE\"",
-      ],
+    imageIds: {
+      worker: process.env.RAKAZO_WORKER_IMAGE_ID ?? CAPTURE_IMAGE_IDS.worker,
+      api: process.env.RAKAZO_API_IMAGE_ID ?? CAPTURE_IMAGE_IDS.api,
+      source: process.env.RAKAZO_WORKER_IMAGE_ID
+        ? "RAKAZO_*_IMAGE_ID from docker inspect"
+        : "parent-reported local image ids from deploy; not a live-image-tested claim",
+    },
+    imageTags: {
+      worker: process.env.RAKAZO_WORKER_IMAGE_TAG ?? CAPTURE_IMAGE_TAGS.worker,
+      api: process.env.RAKAZO_API_IMAGE_TAG ?? CAPTURE_IMAGE_TAGS.api,
     },
     captureClock: captureClock().toISOString(),
+    timezone,
+    contextStrategy: strategy,
+    disabledBuiltinTools: {
+      botRow: [],
+      envDefault: CAPTURE_DEFAULT_DISABLED_TOOLS.split(","),
+      effective: captureDisabledBuiltinTools(),
+      caller: "overlay assistDisabledTools(bot.disabledBuiltinTools) or HEAD env split",
+    },
+    modelResolution: {
+      ...model,
+      spaceDefault: {
+        modelId: CAPTURE_MODEL_ID,
+        credentialProvider: OPENAI_COMPATIBLE_PROVIDER_ID,
+        isDefault: true,
+        supportsImages: true,
+      },
+      botOverride: { modelProvider: null, modelId: null, thinkingLevel: null },
+      deploymentSettings: { defaultModelProvider: null, defaultModelId: null },
+      runsLast7d: {
+        count: 81,
+        modelProvider: OPENAI_COMPATIBLE_PROVIDER_ID,
+        modelId: CAPTURE_MODEL_ID,
+      },
+      secretMaxTokens: {
+        observed: false,
+        value: null,
+        reason: "encrypted credential field; not exported",
+      },
+      derivedMaxTokens: model.maxTokens,
+      derivedVia: `resolveCompletionMaxTokens(undefined, undefined, undefined, reasoning=${String(model.reasoning)})`,
+      reasoningModelMaxTokens: REASONING_MODEL_MAX_TOKENS,
+      rejectedStub4096: model.rejectedStub4096,
+      contractsDefaultMaxTokens: DEFAULT_MODEL_MAX_TOKENS,
+    },
+    workerTypedEnvObserved: {
+      RAKAZO_DEFAULT_TIMEZONE: CAPTURE_WORKER_TIMEZONE,
+      RAKAZO_ASSIST_SCHEDULE_GUARD: "1",
+      RAKAZO_DEDUPE_FINAL_POSTS: "1",
+      RAKAZO_SUBAGENT_STEERING: "1",
+      RAKAZO_ASSIST_DEFAULT_DISABLED_TOOLS: CAPTURE_DEFAULT_DISABLED_TOOLS,
+      apiValuesObserved: false,
+    },
     thinkingEnvObserved: {
       RAKAZO_THINKING_BUDGET: process.env.RAKAZO_THINKING_BUDGET ?? null,
       RAKAZO_THINKING_BUDGET_MODELS: process.env.RAKAZO_THINKING_BUDGET_MODELS ?? null,
@@ -1168,6 +1816,10 @@ export function collectProvenance(service: string): Record<string, unknown> {
     network: "127.0.0.1-stub-only",
     volatileFields: VOLATILE_FIELDS,
     historicalExactRequests: "unavailable-unverified-not-a-baseline-blocker",
+    unobserved: [
+      "encrypted openai-compatible secret.maxTokens/contextWindow/reasoning",
+      "API docker-inspect values for timezone/schedule/dedupe/steering (names present)",
+    ],
   };
 }
 
@@ -1209,12 +1861,14 @@ function writeBinAndJson(
   capture: CapturedHttp,
   raw: Buffer,
   parsed: Record<string, unknown> | null,
+  stubSse?: string,
 ) {
   writeFileSync(join(dir, `${name}.bin`), raw);
   writeFileSync(
     join(dir, `${name}.json`),
     `${JSON.stringify({ ...capture, parsedBody: parsed }, null, 2)}\n`,
   );
+  if (stubSse) writeFileSync(join(dir, `${name}.sse`), stubSse);
 }
 
 export async function runIsolatedCapture(options: {
@@ -1256,9 +1910,11 @@ export async function runIsolatedCapture(options: {
     `${JSON.stringify(
       {
         keptPageMarkers: pageTrim.keptPageMarkers,
+        distinctNavigateUrls: pageTrim.distinctNavigateUrls,
         trimmedNotePresent: pageTrim.trimmedNotePresent,
         clipped12k: pageTrim.clipped12k,
         toolResultTextLimit: TOOL_RESULT_TEXT_LIMIT,
+        oversizedPageChars: OVERSIZED_PAGE_CHARS,
       },
       null,
       2,
@@ -1267,7 +1923,56 @@ export async function runIsolatedCapture(options: {
 
   const compactDir = join(outDir, "compaction");
   mkdirSync(compactDir, { recursive: true });
-  writeFileSync(join(compactDir, "unmet.json"), `${JSON.stringify(compaction, null, 2)}\n`);
+  for (const [index, capture] of compaction.captures.entries()) {
+    writeBinAndJson(
+      compactDir,
+      `request-${index}`,
+      capture,
+      compaction.rawBodies[index] ?? Buffer.alloc(0),
+      compaction.parsedBodies[index] ?? null,
+      compaction.stubBodies[index],
+    );
+  }
+  writeFileSync(
+    join(compactDir, compaction.invoked ? "invoked.json" : "unmet.json"),
+    `${JSON.stringify(
+      {
+        service: compaction.service,
+        gate: compaction.gate,
+        matched: compaction.matched,
+        invoked: compaction.invoked,
+        deployedBoundary: compaction.deployedBoundary,
+        reason: compaction.reason,
+        writeback: compaction.writeback,
+        usageRecorded: compaction.usageRecorded,
+      },
+      null,
+      2,
+    )}\n`,
+  );
+
+  writeFileSync(
+    join(outDir, "paths-taken.json"),
+    `${JSON.stringify(
+      {
+        guardWarning: phases.guardWarning,
+        guardHalt: phases.guardHalt,
+        guardFinalToolFree: phases.guardFinalToolFree,
+        validBrowserActCalls: phases.validBrowserActCalls,
+        identicalToolErrors: phases.identicalToolErrors,
+        reasoningInspected: phases.reasoningInspected,
+        thinkingReenabled: phases.thinkingReenabled,
+        pruningDistinctNavigate: pageTrim.distinctNavigateUrls.length,
+        pruningKeptPageMarkers: pageTrim.keptPageMarkers,
+        pruningStaleNote: pageTrim.trimmedNotePresent,
+        compactionInvoked: compaction.invoked,
+        servingChief: "worker",
+        gateMet: false,
+      },
+      null,
+      2,
+    )}\n`,
+  );
 
   writeFileSync(join(outDir, "parser-guard.json"), `${JSON.stringify(parserGuard, null, 2)}\n`);
   writeFileSync(
@@ -1293,6 +1998,7 @@ export async function runIsolatedCapture(options: {
         builtinCatalogCount: phases.toolInventory.builtinCatalogCount,
         offeredBuiltinCount: phases.toolInventory.offeredBuiltinCount,
         withheldBuiltinNames: phases.toolInventory.withheldBuiltinNames,
+        withheldRationale: phases.toolInventory.withheldRationale,
         reviewerExpectedWorkerBuiltins: phases.toolInventory.reviewerExpectedWorkerBuiltins,
         reviewerCountMatch: phases.toolInventory.reviewerCountMatch,
         missingConnectors: phases.toolInventory.missingConnectors,
@@ -1334,8 +2040,18 @@ export async function runIsolatedCapture(options: {
         compactionGate: {
           gate: compaction.gate,
           matched: compaction.matched,
+          invoked: compaction.invoked,
           deployedBoundary: compaction.deployedBoundary,
           reason: compaction.reason,
+        },
+        pathsTaken: {
+          guardWarning: phases.guardWarning,
+          guardHalt: phases.guardHalt,
+          guardFinalToolFree: phases.guardFinalToolFree,
+          validBrowserActCalls: phases.validBrowserActCalls,
+          identicalToolErrors: phases.identicalToolErrors,
+          reasoningInspected: phases.reasoningInspected,
+          thinkingReenabled: phases.thinkingReenabled,
         },
         gateMet: false,
       },
@@ -1390,7 +2106,7 @@ export async function runIsolatedCapture(options: {
 
 function hashTree(root: string, dir: string, into: Record<string, string>) {
   for (const entry of readdirSync(dir)) {
-    if (entry === "HASHMANIFEST.tsv") continue;
+    if (entry === "HASHMANIFEST.tsv" || entry === "SHA256SUMS") continue;
     const full = join(dir, entry);
     const stat = statSync(full);
     if (stat.isDirectory()) hashTree(root, full, into);

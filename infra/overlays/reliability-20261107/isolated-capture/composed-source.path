@@ -1,0 +1,5 @@
+# One directory per line, or set ISOLATED_CAPTURE_COMPOSED_SOURCE (colon-separated).
+# Must point at actual composed/overlay adapters/src trees. Excerpts are not source of truth.
+# Example:
+# /tmp/compose-check/worker/after/packages/adapters/src
+# /tmp/compose-check/api/after/packages/adapters/src

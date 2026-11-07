@@ -24,9 +24,8 @@
       "consumedBy": ["toolbuilder"],
       "source": "executor.ts assistDisabledTools split(/,/)",
       "semantics": "comma-separated builtin tool names merged into the bot disabled list.",
-      "kind": "comma_tool_names",
-      "disposition": "omit",
-      "omitReason": "freeform tool-name list is not a typed 0/1 switch; capture assembler sets disabledBuiltinTools=[] rather than replaying a live default-off list"
+      "kind": "disabled_tool_csv",
+      "disposition": "forward"
     },
     "RAKAZO_ASSIST_SCHEDULE_GUARD": {
       "consumedBy": ["promptbuilder"],
@@ -40,9 +39,8 @@
       "consumedBy": ["promptbuilder", "compaction"],
       "source": "executor.ts schedule timezone; ctxmem.ts todayIn fallback",
       "semantics": "freeform IANA timezone string.",
-      "kind": "timezone_string",
-      "disposition": "omit",
-      "omitReason": "not a typed 0/1 switch or model-json field; forwarding would copy live tz text; capture pins ISOLATED_CAPTURE_NOW"
+      "kind": "iana_timezone",
+      "disposition": "forward"
     },
     "RAKAZO_ALWAYS_OVERRIDE": {
       "consumedBy": ["promptbuilder"],
@@ -200,7 +198,7 @@
       "semantics": "live model id string.",
       "kind": "model_id",
       "disposition": "omit",
-      "omitReason": "capture injects a synthetic stub model; do not forward live model identifiers"
+      "omitReason": "capture does not forward live PI_DEFAULT_MODEL; model id is qwen3.8-flash-next from space preference via resolveModel"
     },
     "PI_DEFAULT_PROVIDER": {
       "consumedBy": ["parser_guard"],

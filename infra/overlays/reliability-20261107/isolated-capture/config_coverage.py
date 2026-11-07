@@ -8,6 +8,7 @@ not from guessing at env names.
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 
@@ -20,12 +21,6 @@ ENV_ATTR = re.compile(r"(?:process\.env|env)\.([A-Z][A-Z0-9_]*)")
 ENV_INDEX = re.compile(r"(?:process\.env|env)\[(['\"])([A-Z][A-Z0-9_]*)\1\]")
 BOTDIR_CALL = re.compile(r"""botdir(?:Switch|Number)\(\s*['\"]([A-Z][A-Z0-9_]*)['\"]""")
 
-LIVE_ROOTS = (
-    Path("/tmp/compose-check/worker/after/packages/adapters/src"),
-    Path("/tmp/compose-check/api/after/packages/adapters/src"),
-    BUNDLE.parents[3] / "packages" / "adapters" / "src",
-)
-
 FORWARD_KINDS = {
     "off_when_0",
     "on_when_1",
@@ -35,7 +30,34 @@ FORWARD_KINDS = {
     "int",
     "model_list",
     "model_json",
+    "disabled_tool_csv",
+    "iana_timezone",
 }
+
+
+def composed_source_roots(bundle: Path = BUNDLE) -> list[Path]:
+    raw = os.environ.get("ISOLATED_CAPTURE_COMPOSED_SOURCE", "").strip()
+    listed: list[str] = []
+    if raw:
+        listed.extend(part.strip() for part in raw.split(":") if part.strip())
+    marker = bundle / "composed-source.path"
+    if marker.exists():
+        listed.extend(
+            line.strip()
+            for line in marker.read_text().splitlines()
+            if line.strip() and not line.startswith("#")
+        )
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for item in listed:
+        path = Path(item)
+        key = str(path.resolve()) if path.exists() else str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        if path.is_dir():
+            roots.append(path)
+    return roots
 
 
 def load_schema(path: Path = SCHEMA_PATH) -> dict:
@@ -85,24 +107,19 @@ def load_allowlist(path: Path = ALLOWLIST_PATH) -> dict[str, str]:
 def scan_sources(bundle: Path = BUNDLE, modules: list[dict[str, object]] | None = None) -> dict[str, list[str]]:
     rows = modules if modules is not None else load_modules()
     consumed: dict[str, set[str]] = {}
+    roots = composed_source_roots(bundle)
     for row in rows:
         roles = list(row["consumedBy"])
-        texts: list[tuple[str, str]] = []
-        excerpt = str(row.get("excerpt") or "")
-        if excerpt:
-            excerpt_path = bundle / excerpt
-            if excerpt_path.exists():
-                texts.append((str(excerpt_path), excerpt_path.read_text()))
         live = str(row.get("live") or "")
-        if live:
-            for root in LIVE_ROOTS:
-                candidate = root / live
-                if candidate.exists():
-                    texts.append((str(candidate), candidate.read_text()))
-        for origin, text in texts:
-            for name in extract_env_names(text):
+        if not live:
+            continue
+        for root in roots:
+            candidate = root / live
+            if not candidate.exists():
+                continue
+            for name in extract_env_names(candidate.read_text()):
                 consumed.setdefault(name, set()).update(roles)
-                consumed[name].add(f"file:{Path(origin).name}")
+                consumed[name].add(f"file:{candidate.name}")
     return {name: sorted(origins) for name, origins in sorted(consumed.items())}
 
 
@@ -169,6 +186,13 @@ def preflight(
     if "thinking_budget" in known_kwargs:
         mismatches.append("thinking_budget is a top-level env/body field, not a chat_template_kwargs key")
 
+    roots = composed_source_roots(bundle)
+    if not roots:
+        mismatches.append(
+            "composed source required: set ISOLATED_CAPTURE_COMPOSED_SOURCE or composed-source.path "
+            "to actual overlay/composed adapters/src directories; bundle excerpts are not source of truth"
+        )
+
     ok = not (unexplained or mismatches or omit_without_reason or blocked_forward)
     return {
         "ok": ok,
@@ -188,6 +212,7 @@ def preflight(
             if spec.get("disposition") == "omit"
         ),
         "modelJsonKnownFields": sorted(known_kwargs),
+        "composedSourceRoots": [str(path) for path in composed_source_roots(bundle)],
     }
 
 

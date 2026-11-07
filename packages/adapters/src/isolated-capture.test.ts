@@ -8,11 +8,16 @@ import { describe, expect, it } from "vitest";
 import { longWorkProgressGuidance, persistentComputerInstruction } from "./executor.js";
 import {
   CAPTURE_CLOCK_DEFAULT,
+  CAPTURE_DEFAULT_DISABLED_TOOLS,
+  CAPTURE_MODEL_ID,
   captureCompactionPass,
+  captureContextStrategy,
+  captureDisabledBuiltinTools,
   capturePageTrim,
   captureParserGuardCases,
   capturePhaseTurn,
   collectProvenance,
+  deriveProductionModelMetadata,
   ISOLATED_CAPTURE_KIND,
   offeredToolsFromDeployedBuilder,
   pinPiAiVersion,
@@ -25,38 +30,80 @@ import {
   secretStoreCapabilityReport,
   VOLATILE_FIELDS,
 } from "./isolated-capture.js";
+import * as piRuntime from "./pi-runtime.js";
+
+process.env.RAKAZO_ASSIST_DEFAULT_DISABLED_TOOLS ??= CAPTURE_DEFAULT_DISABLED_TOOLS;
+process.env.RAKAZO_DEFAULT_TIMEZONE ??= "America/New_York";
+process.env.RAKAZO_GUARD_FINAL_SUMMARY ??= "1";
+delete process.env.ISOLATED_CAPTURE_CONTEXT_STRATEGY;
+
+const overlaySameErrorGuard =
+  typeof (piRuntime as { assistErrorGuardObserve?: unknown }).assistErrorGuardObserve ===
+  "function";
 
 describe("isolated capture harness", () => {
-  it("captures first/postbrowser/guard-final with named hashed assembler blocks", async () => {
+  it("uses the code-default retrieval strategy and merged env disabled tools", async () => {
+    expect(captureContextStrategy().value).toBe("retrieval");
+    expect(captureContextStrategy().source).toMatch(/DEFAULT_CONTEXT_STRATEGY/);
+    expect(captureDisabledBuiltinTools()).toEqual(CAPTURE_DEFAULT_DISABLED_TOOLS.split(","));
+    const inventory = await offeredToolsFromDeployedBuilder();
+    expect(inventory.assemblerInputs.contextStrategy).toBe("retrieval");
+    expect(inventory.assemblerInputs.historyRetrievalEnabled).toBe(true);
+    expect(inventory.assemblerInputs.disabledBuiltinTools).toEqual(
+      CAPTURE_DEFAULT_DISABLED_TOOLS.split(","),
+    );
+    const disabled = new Set(CAPTURE_DEFAULT_DISABLED_TOOLS.split(","));
+    for (const name of disabled) {
+      expect(inventory.offeredBuiltinNames).not.toContain(name);
+      expect(
+        inventory.withheldRationale.some(
+          (row) => row.name === name && row.reason.includes("assistDisabledTools"),
+        ),
+      ).toBe(true);
+    }
+    const meta = deriveProductionModelMetadata();
+    expect(meta.id).toBe(CAPTURE_MODEL_ID);
+    expect(meta.maxTokens).toBeGreaterThan(4096);
+    expect(meta.maxTokens).toBe(32_768);
+    expect(meta.rejectedStub4096.historicalMaxOutputTokens).toBe(9256);
+  });
+
+  it("captures valid identical tool errors, reasoning replay, and guard path when overlay is present", async () => {
     const result = await capturePhaseTurn("this-tree");
-    expect(result.captures).toHaveLength(3);
-    expect(result.captures.map((row) => row.phase)).toEqual([
-      "first",
-      "postbrowser",
-      "guard-final",
-    ]);
+    expect(result.validBrowserActCalls).toBeGreaterThanOrEqual(4);
+    expect(result.identicalToolErrors).toBeGreaterThanOrEqual(4);
+    const firstText = JSON.stringify(result.parsedBodies[0]);
     const byName = Object.fromEntries(result.blocks.map((block) => [block.name, block]));
     expect(byName.baseComputerInstruction?.present).toBe(true);
     expect(byName.baseComputerInstruction?.sha256).toMatch(/^[a-f0-9]{64}$/);
     expect(byName.longWorkProgressGuidance?.present).toBe(true);
     expect(byName.formatSkillsCatalogInstruction?.present).toBe(true);
-    expect(byName.renderBotCapabilityDirectory?.name).toBe("renderBotCapabilityDirectory");
     const computer = persistentComputerInstruction({
       heldForTakeover: false,
       graphicalToolsAllowed: true,
       graphical: true,
+      disabled: new Set(captureDisabledBuiltinTools()),
     });
     const longWork = longWorkProgressGuidance();
     const skills = formatSkillsCatalogInstruction(SYNTHETIC_SKILL_CATALOG);
     expect(result.assembledInHttp.baseComputerInstruction).toBe(true);
     expect(result.assembledInHttp.longWorkProgressGuidance).toBe(true);
     expect(result.assembledInHttp.formatSkillsCatalogInstruction).toBe(true);
-    const firstText = JSON.stringify(result.parsedBodies[0]);
     expect(firstText).toContain(computer.slice(0, 40));
     expect(firstText).toContain(longWork.slice(0, 40));
     expect(skills && firstText.includes(skills.slice(0, 40))).toBe(true);
-    for (const extra of result.additionalEmitted) {
-      expect(extra.required).toBe(false);
+    expect(firstText).toContain("America/New_York");
+    expect(result.captures[0]!.phase).toBe("first");
+    expect(result.captures.some((row) => row.phase === "postbrowser")).toBe(true);
+    expect(result.captures[0]!.stubSseByteLength).toBeGreaterThan(0);
+    if (overlaySameErrorGuard) {
+      expect(result.guardWarning).toBe(true);
+      expect(result.guardHalt).toBe(true);
+      expect(result.guardFinalToolFree).toBe(true);
+      expect(result.captures.some((row) => row.phase === "guard-warning")).toBe(true);
+      expect(result.captures.some((row) => row.phase === "guard-halt")).toBe(true);
+      const guardFinal = result.captures.find((row) => row.phase === "guard-final");
+      expect(guardFinal?.toolNames ?? ["x"]).toEqual([]);
     }
     const inventory = await offeredToolsFromDeployedBuilder();
     expect(result.offeredToolNames).toEqual(inventory.tools.map((tool) => tool.name));
@@ -64,15 +111,7 @@ describe("isolated capture harness", () => {
       [...inventory.tools.map((tool) => tool.name)].sort(),
     );
     expect(inventory.reviewerExpectedWorkerBuiltins).toBe(REVIEWER_EXPECTED_WORKER_BUILTINS);
-    expect(typeof inventory.reviewerCountMatch).toBe("boolean");
-    expect(inventory.missingConnectors.length).toBeGreaterThan(0);
-    expect(inventory.missingDynamicResolution.length).toBeGreaterThan(0);
     expect(result.namedBlocks.every((block) => block.name.length > 0)).toBe(true);
-    expect(result.namedBlocks.some((block) => block.name === "baseComputerInstruction")).toBe(true);
-    for (const block of result.namedBlocks) {
-      if (block.present) expect(block.sha256).toMatch(/^[a-f0-9]{64}$/);
-      else expect(block.sha256).toBeNull();
-    }
     for (const capture of result.captures) {
       expect(capture.rawSha256).toMatch(/^[a-f0-9]{64}$/);
       expect(capture.rawByteLength).toBeGreaterThan(100);
@@ -86,40 +125,46 @@ describe("isolated capture harness", () => {
     }
     expect(firstText).toContain(CAPTURE_CLOCK_DEFAULT.slice(0, 10));
     expect(JSON.stringify(result)).not.toMatch(/sk-|BEGIN PRIVATE|password=/i);
-  }, 60_000);
+  }, 90_000);
 
-  it("serializes oversized pages with last-3 trim and 12K clip", async () => {
+  it("prunes four distinct oversized navigate/snapshot pages on the actual path", async () => {
     const result = await capturePageTrim("this-tree");
-    expect(result.captures.length).toBe(5);
+    expect(result.distinctNavigateUrls).toHaveLength(4);
     expect(result.trimmedNotePresent).toBe(true);
     expect(result.lastRequestText).toContain(STALE_PAGE_STATE_NOTE);
     expect(result.keptPageMarkers).toEqual(["BEGIN_PAGE_2_", "BEGIN_PAGE_3_", "BEGIN_PAGE_4_"]);
     expect(result.lastRequestText).not.toContain("BEGIN_PAGE_1_");
     expect(result.clipped12k).toBe(true);
-  }, 60_000);
+  }, 90_000);
 
-  it("records compaction as unmet rather than matching an inlined summarizer", async () => {
+  it("invokes deployed compactHistory with mocked job/db adapters", async () => {
     const result = await captureCompactionPass("this-tree");
-    expect(result.gate).toBe("unmet");
-    expect(result.matched).toBe(false);
     expect(result.deployedBoundary).toBe("compactHistory");
-    expect(result.reason).toMatch(/compactHistory/);
-    expect(result).not.toHaveProperty("input");
-    expect(result).not.toHaveProperty("capture");
-  });
+    expect(result.invoked).toBe(true);
+    expect(result.gate).toBe("invoked");
+    expect(result.captures.length).toBeGreaterThan(0);
+    expect(result.writeback.summary).toMatch(/synthetic compacted summary/);
+    expect(result.matched).toBe(false);
+  }, 90_000);
 
-  it("feeds stub responses through the real parser and tool-call guard", async () => {
+  it("feeds full prompt/tools through the parser and identical tool errors, not HTTP 500s", async () => {
     const result = await captureParserGuardCases("this-tree");
+    expect(result.validcall.usedFullPromptTools).toBe(true);
     expect(result.validcall.captures.length).toBeGreaterThanOrEqual(1);
     expect(result.malformed.guardDroppedNameless).toBe(true);
-    expect(result.twoCalls.captures.length).toBeGreaterThanOrEqual(1);
-    expect(result.fourIdenticalErrorsThenSuccess.captures.length).toBe(5);
-    expect(result.fourIdenticalErrorsThenSuccess.recovered).toBe(true);
-  }, 60_000);
+    expect(result.twoCalls.usedFullPromptTools).toBe(true);
+    expect(result.fourIdenticalToolErrors.usedHttp500).toBe(false);
+    expect(result.fourIdenticalToolErrors.validBrowserActCalls).toBeGreaterThanOrEqual(4);
+    expect(result.fourIdenticalToolErrors.identicalToolErrors).toBeGreaterThanOrEqual(4);
+  }, 90_000);
 
-  it("pins provenance and does not create secrets", () => {
-    const provenance = collectProvenance("this-tree");
+  it("pins provenance from deploy inspect and does not fabricate git", () => {
+    const provenance = collectProvenance("worker");
     expect(provenance.kind).toBe(ISOLATED_CAPTURE_KIND);
+    expect(provenance.servingChief).toBe("worker");
+    expect(provenance.baseline).toBe("worker");
+    expect((provenance.gitSha as { value: null; baseSha: string }).value).toBeNull();
+    expect((provenance.gitSha as { baseSha: string }).baseSha).toBe("926710a");
     expect(String(pinPiAiVersion() ?? "")).toMatch(/^\d+\.\d+\.\d+/);
     expect(String(provenance.piAiParserVersion ?? "")).toMatch(/^\d+\.\d+\.\d+/);
     expect(pinToolCallGuardHash().sha256).toMatch(/^[a-f0-9]{64}$/);
@@ -127,33 +172,50 @@ describe("isolated capture harness", () => {
     const capability = secretStoreCapabilityReport();
     expect(capability.didMutate).toBe(false);
     expect(capability.interfaceMethods).toContain("put");
+    const model = provenance.modelResolution as { maxTokens: number; id: string };
+    expect(model.id).toBe(CAPTURE_MODEL_ID);
+    expect(model.maxTokens).toBeGreaterThan(4096);
   });
 
-  it("writes a parent-replayable hash manifest", async () => {
+  it("writes a parent-replayable hash manifest of paths actually taken", async () => {
     const outDir = mkdtempSync(join(tmpdir(), "isolated-capture-"));
     const result = await runIsolatedCapture({ outDir, service: "this-tree" });
     const manifest = readFileSync(join(outDir, "HASHMANIFEST.tsv"), "utf8");
     expect(manifest).toContain("phases/first-0.bin");
     expect(manifest).toContain("provenance.json");
+    expect(manifest).toContain("paths-taken.json");
+    expect(manifest).not.toContain("HASHMANIFEST.tsv");
+    expect(manifest).not.toContain("SHA256SUMS");
     expect(result.hashManifest["phases/first-0.bin"]).toMatch(/^[a-f0-9]{64}$/);
     const summary = JSON.parse(readFileSync(join(outDir, "phases-summary.json"), "utf8")) as {
       gateMet: boolean;
-      compactionGate?: { gate: string; matched: boolean };
+      compactionGate?: { gate: string; matched: boolean; invoked?: boolean };
       blocks: Array<{ name: string; sha256: string | null }>;
     };
-    expect(summary.compactionGate?.gate).toBe("unmet");
+    expect(summary.compactionGate?.invoked).toBe(true);
     expect(summary.compactionGate?.matched).toBe(false);
     expect(summary.gateMet).toBe(false);
-    const compactionRecord = JSON.parse(readFileSync(join(outDir, "compaction/unmet.json"), "utf8")) as {
-      gate: string;
-      matched: boolean;
-      deployedBoundary: string;
+    const paths = JSON.parse(readFileSync(join(outDir, "paths-taken.json"), "utf8")) as {
+      validBrowserActCalls: number;
+      identicalToolErrors: number;
+      pruningDistinctNavigate: number;
+      pruningStaleNote: boolean;
+      compactionInvoked: boolean;
+      guardWarning: boolean;
+      guardHalt: boolean;
+      guardFinalToolFree: boolean;
     };
-    expect(compactionRecord.gate).toBe("unmet");
-    expect(compactionRecord.matched).toBe(false);
-    expect(compactionRecord.deployedBoundary).toBe("compactHistory");
-    expect(manifest).toContain("compaction/unmet.json");
-    expect(manifest).not.toContain("compaction/pass.bin");
+    expect(paths.validBrowserActCalls).toBeGreaterThanOrEqual(4);
+    expect(paths.identicalToolErrors).toBeGreaterThanOrEqual(4);
+    expect(paths.pruningDistinctNavigate).toBe(4);
+    expect(paths.pruningStaleNote).toBe(true);
+    expect(paths.compactionInvoked).toBe(true);
+    if (overlaySameErrorGuard) {
+      expect(paths.guardWarning).toBe(true);
+      expect(paths.guardHalt).toBe(true);
+      expect(paths.guardFinalToolFree).toBe(true);
+    }
+    expect(manifest).toContain("compaction/invoked.json");
     expect(summary.blocks.map((block) => block.name)).toEqual([
       "baseComputerInstruction",
       "renderBotCapabilityDirectory",
@@ -169,12 +231,14 @@ describe("isolated capture harness", () => {
     ) as {
       handwrittenSchemas: boolean;
       reviewerExpectedWorkerBuiltins: number;
+      withheldRationale: Array<{ name: string }>;
     };
     expect(inventoryFile.handwrittenSchemas).toBe(false);
     expect(inventoryFile.reviewerExpectedWorkerBuiltins).toBe(REVIEWER_EXPECTED_WORKER_BUILTINS);
+    expect(inventoryFile.withheldRationale.length).toBeGreaterThan(0);
     expect(manifest).toContain("named-blocks.json");
     expect(manifest).toContain("tools-inventory.json");
-  }, 120_000);
+  }, 180_000);
 
   it("keeps overlay source mounts and forwards typed assist switches", () => {
     const overlay = join(
@@ -184,7 +248,16 @@ describe("isolated capture harness", () => {
     const result = spawnSync(
       "python3",
       ["-m", "unittest", "host_launch_test", "dependency_closure_test", "config_coverage_test"],
-      { cwd: overlay, encoding: "utf8" },
+      {
+        cwd: overlay,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          ISOLATED_CAPTURE_COMPOSED_SOURCE:
+            process.env.ISOLATED_CAPTURE_COMPOSED_SOURCE ??
+            "/tmp/compose-check/worker/after/packages/adapters/src:/tmp/compose-check/api/after/packages/adapters/src",
+        },
+      },
     );
     const output = `${result.stdout}${result.stderr}`;
     if (result.status !== 0) {

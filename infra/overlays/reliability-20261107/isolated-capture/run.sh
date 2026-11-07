@@ -6,6 +6,12 @@ set -euo pipefail
 SERVICE="${ISOLATED_CAPTURE_SERVICE:?set ISOLATED_CAPTURE_SERVICE=worker|api}"
 OUT="${ISOLATED_CAPTURE_OUT:-/out}"
 export ISOLATED_CAPTURE_NOW="${ISOLATED_CAPTURE_NOW:-2026-11-07T00:00:00.000Z}"
+export RAKAZO_ASSIST_DEFAULT_DISABLED_TOOLS="${RAKAZO_ASSIST_DEFAULT_DISABLED_TOOLS:-render_plot,skill_create,skill_update,skill_delete,create_space}"
+export RAKAZO_DEFAULT_TIMEZONE="${RAKAZO_DEFAULT_TIMEZONE:-America/New_York}"
+export RAKAZO_GUARD_FINAL_SUMMARY="${RAKAZO_GUARD_FINAL_SUMMARY:-1}"
+if [[ -f /opt/isolated-capture/fixtures/qwen3.8-flash-next.json && -z "${ISOLATED_CAPTURE_MODEL_METADATA_FILE:-}" ]]; then
+  export ISOLATED_CAPTURE_MODEL_METADATA_FILE="/opt/isolated-capture/fixtures/qwen3.8-flash-next.json"
+fi
 mkdir -p "$OUT"
 ADAPTERS="${RAKAZO_ADAPTERS_SRC:-/app/packages/adapters/src}"
 HARNESS="$ADAPTERS/isolated-capture.ts"

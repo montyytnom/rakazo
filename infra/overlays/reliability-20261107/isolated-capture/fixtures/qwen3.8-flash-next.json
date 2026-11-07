@@ -1,0 +1,9 @@
+{
+  "id": "qwen3.8-flash-next",
+  "provider": "openai-compatible",
+  "reasoning": true,
+  "acceptsImages": true,
+  "maxTokens": 32768,
+  "contextWindow": 131072,
+  "source": "executor.resolveModel space default + resolveCompletionMaxTokens(undefined, undefined, undefined, reasoning=true)=REASONING_MODEL_MAX_TOKENS. secret.maxTokens unobserved. Stub 4096 rejected (historical maxOutput 9256, 3 rows >4096)."
+}
