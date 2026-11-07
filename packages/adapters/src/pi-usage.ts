@@ -167,27 +167,34 @@ export function usageReportingFetch(
     const body = response.body.pipeThrough(
       new TransformStream<Uint8Array, Uint8Array>({
         transform(chunk, controller) {
-          controller.enqueue(chunk);
           buffer = (buffer + decoder.decode(chunk, { stream: true })).replace(/\r\n/g, "\n");
           let boundary = buffer.indexOf("\n\n");
           while (boundary >= 0) {
             const frame = buffer.slice(0, boundary);
-            if (!dropping && frame.length <= 262144) {
-              try {
-                observe(frame);
-              } catch (error) {
-                controller.error(error);
-                return;
-              }
-            }
-            dropping = false;
             buffer = buffer.slice(boundary + 2);
+            if (dropping) {
+              dropping = false;
+              boundary = buffer.indexOf("\n\n");
+              continue;
+            }
+            if (frame.length > 262144) {
+              dropping = true;
+              boundary = buffer.indexOf("\n\n");
+              continue;
+            }
+            try {
+              observe(frame);
+            } catch (error) {
+              controller.error(error);
+              return;
+            }
             boundary = buffer.indexOf("\n\n");
           }
           if (buffer.length > 262144) {
             buffer = buffer.slice(-1);
             dropping = true;
           }
+          controller.enqueue(chunk);
         },
       }),
     );

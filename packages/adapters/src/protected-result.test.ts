@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
+  createMemoryVault,
   createProtectedResultStore,
   handoffProtectedResult,
+  persistProtectedResultDurable,
+  recoverProtectedPlaintext,
+  redactReplayResult,
   redactToolResultForModel,
 } from "./protected-result.js";
 
@@ -23,6 +27,24 @@ describe("protected result persist path", () => {
       op_id: handle!.handle,
     });
     expect(JSON.stringify(delivered)).not.toContain(FIXTURE);
-    expect(handoffProtectedResult(store, "op-missing")).toEqual({ error: "unknown op_id" });
+    expect(handoffProtectedResult(store, "op-missing")).toEqual({
+      error: "unknown op_id; hash cannot recover the secret",
+    });
+  });
+
+  it("replays a stored effect without re-exposing plaintext and cannot invert the hash", async () => {
+    const store = createProtectedResultStore();
+    const vault = createMemoryVault();
+    const handle = await persistProtectedResultDurable(store, FIXTURE, vault);
+    expect(await recoverProtectedPlaintext(store, handle.handle, vault)).toBe(FIXTURE);
+    expect(JSON.stringify(redactReplayResult({ tree: `New password: ${FIXTURE}` }))).not.toContain(
+      FIXTURE,
+    );
+    expect(JSON.stringify(handle)).not.toContain(FIXTURE);
+    store.delete(handle.handle);
+    expect(handoffProtectedResult(store, handle.handle)).toEqual({
+      error: "unknown op_id; hash cannot recover the secret",
+    });
+    expect(await recoverProtectedPlaintext(store, handle.handle, vault)).toBe(FIXTURE);
   });
 });

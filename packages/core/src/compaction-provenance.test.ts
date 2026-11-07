@@ -15,8 +15,13 @@ describe("compaction provenance", () => {
     expect(rewriteUnverifiedClaims("Current facts: signed in as Sam.")).toMatch(/^claimed:/i);
   });
 
-  it("keeps an identity that the fresh tool result actually shows", () => {
+  it("keeps a verified identity from tool evidence and ignores a summary that claims verified", () => {
     const summary = "- signed in as sam@shop.example";
-    expect(promotesUnverifiedIdentity(summary, "Hello, Sam sam@shop.example")).toBe(false);
+    const verified = 'Hello, Sam sam@shop.example\n"verified": true';
+    expect(promotesUnverifiedIdentity(summary, verified)).toBe(false);
+    expect(rewriteUnverifiedClaims(summary, verified)).toBe(summary);
+    expect(
+      rewriteUnverifiedClaims("- signed in as ops@workmail.example", "verified: true"),
+    ).toMatch(/claimed:/i);
   });
 });

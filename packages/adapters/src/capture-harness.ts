@@ -72,23 +72,99 @@ export function captureCallLimits(env: NodeJS.ProcessEnv = process.env): {
   };
 }
 
+export const PRODUCTION_CAPTURE = "production-live-not-present";
+export const RECONSTRUCTION = "reconstruction-overlay-offline";
+
+export function toolNamesFromBuiltinSource(source: string): string[] {
+  const names = [...source.matchAll(/^\s*name:\s*"([a-z0-9_]+)"/gm)].map((match) => match[1]!);
+  return [...new Set(names)];
+}
+
+export async function captureOverlayToolNames(overlayRoot: string | undefined): Promise<{
+  kind: typeof RECONSTRUCTION;
+  productionCapture: false;
+  worker: string[] | null;
+  api: string[] | null;
+} | null> {
+  if (!overlayRoot) return null;
+  const { readFile } = await import("node:fs/promises");
+  const { existsSync } = await import("node:fs");
+  const root = overlayRoot.replace(/\/$/, "");
+  const workerPath = `${root}/opt/docker/rakazo/patches/savedlogins-20261104/src/worker/builtin-tools.ts`;
+  const apiPath = `${root}/opt/docker/rakazo/patches/browserextract/builtin-tools.ts`;
+  const readNames = async (path: string) =>
+    existsSync(path) ? toolNamesFromBuiltinSource(await readFile(path, "utf8")) : null;
+  return {
+    kind: RECONSTRUCTION,
+    productionCapture: false,
+    worker: await readNames(workerPath),
+    api: await readNames(apiPath),
+  };
+}
+
 export async function captureOverlayToolsJson(overlayRoot: string | undefined): Promise<{
   label: typeof CAPTURE_LABEL;
+  kind: typeof RECONSTRUCTION;
+  productionCapture: false;
   variant: "worker" | "api";
   tools: CapturedToolWire[];
 } | null> {
-  if (!overlayRoot) return null;
-  const worker = `${overlayRoot.replace(/\/$/, "")}/opt/docker/rakazo/patches/savedlogins-20261104/src/worker/builtin-tools.ts`;
-  const api = `${overlayRoot.replace(/\/$/, "")}/opt/docker/rakazo/patches/browserextract/builtin-tools.ts`;
-  const { pathToFileURL } = await import("node:url");
-  const { existsSync } = await import("node:fs");
-  const target = existsSync(worker) ? worker : existsSync(api) ? api : "";
-  if (!target) return null;
-  const mod = (await import(pathToFileURL(target).href)) as { builtinAgentTools?: ConnectorTool[] };
-  if (!Array.isArray(mod.builtinAgentTools)) return null;
+  const names = await captureOverlayToolNames(overlayRoot);
+  const variant = names?.worker?.length ? "worker" : names?.api?.length ? "api" : "";
+  if (!names || !variant) return null;
+  const listed = variant === "worker" ? names.worker : names.api;
+  if (!listed) return null;
+  const byName = new Map(
+    serializeToolsWire(builtinAgentTools).map((tool) => [tool.function.name, tool]),
+  );
   return {
     label: CAPTURE_LABEL,
-    variant: existsSync(worker) ? "worker" : "api",
-    tools: serializeToolsWire(mod.builtinAgentTools),
+    kind: RECONSTRUCTION,
+    productionCapture: false,
+    variant,
+    tools: listed.map(
+      (name) =>
+        byName.get(name) ?? {
+          type: "function" as const,
+          function: { name, description: "overlay-only-name-reconstruction", parameters: {} },
+        },
+    ),
+  };
+}
+
+export function reconstructOfflinePhases(input: {
+  apiToolNames: string[];
+  workerToolNames: string[];
+  limits: ReturnType<typeof captureCallLimits>;
+  baseTools: CapturedToolWire[];
+}): {
+  kind: typeof RECONSTRUCTION;
+  productionCapture: false;
+  productionLiveCapture: typeof PRODUCTION_CAPTURE;
+  thinkingUnchanged: true;
+  phases: {
+    first: { tools: CapturedToolWire[]; params: ReturnType<typeof captureCallLimits> };
+    postbrowser: { tools: CapturedToolWire[]; params: ReturnType<typeof captureCallLimits> };
+    "guard-final": { tools: CapturedToolWire[]; params: ReturnType<typeof captureCallLimits> };
+  };
+  apiWorkerNameDelta: string[];
+} {
+  const params = {
+    ...input.limits,
+    thinking: { ...input.limits.thinking, unchanged: true as const },
+  };
+  return {
+    kind: RECONSTRUCTION,
+    productionCapture: false,
+    productionLiveCapture: PRODUCTION_CAPTURE,
+    thinkingUnchanged: true,
+    phases: {
+      first: { tools: input.baseTools, params },
+      postbrowser: { tools: input.baseTools, params },
+      "guard-final": { tools: input.baseTools, params },
+    },
+    apiWorkerNameDelta: [...new Set([...input.apiToolNames, ...input.workerToolNames])].filter(
+      (name) => !input.apiToolNames.includes(name) || !input.workerToolNames.includes(name),
+    ),
   };
 }

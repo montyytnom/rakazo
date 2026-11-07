@@ -6,18 +6,14 @@ const IDENTITY_EMAIL = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
 const VERIFIED_MARKER = /"verified"\s*:\s*true|\bverified\s*:\s*true\b/i;
 
 export function rewriteUnverifiedClaims(summary: string, transcript = ""): string {
-  const ground = `${transcript}\n${summary}`;
-  const verified = VERIFIED_MARKER.test(ground);
+  const verified = VERIFIED_MARKER.test(transcript);
   return summary
     .split(/\n/)
     .map((line) => {
       if (!FACT_LINE.test(line)) return line;
       if (UNVERIFIED_MARK.test(line)) return line;
-      if (
-        verified &&
-        IDENTITY_EMAIL.test(line) &&
-        transcript.includes(line.match(IDENTITY_EMAIL)?.[0] ?? "\0")
-      ) {
+      const email = line.match(IDENTITY_EMAIL)?.[0];
+      if (verified && email && transcript.toLowerCase().includes(email.toLowerCase())) {
         return line;
       }
       if (/\b(done|verified|confirmed|created|logged in|signed in)\b/i.test(line)) {
@@ -34,7 +30,12 @@ export function promotesUnverifiedIdentity(summary: string, pageText = ""): bool
   const email = summary.match(IDENTITY_EMAIL)?.[0];
   if (!email) return false;
   if (UNVERIFIED_MARK.test(summary)) return false;
-  if (pageText.toLowerCase().includes(email.toLowerCase())) return false;
+  if (VERIFIED_MARKER.test(pageText) && pageText.toLowerCase().includes(email.toLowerCase())) {
+    return false;
+  }
+  if (pageText.toLowerCase().includes(email.toLowerCase()) && VERIFIED_MARKER.test(pageText)) {
+    return false;
+  }
   return /\b(signed in|logged in|account)\b/i.test(summary);
 }
 

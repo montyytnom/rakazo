@@ -15,6 +15,21 @@ export function createProtectedResultStore(): ProtectedResultStore {
   return new Map();
 }
 
+export type ProtectedVault = {
+  save(opId: string, plaintext: string): Promise<void>;
+  load(opId: string): Promise<string | undefined>;
+};
+
+export function createMemoryVault(): ProtectedVault {
+  const rows = new Map<string, string>();
+  return {
+    save: async (opId, plaintext) => {
+      rows.set(opId, plaintext);
+    },
+    load: async (opId) => rows.get(opId),
+  };
+}
+
 export function persistProtectedResult(
   store: ProtectedResultStore,
   plaintext: string,
@@ -23,6 +38,31 @@ export function persistProtectedResult(
   const handle = issueProtectedResult(plaintext, at, "verified");
   store.set(handle.handle, { handle, plaintext });
   return handle;
+}
+
+export async function persistProtectedResultDurable(
+  store: ProtectedResultStore,
+  plaintext: string,
+  vault: ProtectedVault,
+  at?: Date,
+): Promise<ProtectedResultHandle> {
+  const handle = persistProtectedResult(store, plaintext, at);
+  await vault.save(handle.handle, plaintext);
+  return handle;
+}
+
+export async function recoverProtectedPlaintext(
+  store: ProtectedResultStore,
+  opId: string,
+  vault?: ProtectedVault,
+): Promise<string | undefined> {
+  const row = store.get(opId);
+  if (row) return row.plaintext;
+  return vault?.load(opId);
+}
+
+export function redactReplayResult(result: unknown, extras: readonly string[] = []): unknown {
+  return redactProtectedTree(result, extras);
 }
 
 export function redactToolResultForModel(
@@ -51,7 +91,9 @@ export function handoffProtectedResult(
   opId: string,
 ): { delivered: boolean; channel: string; op_id: string } | { error: string } {
   const row = store.get(opId);
-  if (!row) return { error: "unknown op_id" };
+  if (!row?.plaintext) {
+    return { error: "unknown op_id; hash cannot recover the secret" };
+  }
   row.handle = { ...row.handle, status: "delivered" };
   return { delivered: true, channel: "secure card to the user", op_id: opId };
 }

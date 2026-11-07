@@ -94,7 +94,7 @@ import {
   redactSecrets,
   renderBotDirectory,
   resolveActionApprovalDetail,
-  resolveTurnIntentId,
+  resolveTurnIntent,
   sameThreadIrreversibleOwner,
   sandboxCommandTimeoutMs,
   sanitizeFinalText,
@@ -105,6 +105,7 @@ import {
   toolRequiresApproval,
   toolRequiresExplicitApproval,
   truncatedPlainText,
+  UNAUTHORIZED_IRREVERSIBLE,
   unattendedTriggerToolRequiresApproval,
   userTurnMessageForRun,
 } from "@rakazo/core";
@@ -351,6 +352,7 @@ import { actorMayUsePrivateEndpoint } from "./private-endpoint.js";
 import {
   createProtectedResultStore,
   handoffProtectedResult,
+  redactReplayResult,
   redactToolResultForModel,
 } from "./protected-result.js";
 import type { RemoteTransportDependencies } from "./remote-mcp.js";
@@ -4434,13 +4436,13 @@ export function createRunExecutor(deps: ExecutorDeps) {
         const pageRefMemory = createRefMemory();
         const protectedResults = createProtectedResultStore();
         const turnToolResults: unknown[] = [];
-        const intentId = resolveTurnIntentId(
-          task.prompt,
+        const turnIntent = resolveTurnIntent(
+          { id: run.sourceMessageId, text: task.prompt },
           history
             .filter((message) => message.role === "user")
-            .map((message) => message.content)
-            .filter(Boolean),
+            .map((message) => ({ id: message.id, text: message.content })),
         );
+        const intentId = turnIntent.intentId;
         const nextMutatingEffectOccurrence = (toolName: string, args: Record<string, unknown>) => {
           const fingerprint = toolEffectIdempotencyKey(runId, toolName, args);
           const occurrence = mutatingEffectOccurrences.get(fingerprint) ?? 0;
@@ -4832,8 +4834,20 @@ export function createRunExecutor(deps: ExecutorDeps) {
               pageRefMemory.lastUrl ?? "",
             );
           }
+          if (irreversible && !turnIntent.authorized) {
+            return {
+              error: UNAUTHORIZED_IRREVERSIBLE,
+              uncertain: true,
+            };
+          }
           if (irreversible) {
-            effectRequest = irreversibleEffectRequest(irreversible, run.threadId, intentId, args);
+            effectRequest = irreversibleEffectRequest(
+              irreversible,
+              run.threadId,
+              intentId,
+              args,
+              turnIntent.sourceMessageId,
+            );
           }
           const effectKey = irreversible
             ? threadIrreversibleEffectKey({
@@ -5183,7 +5197,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
                   return gate.result;
                 }
               } else {
-                return gate.result;
+                return redactReplayResult(gate.result, runSecrets);
               }
             }
             if (gate.action === "paused") {
@@ -9291,6 +9305,11 @@ export async function recordEffect(
         existingRequest: existing.request,
         spaceId: run.spaceId,
         threadId: run.threadId,
+        intentId: (() => {
+          if (!request || typeof request !== "object" || Array.isArray(request)) return undefined;
+          const value = (request as { intentId?: unknown }).intentId;
+          return typeof value === "string" && value ? value : undefined;
+        })(),
       })
     ) {
       consumedIds?.add(existing.id);

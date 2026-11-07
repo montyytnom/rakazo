@@ -1,7 +1,7 @@
 import type { AdapterContext, ComputerRef } from "@rakazo/adapter-kit";
 import {
   classifyBrowserMutation,
-  irreversibleIntentId,
+  resolveTurnIntent,
   threadIrreversibleEffectKey,
 } from "@rakazo/core";
 import { describe, expect, it } from "vitest";
@@ -29,19 +29,21 @@ const ADMIN = "https://admin.example.test/ac/users/u-1001";
 
 describe("synthetic reliability fixtures", () => {
   it("N1: Continue after a landed reset does not click reset again", () => {
-    const first = irreversibleIntentId("Reset the fixture user password");
-    const cont = irreversibleIntentId("Continue", first);
-    expect(cont).toBe(first);
+    const first = resolveTurnIntent({ id: "msg-1", text: "Reset the fixture user password" });
+    const cont = resolveTurnIntent({ id: "msg-2", text: "Continue" }, [
+      { id: "msg-1", text: "Reset the fixture user password" },
+    ]);
+    expect(cont.intentId).toBe(first.intentId);
     const key = threadIrreversibleEffectKey({
       threadId: "thread-1",
-      intentId: cont,
+      intentId: cont.intentId,
       class: "password-reset",
       subject: ADMIN,
     });
     expect(key).toBe(
       threadIrreversibleEffectKey({
         threadId: "thread-1",
-        intentId: first,
+        intentId: first.intentId,
         class: "password-reset",
         subject: ADMIN,
       }),

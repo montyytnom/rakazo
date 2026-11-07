@@ -1,11 +1,13 @@
 import {
   classifyIrreversibleTool,
   irreversibleEffectRequest,
-  irreversibleIntentId,
+  resolveTurnIntent,
   threadIrreversibleEffectKey,
 } from "@rakazo/core";
 import { describe, expect, it } from "vitest";
+import { resolveDuplicateEffectGate } from "./approval-effect.js";
 import { recordEffect } from "./executor.js";
+import { redactReplayResult } from "./protected-result.js";
 
 type Effect = {
   id: string;
@@ -42,7 +44,7 @@ function fixture(initial: Effect[] = []) {
 
 describe("cross-run irreversible ledger", () => {
   it("reuses a completed send after timeout instead of sending again", async () => {
-    const intentId = irreversibleIntentId("Text Pat: running late");
+    const intentId = resolveTurnIntent({ id: "msg-1", text: "Text Pat: running late" }).intentId;
     const classification = classifyIrreversibleTool("installed_execute_tool", {
       name: "mac_messages_send",
       arguments: { handle: "+15550100", text: "Running 10 minutes late." },
@@ -80,8 +82,14 @@ describe("cross-run irreversible ledger", () => {
   });
 
   it("does not reuse a password reset across a new user intent", async () => {
-    const firstIntent = irreversibleIntentId("Reset the fixture user password");
-    const secondIntent = irreversibleIntentId("It did not work. Reset it again.", firstIntent);
+    const firstIntent = resolveTurnIntent({
+      id: "msg-1",
+      text: "Reset the fixture user password",
+    }).intentId;
+    const secondIntent = resolveTurnIntent({
+      id: "msg-2",
+      text: "It did not work. Reset it again.",
+    }).intentId;
     expect(firstIntent).not.toBe(secondIntent);
     const classification = {
       class: "password-reset" as const,
@@ -100,5 +108,46 @@ describe("cross-run irreversible ledger", () => {
       subject: classification.subject,
     });
     expect(firstKey).not.toBe(secondKey);
+  });
+
+  it("fails closed on crash-while-executing and redacts plaintext on completed replay", async () => {
+    const intentId = resolveTurnIntent({ id: "msg-1", text: "Text Pat: running late" }).intentId;
+    const classification = classifyIrreversibleTool("installed_execute_tool", {
+      name: "mac_messages_send",
+      arguments: { handle: "+15550100" },
+    });
+    const key = threadIrreversibleEffectKey({
+      threadId: "thread-1",
+      intentId,
+      class: classification!.class,
+    });
+    const request = irreversibleEffectRequest(classification!, "thread-1", intentId, {
+      handle: "+15550100",
+    });
+    const f = fixture();
+    const first = await recordEffect(
+      f.deps,
+      { id: "run-1", spaceId: "space-1", threadId: "thread-1", botId: "bot-1" },
+      "send",
+      key,
+      request,
+    );
+    first.effect.status = "executing";
+    const second = await recordEffect(
+      f.deps,
+      { id: "run-2", spaceId: "space-1", threadId: "thread-1", botId: "bot-1" },
+      "send",
+      key,
+      request,
+    );
+    expect(second.duplicate).toBe(true);
+    expect(resolveDuplicateEffectGate(second.effect, "send").action).toBe("uncertain");
+    first.effect.status = "completed";
+    first.effect.result = { sent: true, password: "FxNew#2207GenA" };
+    const replay = resolveDuplicateEffectGate(first.effect, "send");
+    expect(replay.action).toBe("return");
+    if (replay.action === "return") {
+      expect(JSON.stringify(redactReplayResult(replay.result))).not.toContain("FxNew#2207GenA");
+    }
   });
 });

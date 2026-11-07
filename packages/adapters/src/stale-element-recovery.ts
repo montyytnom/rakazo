@@ -6,6 +6,7 @@ import type {
   BrowserSnapshotNode,
   ComputerRef,
 } from "@rakazo/adapter-kit";
+import { classifyBrowserMutation } from "@rakazo/core";
 
 export const STALE_ELEMENT_ERROR = /stale element ref|unknown element ref/i;
 export const MAX_STALE_RECOVERIES = 1;
@@ -67,11 +68,11 @@ export function remapActions(
     }
     const prior = memory.byRef.get(action.ref);
     if (!prior) return undefined;
-    const match = elements.find(
+    const matches = elements.filter(
       (element) => element.role === prior.role && element.name === prior.name,
     );
-    if (!match) return undefined;
-    remapped.push({ ...action, ref: match.ref });
+    if (matches.length !== 1) return undefined;
+    remapped.push({ ...action, ref: matches[0]!.ref });
   }
   return remapped;
 }
@@ -97,6 +98,33 @@ export async function recoverStaleBrowserAct(input: {
     { signal: input.context.signal },
     input.context,
   );
+  if (!samePage(input.memory.lastUrl, snap.url)) {
+    rememberSnapshot(input.memory, snap.elements, snap.url);
+    return {
+      ...first,
+      ok: false,
+      url: snap.url || first.url,
+      title: snap.title || first.title,
+      tree: snap.tree,
+      elements: snap.elements,
+      recovered: false,
+      error: `${first.error ?? "Stale element ref"}. Page changed or was unknown; use the new refs. Do not retry the old ref.`,
+    };
+  }
+  const labels = browserActLabels({ actions: input.actions }, input.memory);
+  if (classifyBrowserMutation(labels, input.memory.lastUrl ?? snap.url)) {
+    rememberSnapshot(input.memory, snap.elements, snap.url);
+    return {
+      ...first,
+      ok: false,
+      url: snap.url || first.url,
+      title: snap.title || first.title,
+      tree: snap.tree,
+      elements: snap.elements,
+      recovered: false,
+      error: `${first.error ?? "Stale element ref"}. Irreversible control was not re-clicked; use the new refs.`,
+    };
+  }
   const remapped = remapActions(input.actions, input.memory, snap.elements);
   rememberSnapshot(input.memory, snap.elements, snap.url);
   if (!remapped) {
@@ -125,4 +153,18 @@ export async function recoverStaleBrowserAct(input: {
     elements: second.elements ?? snap.elements,
     error: `${second.error ?? first.error ?? "Stale element ref"}. Fresh snapshot taken; use the new refs.`,
   };
+}
+
+export function samePage(left?: string, right?: string): boolean {
+  if (!left || !right) return false;
+  return pagePath(left) === pagePath(right);
+}
+
+function pagePath(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return url;
+  }
 }

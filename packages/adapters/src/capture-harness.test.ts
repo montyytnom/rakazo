@@ -4,6 +4,9 @@ import {
   CAPTURE_LABEL,
   captureBuiltinToolsJson,
   captureCallLimits,
+  PRODUCTION_CAPTURE,
+  RECONSTRUCTION,
+  reconstructOfflinePhases,
   serializeToolsWire,
 } from "./capture-harness.js";
 
@@ -34,5 +37,15 @@ describe("capture harness", () => {
     expect(limits.parallelToolCalls).toBeNull();
     expect(limits.maxTokensDefault).toBe(32768);
     expect(serializeToolsWire(builtinAgentTools.slice(0, 1))[0]?.function.parameters).toBeTruthy();
+    const phases = reconstructOfflinePhases({
+      apiToolNames: ["browser_act"],
+      workerToolNames: ["browser_act", "browser_extract"],
+      limits,
+      baseTools: captureBuiltinToolsJson().tools,
+    });
+    expect(phases.productionCapture).toBe(false);
+    expect(phases.kind).toBe(RECONSTRUCTION);
+    expect(phases.productionLiveCapture).toBe(PRODUCTION_CAPTURE);
+    expect(phases.apiWorkerNameDelta).toEqual(["browser_extract"]);
   });
 });

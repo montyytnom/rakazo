@@ -603,4 +603,16 @@ describe("Pi usage accounting", () => {
     expect(new Uint8Array(await response.arrayBuffer())).toEqual(bytes);
     expect(reported.has("inputTokens")).toBe(true);
   });
+  it("errors an HTTP 200 SSE error frame without treating it as a completed payload", async () => {
+    const fetcher = usageReportingFetch(
+      async () =>
+        new Response('event: error\ndata: {"error":{"message":"boom after tools"}}\n\n', {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }),
+      new Set(),
+    );
+    const response = await fetcher("https://model.example.test");
+    await expect(response.text()).rejects.toThrow(/boom after tools/);
+  });
 });

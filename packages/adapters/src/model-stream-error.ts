@@ -14,18 +14,14 @@ export function extractOpenAiSseError(payload: string): StreamErrorEvent | undef
       .filter((line) => line.startsWith("data:"))
       .map((line) => line.slice(5).trim())
       .join("");
-    if (!dataLines || dataLines === "[DONE]") continue;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(dataLines);
-    } catch {
-      continue;
+    if (event === "error") {
+      const parsed = tryJson(dataLines);
+      return streamErrorFromJson(parsed) ?? { message: dataLines || "error", type: "error" };
     }
+    if (!dataLines || dataLines === "[DONE]") continue;
+    const parsed = tryJson(dataLines);
     const error = streamErrorFromJson(parsed);
     if (error) return error;
-    if (event === "error") {
-      return { message: dataLines, type: "error" };
-    }
   }
   const direct = streamErrorFromJson(tryJson(payload));
   return direct;

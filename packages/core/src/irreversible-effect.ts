@@ -8,6 +8,21 @@ export type IrreversibleClassification = {
   subject: string;
 };
 
+export type UserTurnRef = {
+  id?: string | null;
+  text: string;
+};
+
+export type TurnIntent = {
+  intentId: string;
+  authorized: boolean;
+  sourceMessageId: string | null;
+  fromNudge: boolean;
+};
+
+export const UNAUTHORIZED_IRREVERSIBLE =
+  "This irreversible action is not bound to a live user message. Ask the user to repeat the request. Do not retry from a summary.";
+
 const CONTINUE_NUDGE = /^(continue|try again|retry|again)$/i;
 const SEND_NAME =
   /(?:^|_|__)(send_mail|send_message|messages_send|mac_messages_send|sms_send|send_sms|send_text)(?:$|_)/i;
@@ -26,19 +41,38 @@ export function isContinueNudge(text: string): boolean {
 
 export function irreversibleIntentId(userText: string, priorIntentId?: string): string {
   if (priorIntentId && isContinueNudge(userText)) return priorIntentId;
-  return digest(userText.trim());
+  return digest(`unbound:${userText.trim()}`);
+}
+
+export function resolveTurnIntent(
+  current: UserTurnRef,
+  prior: readonly UserTurnRef[] = [],
+): TurnIntent {
+  if (!isContinueNudge(current.text)) {
+    return bindTurn(current, false);
+  }
+  for (let index = prior.length - 1; index >= 0; index -= 1) {
+    const turn = prior[index];
+    const text = turn?.text?.trim() ?? "";
+    if (!text || isContinueNudge(text)) continue;
+    return bindTurn({ id: turn?.id, text }, true);
+  }
+  return {
+    intentId: digest(`unbound-nudge:${current.text.trim()}`),
+    authorized: false,
+    sourceMessageId: null,
+    fromNudge: true,
+  };
 }
 
 export function resolveTurnIntentId(
   currentUserText: string,
   priorUserTexts: readonly string[] = [],
 ): string {
-  if (!isContinueNudge(currentUserText)) return irreversibleIntentId(currentUserText);
-  for (let index = priorUserTexts.length - 1; index >= 0; index -= 1) {
-    const text = priorUserTexts[index]?.trim() ?? "";
-    if (text && !isContinueNudge(text)) return irreversibleIntentId(text);
-  }
-  return irreversibleIntentId(currentUserText);
+  return resolveTurnIntent(
+    { text: currentUserText },
+    priorUserTexts.map((text) => ({ text })),
+  ).intentId;
 }
 
 export function innerExecutedToolName(name: string, args: Record<string, unknown>): string {
@@ -86,14 +120,14 @@ export function threadIrreversibleEffectKey(input: {
   threadId: string;
   intentId: string;
   class: IrreversibleClass;
-  subject: string;
+  subject?: string;
 }): string {
+  void input.subject;
   return `irr:v1:${digest(
     stableJsonValue({
       threadId: input.threadId,
       intentId: input.intentId,
       class: input.class,
-      subject: input.subject,
     }),
   )}`;
 }
@@ -107,12 +141,15 @@ export function sameThreadIrreversibleOwner(input: {
   existingRequest: unknown;
   spaceId: string;
   threadId: string;
+  intentId?: string;
 }): boolean {
   if (input.existingSpaceId !== input.spaceId) return false;
   const request = input.existingRequest;
   if (!request || typeof request !== "object" || Array.isArray(request)) return false;
-  const threadId = (request as { threadId?: unknown }).threadId;
-  return threadId === input.threadId;
+  const record = request as { threadId?: unknown; intentId?: unknown };
+  if (record.threadId !== input.threadId) return false;
+  if (input.intentId && record.intentId !== input.intentId) return false;
+  return true;
 }
 
 export function irreversibleEffectRequest(
@@ -120,14 +157,34 @@ export function irreversibleEffectRequest(
   threadId: string,
   intentId: string,
   args: unknown,
+  sourceMessageId?: string | null,
 ): Record<string, unknown> {
   return {
     scope: "thread-intent",
     threadId,
     intentId,
+    sourceMessageId: sourceMessageId ?? null,
     class: classification.class,
     subject: classification.subject,
     args,
+  };
+}
+
+function bindTurn(turn: UserTurnRef, fromNudge: boolean): TurnIntent {
+  const id = turn.id?.trim() ?? "";
+  if (id) {
+    return {
+      intentId: digest(`msg:${id}`),
+      authorized: true,
+      sourceMessageId: id,
+      fromNudge,
+    };
+  }
+  return {
+    intentId: digest(`unbound:${turn.text.trim()}`),
+    authorized: false,
+    sourceMessageId: null,
+    fromNudge,
   };
 }
 

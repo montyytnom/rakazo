@@ -23,4 +23,6 @@ Historical plaintext in `external_effects.result`, `messages`, and `events` is *
 
 ## API / worker parity
 
-Production currently mounts different `browser-tools`, `builtin-tools`, `computer-browser`, and `executor` on api vs worker. After this source lands, remount **the same repaired adapter files on both** so the advertised catalog matches execution. Do not drop saved-login, Amazon sign-in verify, or `browser_extract` customizations.
+See `REPLACEMENT-MANIFEST.md`. The four skewed overlay files (`executor`, `browser-tools`, `builtin-tools`, `computer-browser`) stay overlay-owned. Bind-mount the new modules onto **both** api and worker, then apply `HOOKS.md` to both overlay copies. Do not drop saved-login, Amazon sign-in verify, or `browser_extract`. `computer-browser.ts` is untouched here.
+
+A 72-tool code-derived dump is **not** a matched production capture and does not unlock live evals.

@@ -18,7 +18,14 @@ describe("HTTP 200 SSE error events", () => {
     expect(streamErrorFailsRun(error!)).toBe(true);
   });
 
-  it("ignores a completed stream", () => {
-    expect(extractOpenAiSseError("data: [DONE]\n\n")).toBeUndefined();
+  it("fails closed on a malformed error event and a JSON error after a tool payload", () => {
+    expect(extractOpenAiSseError("event: error\ndata: not-json\n\n")?.type).toBe("error");
+    const afterTool = [
+      'data: {"choices":[{"delta":{"tool_calls":[{"id":"c1"}]}}]}',
+      "",
+      'data: {"error":{"message":"truncated after tools"}}',
+      "",
+    ].join("\n");
+    expect(extractOpenAiSseError(afterTool)?.message).toMatch(/truncated after tools/);
   });
 });
