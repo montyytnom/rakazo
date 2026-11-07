@@ -23,7 +23,8 @@ export const SYNTHETIC_CAPTURE_WINDOW_NOTE =
 /** Exact overlay assistBareDone follow-up (composed AFTER pi-runtime). */
 export const ASSIST_BARE_DONE_NUDGE =
   "Give the user the actual result now: what you did, what you found or changed, and how you checked it. A bare 'done' is not enough.";
-export const SCRIPT_NUDGE_FILLER = "synthetic-stop-0";
+/** Realistic unverified English completion claim. Not a harness-only token. */
+export const SCRIPT_NUDGE_FILLER = "All set.";
 
 type Effect = {
   id: string;
@@ -721,7 +722,6 @@ async function runPiRuntimeScenario(options: {
       finalHasStale: final.includes(STALE_SECRET_SENTINEL),
       finalHasUnsupportedDoneShape:
         /\bDone\b/.test(final) ||
-        /Donesynthetic-stop/i.test(final) ||
         (final.includes(SCRIPT_NUDGE_FILLER) && !/not verified/i.test(final)),
       handoffHasCurrent: handoff.includes(CURRENT_SECRET_SENTINEL),
       handoffHasStale: handoff.includes(STALE_SECRET_SENTINEL),

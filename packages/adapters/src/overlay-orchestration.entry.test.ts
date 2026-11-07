@@ -1329,9 +1329,10 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
       runId: "run-1",
     });
     expect(sanitizeFinalText("Done", evidence, ledger)).toBe("Outcome was not verified.");
-    expect(sanitizeFinalText("Donesynthetic-stop-0", evidence)).toBe("Outcome was not verified.");
-    expect(sanitizeFinalText("Done\n\nsynthetic-stop-0", evidence)).toBe(
-      "Outcome was not verified.",
+    expect(sanitizeFinalText("DoneAll set.", evidence)).toBe("Outcome was not verified.");
+    expect(sanitizeFinalText("Done\n\nAll set.", evidence)).toBe("Outcome was not verified.");
+    expect(sanitizeFinalText("DoneThe bag is in the cart.", evidence)).toBe(
+      "The bag is in the cart.",
     );
   });
 

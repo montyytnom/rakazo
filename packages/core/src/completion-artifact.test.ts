@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   bindOutcomeArtifact,
@@ -63,16 +64,40 @@ describe("completion artifacts", () => {
     }
   });
 
-  it("rewrites a bare Done glued to a nudge-turn filler at the terminal boundary", () => {
+  it("rewrites a realistic unverified completion claim, including glued and whitespace variants", () => {
     const idle = collectToolEvidence([]);
     for (const claim of [
-      "Donesynthetic-stop-0",
-      "Done\n\nsynthetic-stop-0",
-      "Done synthetic-stop-0",
+      "All set.",
+      "DoneAll set.",
+      "Done\n\nAll set.",
+      "Done All set.",
+      "Done. All set.",
     ]) {
       expect(unsupportedClaims(claim, idle)).toContain("success-without-artifact");
       expect(sanitizeFinalText(claim, idle)).toBe("Outcome was not verified.");
     }
+  });
+
+  it("keeps unrelated legitimate text and does not strip non-English completions", () => {
+    const idle = collectToolEvidence([]);
+    expect(sanitizeFinalText("The bag is in the cart.", idle)).toBe("The bag is in the cart.");
+    expect(sanitizeFinalText("I found three matching rows.", idle)).toBe(
+      "I found three matching rows.",
+    );
+    expect(sanitizeFinalText("Listo.", idle)).toBe("Listo.");
+    expect(sanitizeFinalText("Done. The bag is in the cart.", idle)).toBe(
+      "The bag is in the cart.",
+    );
+    expect(sanitizeFinalText("DoneThe bag is in the cart.", idle)).toBe(
+      "The bag is in the cart.",
+    );
+  });
+
+  it("does not match harness filler tokens or capture sentinels in production source", () => {
+    const src = readFileSync(new URL("./completion-artifact.ts", import.meta.url), "utf8");
+    expect(src).not.toMatch(/synthetic-stop/);
+    expect(src).not.toMatch(/Cur#Rpr/);
+    expect(src).not.toMatch(/Old#Stl/);
   });
 
   it("keeps the original final when the ledger has current-intent delivered-send proof", () => {

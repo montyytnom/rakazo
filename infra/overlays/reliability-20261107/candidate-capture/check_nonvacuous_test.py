@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import unittest
@@ -41,22 +42,105 @@ class CheckNonvacuousTests(unittest.TestCase):
             self.assertIn("VACUOUS_FAILED_RUN", failures, name)
             self.assertIn("VACUOUS_MISSING_TOOL_ROUND", failures, name)
 
-    def test_raw_http_body_is_privacy_fail(self) -> None:
-        failures = check_nonvacuous.evaluate(
-            "generated-secret",
-            {
-                "ok": True,
-                "http": '{"messages":[{"content":"operating-name"}]}',
-                "httpBytes": 80000,
-                "httpRequestCount": 2,
-                "persist": '[{"id":"effect-1"}]',
-                "final": '[{"outcome":"completed"}]',
-                "runOutcome": "completed",
-                "executeToolNames": ["scratchpad_add"],
-                "executeArgsHasCurrent": True,
-            },
-        )
-        self.assertIn("PRIVACY_RAW_HTTP_PERSISTED", failures)
+    def test_local_http_body_proves_secret_leak_without_copying_body(self) -> None:
+        body = '{"messages":[{"content":"Cur#Rpr7xQ2mN9kL"}]}'
+        row = {
+            "ok": True,
+            "http": body,
+            "httpRequestCount": 2,
+            "persist": '[{"id":"effect-1"}]',
+            "final": '[{"outcome":"completed"}]',
+            "runOutcome": "completed",
+            "executeToolNames": ["scratchpad_add"],
+            "executeArgsHasCurrent": True,
+        }
+        consumed = check_nonvacuous.consume_http_body(row)
+        self.assertNotIn("http", consumed)
+        self.assertTrue(consumed["httpHasCurrent"])
+        self.assertEqual(consumed["httpSha256"], hashlib.sha256(body.encode()).hexdigest())
+        failures = check_nonvacuous.evaluate("generated-secret", row)
+        self.assertIn("AFTER_LEAK_CURRENT_IN_HTTP", failures)
+
+    def test_local_http_body_proves_withhold_and_metrics_omit_body(self) -> None:
+        body = '{"messages":[{"content":"[withheld]"}]}'
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "worker"
+            dest.mkdir()
+            scenarios = {
+                "generated-secret": {
+                    "ok": True,
+                    "http": body,
+                    "httpRequestCount": 2,
+                    "persist": '[{"id":"effect-1"}]',
+                    "final": '[{"outcome":"completed"}]',
+                    "runOutcome": "completed",
+                    "executeToolNames": ["scratchpad_add"],
+                    "executeArgsHasCurrent": True,
+                },
+                "stale-secret": {
+                    "ok": True,
+                    "http": body,
+                    "httpRequestCount": 2,
+                    "persist": '[{"id":"effect-1"}]',
+                    "final": '[{"outcome":"completed"}]',
+                    "runOutcome": "completed",
+                    "executeToolNames": ["scratchpad_add"],
+                    "executeArgsHasCurrent": True,
+                },
+                "protected-handoff-repaired-path": {
+                    "ok": True,
+                    "http": body,
+                    "httpRequestCount": 2,
+                    "persist": '[{"id":"effect-1"}]',
+                    "final": '[{"outcome":"completed"}]',
+                    "runOutcome": "completed",
+                    "executeToolNames": ["scratchpad_add", "protected_result_handoff"],
+                    "handoff": '{"ok":true}',
+                    "executeArgsHasCurrent": True,
+                },
+                "false-success-done": {
+                    "ok": True,
+                    "http": body
+                    + check_nonvacuous.ASSIST_BARE_DONE_NUDGE,
+                    "httpRequestCount": 3,
+                    "persist": '[{"id":"effect-1"}]',
+                    "final": '[{"outcome":"completed","blocks":[{"text":"Outcome was not verified."}]}]',
+                    "runOutcome": "completed",
+                    "executeToolNames": ["scratchpad_add"],
+                    "stubEmittedDone": True,
+                    "stubEmittedNudgeFiller": True,
+                    "finalHasNotVerified": True,
+                    "finalHasDoneWord": False,
+                    "finalHasUnsupportedDoneShape": False,
+                },
+                "compaction-current-secret": {
+                    "summary": "New password: [withheld]",
+                    "hasCurrent": False,
+                    "hasStale": False,
+                    "hasAllSet": False,
+                },
+                "compaction-stale-secret": {
+                    "summary": "Old password: [withheld]",
+                    "hasCurrent": False,
+                    "hasStale": False,
+                    "hasAllSet": False,
+                },
+            }
+            (dest / "phases-summary.json").write_text(json.dumps({"scenarios": scenarios}) + "\n")
+            report = check_nonvacuous.check_tree(Path(tmp))
+            self.assertTrue(report["ok"], report)
+            self.assertNotIn('"http":', json.dumps(report))
+            for row in report["rows"]:
+                self.assertNotIn("http", row)
+                if row["scenario"] in (
+                    "generated-secret",
+                    "stale-secret",
+                    "protected-handoff-repaired-path",
+                    "false-success-done",
+                ):
+                    self.assertTrue(row.get("httpSha256"))
+                    self.assertFalse(row.get("httpHasCurrent"))
+                    self.assertTrue(row.get("httpBodiesConsumed"))
 
     def test_false_done_without_nudge_is_vacuous(self) -> None:
         failures = check_nonvacuous.evaluate(

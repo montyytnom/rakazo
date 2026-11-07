@@ -12,13 +12,15 @@ const SEND_DENY = /\b(not (yet )?sent|hasn.t been sent|not delivered)\b/i;
 const LIMIT_AS_PAYMENT =
   /(17,?000(?:\.00)?[^.]{0,40}(?:payment|paid|ACH))|((?:payment|paid|ACH)[^.]{0,40}17,?000)/i;
 const CREDIT_LIMIT = /credit limit/i;
-/** Claim *detection* is English regex. Allowing a success claim is ledger-only. */
+/**
+ * Claim *detection* is English regex. Allowing a success claim is ledger-only.
+ * Not a multilingual or semantic parser: non-English completions are left as-is.
+ */
 const SUCCESS_CLAIM =
   /\b(done|complete|completed|success(?:ful(?:ly)?)?|all set|successfully changed|it is reset|reset (?:is |was )?done)\b/i;
-/** Bare-done nudge concat ("Donesynthetic-stop-0") has no word boundary after Done. */
+/** Fallback Done concatenated onto the next assistant turn has no separator or word boundary. */
 const GLUED_SUCCESS =
   /^(done|ok|okay|completed?|finished|all done|task complete|it'?s done)(?=[A-Za-z0-9_-])/i;
-const FILLER_REPLY = /synthetic-stop-\d+/i;
 const EMAIL = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
 const LOGIN_PAGE = /\b(sign in|log in|login)\b/i;
 
@@ -198,21 +200,20 @@ export function unsupportedClaims(
   }
   if (
     !ledgerAllowsSuccess(ledger) &&
-    (positiveClaims(finalText, SUCCESS_CLAIM).length > 0 ||
-      hasGluedOrFillerUnsupportedCompletion(finalText))
+    (positiveClaims(finalText, SUCCESS_CLAIM).length > 0 || hasGluedUnsupportedCompletion(finalText))
   ) {
     violations.push("success-without-artifact");
   }
   return [...new Set(violations)];
 }
 
-/** Terminal final after a bare-done nudge may glue the fallback Done to the next turn. */
-export function hasGluedOrFillerUnsupportedCompletion(text: string): boolean {
-  const compact = text.trim();
-  if (!compact) return false;
-  if (FILLER_REPLY.test(compact)) return true;
-  if (GLUED_SUCCESS.test(compact)) return true;
-  return false;
+/** Terminal final after a bare-done follow-up may glue the fallback Done to the next turn. */
+export function hasGluedUnsupportedCompletion(text: string): boolean {
+  return GLUED_SUCCESS.test(text.trim());
+}
+
+export function stripGluedSuccessPrefix(text: string): string {
+  return text.replace(GLUED_SUCCESS, "");
 }
 
 export function sanitizeFinalText(
@@ -248,15 +249,18 @@ export function sanitizeFinalText(
     text = `${text} Sign-in identity was not on the page.`.trim();
   }
   if (violations.has("success-without-artifact")) {
-    const keptSuccess = clauses(text).filter(
-      (clause) =>
-        !(SUCCESS_CLAIM.test(clause) && !NEGATIVE.test(clause)) &&
-        !hasGluedOrFillerUnsupportedCompletion(clause),
-    );
+    const keptSuccess = clauses(text).flatMap((clause) => {
+      const unglued = stripGluedSuccessPrefix(clause).trim();
+      if (unglued !== clause.trim()) {
+        if (!unglued) return [];
+        if (SUCCESS_CLAIM.test(unglued) && !NEGATIVE.test(unglued)) return [];
+        return [unglued];
+      }
+      if (SUCCESS_CLAIM.test(clause) && !NEGATIVE.test(clause)) return [];
+      return [clause];
+    });
     text = keptSuccess.join(". ").replace(/\s+/g, " ").trim();
-    if (!text || hasGluedOrFillerUnsupportedCompletion(text) || FILLER_REPLY.test(text)) {
-      text = "Outcome was not verified.";
-    }
+    if (!text) text = "Outcome was not verified.";
   }
   return text.replace(/\s+/g, " ").trim();
 }
