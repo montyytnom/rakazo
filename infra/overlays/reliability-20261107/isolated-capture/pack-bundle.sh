@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# Build the parent-runnable tarball. No live context, no model calls.
+# Build the parent-runnable tarball only after launcher + closure tests pass.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../../../.." && pwd)"
+HERE="$(cd "$(dirname "$0")" && pwd)"
 FLAT_PARENT="${1:-/tmp}"
 OUT_TGZ="${2:-/opt/cursor/artifacts/isolated-capture-bundle.tgz}"
+cd "$HERE"
+python3 -m unittest host_launch_test dependency_closure_test -v
+rm -rf "$HERE/__pycache__"
 STAGE="$FLAT_PARENT/isolated-capture-bundle"
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
-cp -a "$ROOT/infra/overlays/reliability-20261107/isolated-capture/." "$STAGE/"
+cp -a "$HERE/." "$STAGE/"
 cp "$ROOT/packages/adapters/src/isolated-capture.ts" "$STAGE/isolated-capture.ts"
 cp "$ROOT/packages/adapters/src/pi-tool-call-guard.ts" "$STAGE/pi-tool-call-guard.ts"
 rm -f "$STAGE/pack-bundle.sh"

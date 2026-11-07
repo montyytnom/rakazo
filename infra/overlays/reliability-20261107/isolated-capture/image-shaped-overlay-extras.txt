@@ -1,0 +1,12 @@
+# Overlay-only adapters/src basenames on a 926710a-plus-overlays tree.
+# Snapshot of known production overlay destinations, not a live image dump.
+# Used for dependency-closure tests. Do not treat this as proof a live image was opened.
+attachment-text.ts
+botdir.ts
+ctxmem.ts
+fast-thinking.ts
+login-guard.ts
+loop-guard.ts
+outbound-guard.ts
+quiet-gate.ts
+write-guard.ts

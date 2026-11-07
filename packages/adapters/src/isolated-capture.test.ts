@@ -1,6 +1,8 @@
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { formatSkillsCatalogInstruction } from "@rakazo/core";
 import { describe, expect, it } from "vitest";
 import { longWorkProgressGuidance, persistentComputerInstruction } from "./executor.js";
@@ -159,4 +161,22 @@ describe("isolated capture harness", () => {
     expect(manifest).toContain("named-blocks.json");
     expect(manifest).toContain("tools-inventory.json");
   }, 120_000);
+
+  it("keeps overlay source mounts and hashes assist env instead of copying it", () => {
+    const overlay = join(
+      dirname(fileURLToPath(import.meta.url)),
+      "../../../infra/overlays/reliability-20261107/isolated-capture",
+    );
+    const result = spawnSync(
+      "python3",
+      ["-m", "unittest", "host_launch_test", "dependency_closure_test"],
+      { cwd: overlay, encoding: "utf8" },
+    );
+    const output = `${result.stdout}${result.stderr}`;
+    if (result.status !== 0) {
+      throw new Error(output);
+    }
+    expect(result.status).toBe(0);
+    expect(output).toContain("Ran 7 tests");
+  });
 });

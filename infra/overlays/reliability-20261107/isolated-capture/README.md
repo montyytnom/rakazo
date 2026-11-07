@@ -29,13 +29,17 @@ export RAKAZO_WORKER_CONTAINER=rakazo-worker
 export RAKAZO_API_CONTAINER=rakazo-api
 
 ./host-launch.sh --dry-run --out /tmp/isolated-capture-out
-# audit dry-run-manifest.json: mounts, allowlisted env keys, omitted key names (no secret values)
+# audit dry-run-manifest.json: retained /app source mounts, hashed assist env, typed scalars only
 
 ./host-launch.sh --execute --out /tmp/isolated-capture-out
 ```
 
-`--execute` starts `rakazo-isolated-capture-{worker,api}-*` with `--network none`, `--read-only`, tmpfs `/tmp` and `/run`, writable `/out` only. It removes only those capture containers. Production containers are not exec'd, patched, or restarted. `.env` and `/run/login-guard` are not copied.
+`--execute` starts `rakazo-isolated-capture-{worker,api}-*` with `--network none`, `--read-only`, `--cap-drop ALL`, `--security-opt no-new-privileges`, CPU/memory/PID bounds, tmpfs `/tmp` and `/run`, writable `/out` only. It removes only those capture containers. Production containers are not exec'd, patched, or restarted.
+
+Overlay source files under `/app/packages/adapters/src/` are retained, including worker `login-guard.ts` and api/worker `page-browser-session.ts`. State paths `/data`, `/run/login-guard`, `/run/op-data`, and `/run/secrets/scrapling_token` are not mounted. `.env` is not copied.
+
+`RAKAZO_ASSIST_PROMPT` and `RAKAZO_ASSIST_STABLE_PREFIX` are hashed in the manifest and replaced with synthetic unset (overlay code defaults). Live prompt strings never appear in the manifest, docker `-e` argv, or capture output. Limitation: capture does not replay a live assist prompt string.
 
 ## In-container
 
-`run.sh` is invoked by the launcher. Bind-mounts this bundle's `isolated-capture.ts` onto `/app/packages/adapters/src/isolated-capture.ts` so relative imports resolve to the live adapters tree.
+`run.sh` is invoked by the launcher. Bind-mounts this bundle's isolated sources (currently `isolated-capture.ts` only) onto `/app/packages/adapters/src/` so relative imports resolve to the live adapters tree. Deployed runtime files are not replaced.

@@ -17,6 +17,8 @@ Name + sha256 of every block is in `phases-summary.json`. group/messaging/memory
 
 `selectBuiltinToolsForRun` against the mounted per-service `builtin-tools` / `executor`. Empty connector registry is listed as a baseline limitation. Reviewer expected worker builtins 74: verify, do not force.
 
+Isolated sources are bind-mounted without replacing deployed runtime modules. `isolated-capture.ts` does not import `capture-harness`. Overlay `login-guard.ts` / `page-browser-session.ts` stay in the source mount set. Assist prompt env is hashed, never copied.
+
 ## Login-guard SHAPE
 
 See `login-guard-policy.SHAPE.txt`. Production `/run/login-guard/policy.txt` is not mounted into capture containers.

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # In-container entry. Host launcher starts an ephemeral container and execs this.
 # No git checkout. No GX10. No live policy/.env. Writable output is /out.
+# isolated-capture.ts is bind-mounted as a new adapters/src file; deployed runtime stays.
 set -euo pipefail
 SERVICE="${ISOLATED_CAPTURE_SERVICE:?set ISOLATED_CAPTURE_SERVICE=worker|api}"
 OUT="${ISOLATED_CAPTURE_OUT:-/out}"
