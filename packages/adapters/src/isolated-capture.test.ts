@@ -8,17 +8,24 @@ import { formatSkillsCatalogInstruction } from "@rakazo/core";
 import { describe, expect, it } from "vitest";
 import { longWorkProgressGuidance, persistentComputerInstruction } from "./executor.js";
 import {
+  ASSISTANT_HISTORY_MARKER,
   CAPTURE_CLOCK_DEFAULT,
   CAPTURE_DEFAULT_DISABLED_TOOLS,
   CAPTURE_LOGIN_CLAIM,
   CAPTURE_MODEL_ID,
+  CONNECTED_PLUGIN_PREFER,
   CREATE_SPACE_CLAUSE,
+  CREATE_SPACE_CONFIRM_IDENTIFIER,
   FLEET_CLAUSE,
   HISTORICAL_CANDIDATE_WORDING,
   OLDER_RESULT_SHORTENING,
   OLDER_TOOL_RESULT_SHORTEN_BYTES,
   RENDER_PLOT_CLAUSE,
   SKIPPED_LOOP_GUARD,
+  SYNTHETIC_FACTS_CONTENT,
+  SYNTHETIC_MCP_TOOL_NAME,
+  TURN_CONTEXT_BACKGROUND,
+  TURN_CONTEXT_OPEN,
   classifyCapturePhase,
   captureCompactionPass,
   captureContextStrategy,
@@ -26,11 +33,13 @@ import {
   captureFleetManagement,
   captureGuardPathB,
   captureGuardPathC,
+  captureHistoryConnectorTurn,
   capturePageTrim,
   captureParserGuardCases,
   capturePhaseTurn,
   collectProvenance,
   deriveProductionModelMetadata,
+  discoverSyntheticConnectorTools,
   ERROR_GUARD_PREFIX,
   GUARD_HALT_MARK,
   IDENTICAL_TOOL_ERROR,
@@ -43,12 +52,15 @@ import {
   olderToolResultFallbackLength,
   pinPiAiVersion,
   pinToolCallGuardHash,
+  promptClauseRecord,
   REVIEWER_EXPECTED_WORKER_BUILTINS,
   runIsolatedCapture,
   SAMPLING_KEYS,
+  shortenToolResultTextSourceEvidence,
   STALE_PAGE_STATE_NOTE,
   SYNTHETIC_SKILL_CATALOG,
   secretStoreCapabilityReport,
+  syntheticPriorTurnHistory,
   VOLATILE_FIELDS,
 } from "./isolated-capture.js";
 
@@ -207,6 +219,12 @@ describe("isolated capture harness", () => {
     expect(firstText).not.toContain(RENDER_PLOT_CLAUSE);
     expect(firstText).toContain(FLEET_CLAUSE);
     expect(result.promptClauses.createSpace).toBe(false);
+    expect(result.promptClauses.createSpaceOfferedClause).toBe(false);
+    expect(result.promptClauses.createSpace).toBe(result.promptClauses.createSpaceOfferedClause);
+    expect(result.promptClauses.createSpaceMeans).toMatch(/offeredBuiltinClause/);
+    expect(result.promptClauses.createSpaceIdentifierInConfirmRule).toBe(
+      firstText.includes(CREATE_SPACE_CONFIRM_IDENTIFIER),
+    );
     expect(result.promptClauses.renderPlot).toBe(false);
     expect(result.promptClauses.fleet).toBe(true);
     expect(result.path).toBe("A");
@@ -243,7 +261,74 @@ describe("isolated capture harness", () => {
     expect(result.olderResultShortening).toEqual(OLDER_RESULT_SHORTENING);
     expect(result.olderResultShortening.independentOfContextWindow).toBe(true);
     expect(result.olderResultShortening.function).toBe("createRuntimeContextPolicy");
+    expect(result.olderResultShortening.shorteningFunction).toBe("shortenToolResultText");
     expect(result.olderResultShortening.sizeHardcoded).toBe(1024);
+    const evidence = shortenToolResultTextSourceEvidence();
+    expect(evidence.exportName).toBe("shortenToolResultText");
+    expect(evidence.runtimeName).toBe("shortenToolResultText");
+    expect(evidence.present).toBe(true);
+    expect(evidence.independentOfContextWindow).toBe(true);
+    expect(evidence.fileSha256).toMatch(/^[a-f0-9]{64}$/);
+  }, 90_000);
+
+  it("sends prior-turn history, turn_context memory, and synthetic connectors through live paths", async () => {
+    const history = syntheticPriorTurnHistory();
+    expect(history).toHaveLength(3);
+    expect(history.some((row) => row.role === "assistant")).toBe(true);
+    expect(history.some((row) => row.content.length > 1024)).toBe(true);
+    const connectors = await discoverSyntheticConnectorTools();
+    expect(connectors.mcpToolNames).toContain(SYNTHETIC_MCP_TOOL_NAME);
+    expect(connectors.installedWrapperNames).toEqual(
+      expect.arrayContaining([
+        "installed_search_tools",
+        "installed_load_tool",
+        "installed_execute_tool",
+      ]),
+    );
+    expect(connectors.pluginLine).toContain("Connected plugins:");
+    expect(connectors.pluginLine).toContain(CONNECTED_PLUGIN_PREFER);
+    expect(connectors.limits.synthetic).toBe(true);
+    expect(connectors.limits.network).toBe("in-process-fetch-stub");
+    expect(String(connectors.limits.mcpEndpoint)).toContain("capture-synth.invalid");
+    expect(JSON.stringify(connectors)).not.toMatch(/grommunio|sk-[a-z0-9]|BEGIN PRIVATE/i);
+
+    const result = await captureHistoryConnectorTurn("this-tree");
+    expect(result.captures.length).toBeGreaterThanOrEqual(1);
+    expect(result.retrievalStrategy).toBe("retrieval");
+    expect(result.assistantMappedToUser).toBe(true);
+    expect(result.assistantPrefixPresent).toBe(true);
+    expect(result.longestHistoryRowChars).toBeGreaterThan(1024);
+    expect(result.historyRowsInRequest.some((row) => row.role === "user")).toBe(true);
+    expect(
+      result.historyRowsInRequest.some(
+        (row) => row.role === "user" && row.text.includes(ASSISTANT_HISTORY_MARKER),
+      ),
+    ).toBe(true);
+    expect(result.historyRowsInRequest.every((row) => row.role === "user")).toBe(true);
+    expect(result.factsPresent).toBe(true);
+    expect(result.durableMemoryPresent).toBe(true);
+    if (result.overlayStablePrefix) {
+      expect(result.turnContextPresent).toBe(true);
+      expect(result.turnContextInUserPrompt).toBe(true);
+      expect(result.parsedBodies[0] ? JSON.stringify(result.parsedBodies[0]) : "").toContain(
+        TURN_CONTEXT_BACKGROUND,
+      );
+      expect(result.parsedBodies[0] ? JSON.stringify(result.parsedBodies[0]) : "").toContain(
+        TURN_CONTEXT_OPEN,
+      );
+    }
+    expect(result.mcpToolNames).toContain(SYNTHETIC_MCP_TOOL_NAME);
+    expect(result.installedWrapperNames).toEqual(
+      expect.arrayContaining([
+        "installed_search_tools",
+        "installed_load_tool",
+        "installed_execute_tool",
+      ]),
+    );
+    expect(result.pluginLinePresent).toBe(true);
+    expect(result.promptClauses.createSpace).toBe(false);
+    expect(result.promptClauses.createSpaceOfferedClause).toBe(false);
+    expect(JSON.stringify(result.parsedBodies[0] ?? {})).not.toMatch(/sk-|BEGIN PRIVATE|password=/i);
   }, 90_000);
 
   it("invokes deployed compactHistory with pinned clock, mixed rows, and prior summary", async () => {
@@ -316,6 +401,15 @@ describe("isolated capture harness", () => {
     const model = provenance.modelResolution as { maxTokens: number; id: string };
     expect(model.id).toBe(CAPTURE_MODEL_ID);
     expect(model.maxTokens).toBeGreaterThan(4096);
+    const shortening = provenance.olderToolResultShortening as {
+      shorteningFunction: string;
+      sourceEvidence: { exportName: string; present: boolean; runtimeName: string };
+    };
+    expect(shortening.shorteningFunction).toBe("shortenToolResultText");
+    expect(shortening.sourceEvidence.exportName).toBe("shortenToolResultText");
+    expect(shortening.sourceEvidence.runtimeName).toBe("shortenToolResultText");
+    expect(shortening.sourceEvidence.present).toBe(true);
+    expect(promptClauseRecord("no clauses").createSpaceOfferedClause).toBe(false);
   });
 
   it("writes a parent-replayable hash manifest of paths actually taken", async () => {
@@ -344,7 +438,21 @@ describe("isolated capture harness", () => {
       pruningPage1Trimmed: boolean;
       compactionInvoked: boolean;
       compactionClockPinned: boolean;
-      promptClauses: { createSpace: boolean; renderPlot: boolean; fleet: boolean };
+      promptClauses: {
+        createSpace: boolean;
+        createSpaceOfferedClause: boolean;
+        createSpaceIdentifierInConfirmRule: boolean;
+        createSpaceMeans: string;
+        renderPlot: boolean;
+        fleet: boolean;
+      };
+      historyConnectors: {
+        assistantMappedToUser: boolean;
+        longestHistoryRowChars: number;
+        mcpToolNames: string[];
+        installedWrapperNames: string[];
+        factsPresent: boolean;
+      };
       pathA: { skippedPresent: boolean; haltAdvertisesTools: boolean };
       guardWarning: boolean;
       guardHalt: boolean;
@@ -358,8 +466,15 @@ describe("isolated capture harness", () => {
     expect(paths.compactionInvoked).toBe(true);
     expect(paths.compactionClockPinned).toBe(true);
     expect(paths.promptClauses.createSpace).toBe(false);
+    expect(paths.promptClauses.createSpaceOfferedClause).toBe(false);
+    expect(paths.promptClauses.createSpaceMeans).toMatch(/Confirm-rule identifier/);
     expect(paths.promptClauses.renderPlot).toBe(false);
     expect(paths.promptClauses.fleet).toBe(true);
+    expect(paths.historyConnectors.assistantMappedToUser).toBe(true);
+    expect(paths.historyConnectors.longestHistoryRowChars).toBeGreaterThan(1024);
+    expect(paths.historyConnectors.mcpToolNames).toContain(SYNTHETIC_MCP_TOOL_NAME);
+    expect(paths.historyConnectors.installedWrapperNames.length).toBeGreaterThan(0);
+    expect(paths.historyConnectors.factsPresent).toBe(true);
     expect(paths.pathA.skippedPresent).toBe(false);
     expect(manifest).toContain("historical-unverified.md");
     expect(readFileSync(join(outDir, "historical-unverified.md"), "utf8")).toContain(
@@ -390,6 +505,12 @@ describe("isolated capture harness", () => {
     expect(inventoryFile.withheldRationale.length).toBeGreaterThan(0);
     expect(manifest).toContain("named-blocks.json");
     expect(manifest).toContain("tools-inventory.json");
+    expect(manifest).toContain("history-connectors/summary.json");
+    const historySummary = JSON.parse(
+      readFileSync(join(outDir, "history-connectors/summary.json"), "utf8"),
+    ) as { mcpToolNames: string[]; authorization: string };
+    expect(historySummary.mcpToolNames).toContain(SYNTHETIC_MCP_TOOL_NAME);
+    expect(historySummary.authorization).toMatch(/does not authorize/);
   }, 300_000);
 
   it("keeps overlay source mounts and forwards typed assist switches", () => {
