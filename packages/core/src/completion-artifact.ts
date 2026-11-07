@@ -1,3 +1,5 @@
+import { classifyIrreversibleTool } from "./irreversible-effect.js";
+
 const CLAIM_SPLIT = /(?:\. (?=[A-Z])|[;!?\n]| — | – |, but | but )/g;
 const NEGATIVE =
   /\b(not|n't|never|no new|unable|could ?n.t|failed|hasn't|haven't|isn't|wasn't|pending|blocked|still need|unverified|unconfirmed|waiting|until)\b/i;
@@ -10,13 +12,33 @@ const SEND_DENY = /\b(not (yet )?sent|hasn.t been sent|not delivered)\b/i;
 const LIMIT_AS_PAYMENT =
   /(17,?000(?:\.00)?[^.]{0,40}(?:payment|paid|ACH))|((?:payment|paid|ACH)[^.]{0,40}17,?000)/i;
 const CREDIT_LIMIT = /credit limit/i;
-const SUCCESS_CLAIM = /\b(done|complete|completed|success(?:ful)?)\b/i;
+/** Claim *detection* is English regex. Allowing a success claim is ledger-only. */
+const SUCCESS_CLAIM =
+  /\b(done|complete|completed|success(?:ful(?:ly)?)?|all set|successfully changed|it is reset|reset (?:is |was )?done)\b/i;
 const EMAIL = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
+const LOGIN_PAGE = /\b(sign in|log in|login)\b/i;
 
 export type ToolEvidence = {
   texts: string[];
   verified: boolean;
   sent: boolean | null;
+};
+
+export type OutcomeArtifactClass = "verified-read" | "delivered-send" | "task-proof";
+
+export type OutcomeArtifact = {
+  class: OutcomeArtifactClass;
+  intentId: string;
+  sourceMessageId: string;
+  runId: string;
+  subject?: string;
+};
+
+export type CompletionLedger = {
+  intentId: string;
+  sourceMessageId: string;
+  runId: string;
+  artifacts: OutcomeArtifact[];
 };
 
 export type ClaimViolation =
@@ -26,6 +48,96 @@ export type ClaimViolation =
   | "send-contradiction"
   | "limit-as-payment"
   | "success-without-artifact";
+
+export function emptyCompletionLedger(input: {
+  intentId: string;
+  sourceMessageId: string;
+  runId: string;
+}): CompletionLedger {
+  return {
+    intentId: input.intentId,
+    sourceMessageId: input.sourceMessageId,
+    runId: input.runId,
+    artifacts: [],
+  };
+}
+
+export function ledgerAllowsSuccess(ledger: CompletionLedger | undefined): boolean {
+  if (!ledger?.intentId || !ledger.sourceMessageId || !ledger.runId) return false;
+  return ledger.artifacts.some(
+    (artifact) =>
+      artifact.intentId === ledger.intentId &&
+      artifact.sourceMessageId === ledger.sourceMessageId &&
+      artifact.runId === ledger.runId &&
+      (artifact.class === "verified-read" ||
+        artifact.class === "delivered-send" ||
+        artifact.class === "task-proof"),
+  );
+}
+
+export function ledgerHasClass(
+  ledger: CompletionLedger | undefined,
+  className: OutcomeArtifactClass,
+): boolean {
+  if (!ledgerAllowsSuccess(ledger)) return false;
+  return ledger!.artifacts.some(
+    (artifact) =>
+      artifact.class === className &&
+      artifact.intentId === ledger!.intentId &&
+      artifact.sourceMessageId === ledger!.sourceMessageId &&
+      artifact.runId === ledger!.runId,
+  );
+}
+
+/**
+ * Structured proof only. Boolean `verified`/`sent`/`outcomeProof` fields on this
+ * turn's tool result, bound to the current intent+sourceMessageId+runId.
+ * Page text, `{ok:true}`, login snapshots, 404s, and other runs do not count.
+ */
+export function bindOutcomeArtifact(input: {
+  result: unknown;
+  toolName: string;
+  args?: Record<string, unknown>;
+  intentId: string;
+  sourceMessageId: string;
+  runId: string;
+}): OutcomeArtifact | null {
+  const { result, toolName, intentId, sourceMessageId, runId } = input;
+  if (!intentId || !sourceMessageId || !runId) return null;
+  if (!result || typeof result !== "object" || Array.isArray(result)) return null;
+  const record = result as Record<string, unknown>;
+  const args = input.args ?? {};
+  const irreversible = classifyIrreversibleTool(toolName, args);
+  if (record.outcomeProof === true) {
+    if (record.intentId !== intentId || record.sourceMessageId !== sourceMessageId) return null;
+    if (typeof record.runId === "string" && record.runId !== runId) return null;
+    return { class: "task-proof", intentId, sourceMessageId, runId };
+  }
+  if (record.sent === true && irreversible?.class === "send") {
+    return {
+      class: "delivered-send",
+      intentId,
+      sourceMessageId,
+      runId,
+      subject: irreversible.subject,
+    };
+  }
+  if (record.verified === true && !isInsufficientRead(record)) {
+    return { class: "verified-read", intentId, sourceMessageId, runId };
+  }
+  return null;
+}
+
+function pageBlob(record: Record<string, unknown>): string {
+  return `${record.tree ?? ""} ${record.header ?? ""} ${record.title ?? ""} ${record.url ?? ""}`;
+}
+
+function isInsufficientRead(record: Record<string, unknown>): boolean {
+  const blob = pageBlob(record);
+  if (LOGIN_PAGE.test(blob)) return true;
+  if (/\b404\b/.test(blob) || /not found/i.test(blob)) return true;
+  return false;
+}
 
 export function clauses(text: string): string[] {
   return text
@@ -48,7 +160,11 @@ export function collectToolEvidence(results: readonly unknown[]): ToolEvidence {
   return { texts, verified, sent };
 }
 
-export function unsupportedClaims(finalText: string, evidence: ToolEvidence): ClaimViolation[] {
+export function unsupportedClaims(
+  finalText: string,
+  evidence: ToolEvidence,
+  ledger?: CompletionLedger,
+): ClaimViolation[] {
   const blob = evidence.texts.join("\n");
   const violations: ClaimViolation[] = [];
   const identity = positiveClaims(finalText, IDENTITY_CLAIM);
@@ -66,7 +182,7 @@ export function unsupportedClaims(finalText: string, evidence: ToolEvidence): Cl
   if (positiveClaims(finalText, LICENSE_CLAIM).length > 0 && !/license/i.test(blob)) {
     violations.push("license");
   }
-  if (positiveClaims(finalText, VERIFIED_CLAIM).length > 0 && !evidence.verified) {
+  if (positiveClaims(finalText, VERIFIED_CLAIM).length > 0 && !ledgerHasClass(ledger, "verified-read") && !ledgerHasClass(ledger, "task-proof")) {
     violations.push("verified");
   }
   const sendYes = positiveClaims(finalText, SEND_CLAIM).length > 0;
@@ -76,17 +192,18 @@ export function unsupportedClaims(finalText: string, evidence: ToolEvidence): Cl
   if (LIMIT_AS_PAYMENT.test(finalText) && !CREDIT_LIMIT.test(finalText)) {
     violations.push("limit-as-payment");
   }
-  if (
-    positiveClaims(finalText, SUCCESS_CLAIM).length > 0 &&
-    !headlineAllowsDone(evidence)
-  ) {
+  if (positiveClaims(finalText, SUCCESS_CLAIM).length > 0 && !ledgerAllowsSuccess(ledger)) {
     violations.push("success-without-artifact");
   }
   return [...new Set(violations)];
 }
 
-export function sanitizeFinalText(finalText: string, evidence: ToolEvidence): string {
-  const violations = new Set(unsupportedClaims(finalText, evidence));
+export function sanitizeFinalText(
+  finalText: string,
+  evidence: ToolEvidence,
+  ledger?: CompletionLedger,
+): string {
+  const violations = new Set(unsupportedClaims(finalText, evidence, ledger));
   if (violations.size === 0) return finalText;
   const kept = clauses(finalText).filter((clause) => {
     if (violations.has("identity") && IDENTITY_CLAIM.test(clause)) return false;
@@ -123,8 +240,10 @@ export function sanitizeFinalText(finalText: string, evidence: ToolEvidence): st
   return text.replace(/\s+/g, " ").trim();
 }
 
+/** @deprecated Blob `verified`/`sent` is not an intent-bound ledger. Prefer ledgerAllowsSuccess. */
 export function headlineAllowsDone(evidence: ToolEvidence): boolean {
-  return evidence.verified || evidence.sent === true;
+  void evidence;
+  return false;
 }
 
 function resultText(result: unknown): string {

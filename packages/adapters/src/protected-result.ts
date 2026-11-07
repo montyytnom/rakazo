@@ -5,7 +5,11 @@ import {
   type ProtectedResultHandle,
   protectedResultNote,
   redactProtectedTree,
+  redactThrown,
 } from "@rakazo/core";
+
+/** Historical plaintext rows are not rewritten by persist. Cleanup is a separate locked plan. */
+export const HISTORICAL_PLAINTEXT_CLEANUP_LOCKED = true as const;
 
 export const PROTECTED_RESULT_VAULT_BLOCKER =
   "PROTECTED_RESULT_VAULT: disabled until SecretStore encryption is provisioned on the runtime; plaintext persist is refused";
@@ -200,7 +204,9 @@ export async function protectPersistedEffectResult(input: {
         : { note: model, [VAULT_REF_FIELD]: vaultRef };
     return { model, stored, handle: protectedPage.handle };
   } catch (error) {
-    if (!(error instanceof ProtectedResultVaultDisabledError)) throw error;
+    if (!(error instanceof ProtectedResultVaultDisabledError)) {
+      throw redactThrown(error, [plaintext]);
+    }
     if (row) delete row.plaintext;
     return { model, stored: model, handle: protectedPage.handle };
   }

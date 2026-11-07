@@ -115,4 +115,9 @@ describe("protected result persist path", () => {
       "protectedVaultRef",
     );
   });
+
+  it("locks historical plaintext cleanup off the persist path", async () => {
+    const { HISTORICAL_PLAINTEXT_CLEANUP_LOCKED } = await import("./protected-result.js");
+    expect(HISTORICAL_PLAINTEXT_CLEANUP_LOCKED).toBe(true);
+  });
 });

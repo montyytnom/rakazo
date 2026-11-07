@@ -233,6 +233,9 @@ def patch_executor(path: Path) -> None:
         "  sanitizeFinalText,\n"
         "  secretsFromPriorAssistantText,\n"
         "  stripSecretEchoes,\n"
+        "  bindOutcomeArtifact,\n"
+        "  emptyCompletionLedger,\n"
+        "  harvestSecretsFromUnknown,\n"
         "} from \"@rakazo/core\";\n",
         "core irreversible imports",
     )
@@ -264,7 +267,12 @@ def patch_executor(path: Path) -> None:
         "            .filter((message) => message.role === \"user\")\n"
         "            .map((message) => ({ id: message.id, text: message.content })),\n"
         "        );\n"
-        "        const intentId = turnIntent.intentId;\n",
+        "        const intentId = turnIntent.intentId;\n"
+        "        const turnLedger = emptyCompletionLedger({\n"
+        "          intentId,\n"
+        "          sourceMessageId: turnIntent.sourceMessageId ?? \"\",\n"
+        "          runId,\n"
+        "        });\n",
         "turn intent + ref memory",
     )
     replace_once(
@@ -310,7 +318,18 @@ def patch_executor(path: Path) -> None:
         "                return gate.result;\n"
         "              }",
         "              } else {\n"
-        "                return redactReplayResult(gate.result, runSecrets);\n"
+        "                const replayed = redactReplayResult(gate.result, runSecrets);\n"
+        "                turnToolResults.push(replayed);\n"
+        "                const artifact = bindOutcomeArtifact({\n"
+        "                  result: replayed,\n"
+        "                  toolName: replayEffectToolName,\n"
+        "                  args,\n"
+        "                  intentId,\n"
+        "                  sourceMessageId: turnIntent.sourceMessageId ?? \"\",\n"
+        "                  runId,\n"
+        "                });\n"
+        "                if (artifact) turnLedger.artifacts.push(artifact);\n"
+        "                return replayed;\n"
         "              }",
         "redact duplicate replay",
     )
@@ -333,13 +352,19 @@ def patch_executor(path: Path) -> None:
         "              store: protectedResults,\n"
         "              vault: protectedVault,\n"
         "            });\n"
-        "            for (const secret of secretsFromPriorAssistantText([\n"
-        "              typeof result === \"string\" ? result : JSON.stringify(result ?? \"\"),\n"
-        "              JSON.stringify(args ?? {}),\n"
-        "            ])) {\n"
+        "            for (const secret of harvestSecretsFromUnknown([result, args])) {\n"
         "              if (!runSecrets.includes(secret)) runSecrets.push(secret);\n"
         "            }\n"
         "            turnToolResults.push(protectedPage.model);\n"
+        "            const artifact = bindOutcomeArtifact({\n"
+        "              result: protectedPage.model,\n"
+        "              toolName: name,\n"
+        "              args,\n"
+        "              intentId,\n"
+        "              sourceMessageId: turnIntent.sourceMessageId ?? \"\",\n"
+        "              runId,\n"
+        "            });\n"
+        "            if (artifact) turnLedger.artifacts.push(artifact);\n"
         "            return (await persistEffectResult(protectedPage.stored))\n"
         "              ? protectedPage.model\n"
         "              : uncertainEffectResult(name, args);\n"
@@ -501,7 +526,7 @@ def patch_executor(path: Path) -> None:
         "                midTurnUserTexts,\n"
         "              ).map((block) => {\n"
         "                if (block.kind !== \"text\") return block;\n"
-        "                const sanitized = sanitizeFinalText(block.text, evidence);\n"
+        "                const sanitized = sanitizeFinalText(block.text, evidence, turnLedger);\n"
         "                return {\n"
         "                  ...block,\n"
         "                  text: stripSecretEchoes(sanitized, [...runSecrets, ...priorSecrets]).text,\n"
@@ -511,7 +536,7 @@ def patch_executor(path: Path) -> None:
         "            ? \"\"\n"
         "            : redactSecrets(\n"
         "                completionNotificationBody(\n"
-        "                  stripSecretEchoes(sanitizeFinalText(silentReply.assembled, evidence), [\n"
+        "                  stripSecretEchoes(sanitizeFinalText(silentReply.assembled, evidence, turnLedger), [\n"
         "                    ...runSecrets,\n"
         "                    ...priorSecrets,\n"
         "                  ]).text,\n"
@@ -520,6 +545,21 @@ def patch_executor(path: Path) -> None:
         "                runSecrets,\n"
         "              );\n",
         "final reply secret/completion sanitization",
+    )
+    replace_once(
+        path,
+        "        const runtimeHistory = [...historicalContext, ...historyWithImages];\n",
+        "        for (const secret of harvestSecretsFromUnknown(\n"
+        "          history.filter((message) => message.role === \"assistant\").map((message) => message.content),\n"
+        "        )) {\n"
+        "          if (!runSecrets.includes(secret)) runSecrets.push(secret);\n"
+        "        }\n"
+        "        const runtimeHistory = [...historicalContext, ...historyWithImages].map((message) =>\n"
+        "          typeof message.content === \"string\"\n"
+        "            ? { ...message, content: stripSecretEchoes(message.content, runSecrets).text }\n"
+        "            : message,\n"
+        "        );\n",
+        "history secret strip before model",
     )
 
 
@@ -660,6 +700,86 @@ def patch_pi_usage(path: Path) -> None:
         "      try {\n"
         "        const event = JSON.parse(data);",
         "sse fail-closed before parse",
+    )
+
+
+def patch_pi_runtime(path: Path) -> None:
+    if "stripSecretTranscript" in path.read_text():
+        return
+    replace_once(
+        path,
+        'import { abortableDelay, MISSING_TOOL_FINAL_RESPONSE_ERROR } from "@rakazo/core";\n',
+        "import {\n"
+        "  abortableDelay,\n"
+        "  harvestSecretsFromUnknown,\n"
+        "  MISSING_TOOL_FINAL_RESPONSE_ERROR,\n"
+        "  stripSecretsFromUnknown,\n"
+        '} from "@rakazo/core";\n',
+        "pi-runtime secret strip import",
+    )
+    replace_once(
+        path,
+        "          transformContext: async (messages) =>\n"
+        "            pruneComputerScreenshotContext(\n"
+        "              assistProgressContext(pruneStalePageStateContext(messages)),\n"
+        "              hasBackups\n"
+        "                ? activeStreamTarget.config.maxImagesPerPrompt\n"
+        "                : request.model.maxImagesPerPrompt,\n"
+        "            ),\n",
+        "          transformContext: async (messages) =>\n"
+        "            stripSecretTranscript(\n"
+        "              pruneComputerScreenshotContext(\n"
+        "                assistProgressContext(pruneStalePageStateContext(messages)),\n"
+        "                hasBackups\n"
+        "                  ? activeStreamTarget.config.maxImagesPerPrompt\n"
+        "                  : request.model.maxImagesPerPrompt,\n"
+        "              ),\n"
+        "            ),\n",
+        "main transformContext secret strip",
+    )
+    replace_once(
+        path,
+        "    transformContext: async (messages) =>\n"
+        "      pruneComputerScreenshotContext(\n"
+        "        assistProgressContext(pruneStalePageStateContext(messages)),\n"
+        "        requestModel.maxImagesPerPrompt,\n"
+        "      ),\n",
+        "    transformContext: async (messages) =>\n"
+        "      stripSecretTranscript(\n"
+        "        pruneComputerScreenshotContext(\n"
+        "          assistProgressContext(pruneStalePageStateContext(messages)),\n"
+        "          requestModel.maxImagesPerPrompt,\n"
+        "        ),\n"
+        "      ),\n",
+        "subagent transformContext secret strip",
+    )
+    replace_once(
+        path,
+        "    return policy.prepareContext(ctx, model);\n",
+        "    return stripSecretContext(policy.prepareContext(ctx, model));\n",
+        "assistPrepareContext secret strip",
+    )
+    replace_once(
+        path,
+        "        return prepared;\n",
+        "        return stripSecretContext(prepared);\n",
+        "assist shrink secret strip",
+    )
+    path.write_text(
+        path.read_text()
+        + """
+function stripSecretTranscript<T>(messages: T[]): T[] {
+  const secrets = harvestSecretsFromUnknown(messages);
+  if (secrets.length === 0) return messages;
+  return stripSecretsFromUnknown(messages, secrets) as T[];
+}
+
+function stripSecretContext(ctx: Context): Context {
+  const secrets = harvestSecretsFromUnknown(ctx);
+  if (secrets.length === 0) return ctx;
+  return stripSecretsFromUnknown(ctx, secrets) as Context;
+}
+"""
     )
 
 
@@ -830,6 +950,7 @@ def apply_patches(dest: Path, service: str) -> None:
     patch_history_compaction(adapters / "history-compaction.ts")
     patch_bot_messages(adapters / "bot-messages.ts")
     patch_pi_usage(adapters / "pi-usage.ts")
+    patch_pi_runtime(adapters / "pi-runtime.ts")
     patch_thinkbudget_fetch(adapters / "pi-openai-compatible-provider.ts")
     patch_core_index(dest)
 
@@ -871,6 +992,9 @@ def emit_hashes(dest: Path, service: str, patch: bool) -> None:
         f"packages/adapters/src/computer-browser.ts\t{sha256(dest / 'packages/adapters/src/computer-browser.ts')}",
         f"packages/adapters/src/browser-tools.ts\t{sha256(dest / 'packages/adapters/src/browser-tools.ts')}",
         f"packages/adapters/src/protected-result.ts\t{sha256(dest / 'packages/adapters/src/protected-result.ts')}",
+        f"packages/adapters/src/pi-runtime.ts\t{sha256(dest / 'packages/adapters/src/pi-runtime.ts')}",
+        f"packages/core/src/secret-result-handle.ts\t{sha256(dest / 'packages/core/src/secret-result-handle.ts')}",
+        f"packages/core/src/completion-artifact.ts\t{sha256(dest / 'packages/core/src/completion-artifact.ts')}",
     ]
     name = "AFTER-HASHES.tsv" if patch else "PREIMAGE-HASHES.tsv"
     (dest / name).write_text("\n".join(rows) + "\n")

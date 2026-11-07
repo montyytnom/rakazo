@@ -1,6 +1,6 @@
 # Historical secret cleanup (separate from this repair)
 
-This repair only changes the **future** persist path. Do not run destructive SQL as part of this overlay.
+This repair only changes the **future** persist path. Do not run destructive SQL as part of this overlay. `HISTORICAL_PLAINTEXT_CLEANUP_LOCKED` stays true; persist must not rewrite old plaintext rows.
 
 ## Scope (later, parent-owned)
 

@@ -1,12 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
   extractGeneratedPassword,
+  harvestSecretsFromText,
+  harvestSecretsFromUnknown,
   issueProtectedResult,
   looksLikeSecretValue,
   protectedResultNote,
   redactProtectedTree,
+  redactThrown,
   secretsFromPriorAssistantText,
   stripSecretEchoes,
+  stripSecretsFromUnknown,
 } from "./secret-result-handle.js";
 
 const FIXTURE_OLD = "FxOld#4419Temp";
@@ -45,5 +49,58 @@ describe("protected result handles", () => {
       `Old password: ${FIXTURE_OLD}. New password: ${FIXTURE_NEW}`,
     ]);
     expect(both).toEqual([FIXTURE_OLD, FIXTURE_NEW]);
+  });
+
+  it("harvests labelled plaintext from simple, JSON, and markdown forms", () => {
+    const simple = "hunter99";
+    expect(harvestSecretsFromText(`password ${simple}`)).toContain(simple);
+    expect(harvestSecretsFromText(`password is ${simple}`)).toContain(simple);
+    expect(harvestSecretsFromUnknown({ password: simple })).toContain(simple);
+    expect(harvestSecretsFromText(`{"newPassword":"${FIXTURE_NEW}"}`)).toContain(FIXTURE_NEW);
+    expect(harvestSecretsFromText(`**New password:** \`${FIXTURE_NEW}\``)).toContain(FIXTURE_NEW);
+    expect(
+      harvestSecretsFromText("```json\n" + JSON.stringify({ password: FIXTURE_OLD }) + "\n```"),
+    ).toContain(FIXTURE_OLD);
+  });
+
+  it("does not harvest protected refs or benign password language", () => {
+    expect(harvestSecretsFromText("Reset password successful.")).toEqual([]);
+    expect(harvestSecretsFromText("The password field is required.")).toEqual([]);
+    expect(harvestSecretsFromText("Protected result op-deadbeef at 2026-11-07, sha256:aabb")).toEqual(
+      [],
+    );
+    expect(harvestSecretsFromText("complete the form")).toEqual([]);
+    expect(looksLikeSecretValue("op-deadbeef")).toBe(false);
+  });
+
+  it("strips secrets from thrown errors so logs cannot echo plaintext", () => {
+    const error = redactThrown(new Error(`vault failed for ${FIXTURE_NEW}`), [FIXTURE_NEW]);
+    expect(error.message).not.toContain(FIXTURE_NEW);
+    expect(error.message).toContain("[withheld]");
+  });
+
+  it("strips harvested secrets from replayed tool-call arguments and tool results", () => {
+    const transcript = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            name: "scratchpad_add",
+            arguments: { title: `New password: ${FIXTURE_NEW}` },
+          },
+        ],
+      },
+      {
+        role: "toolResult",
+        toolName: "scratchpad_add",
+        content: [{ type: "text", text: `Protected result. title: New password: ${FIXTURE_NEW}` }],
+      },
+    ];
+    const secrets = harvestSecretsFromUnknown(transcript);
+    expect(secrets).toContain(FIXTURE_NEW);
+    const stripped = JSON.stringify(stripSecretsFromUnknown(transcript, secrets));
+    expect(stripped).not.toContain(FIXTURE_NEW);
+    expect(stripped).toContain("[withheld]");
   });
 });

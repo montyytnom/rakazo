@@ -100,6 +100,9 @@ import {
   sanitizeFinalText,
   secretsFromPriorAssistantText,
   stripSecretEchoes,
+  bindOutcomeArtifact,
+  emptyCompletionLedger,
+  harvestSecretsFromUnknown,
   TAKEOVER_COMPUTER_PENDING_STATE,
   threadIrreversibleEffectKey,
   toolRequiresApproval,
@@ -4443,6 +4446,11 @@ export function createRunExecutor(deps: ExecutorDeps) {
             .map((message) => ({ id: message.id, text: message.content })),
         );
         const intentId = turnIntent.intentId;
+        const turnLedger = emptyCompletionLedger({
+          intentId,
+          sourceMessageId: turnIntent.sourceMessageId ?? "",
+          runId,
+        });
         const nextMutatingEffectOccurrence = (toolName: string, args: Record<string, unknown>) => {
           const fingerprint = toolEffectIdempotencyKey(runId, toolName, args);
           const occurrence = mutatingEffectOccurrences.get(fingerprint) ?? 0;
@@ -5197,7 +5205,18 @@ export function createRunExecutor(deps: ExecutorDeps) {
                   return gate.result;
                 }
               } else {
-                return redactReplayResult(gate.result, runSecrets);
+                const replayed = redactReplayResult(gate.result, runSecrets);
+                turnToolResults.push(replayed);
+                const artifact = bindOutcomeArtifact({
+                  result: replayed,
+                  toolName: name,
+                  args,
+                  intentId,
+                  sourceMessageId: turnIntent.sourceMessageId ?? "",
+                  runId,
+                });
+                if (artifact) turnLedger.artifacts.push(artifact);
+                return replayed;
               }
             }
             if (gate.action === "paused") {
@@ -5246,13 +5265,19 @@ export function createRunExecutor(deps: ExecutorDeps) {
                 )
               : Promise.resolve(true);
           const finish = async (result: unknown) => {
-            turnToolResults.push(result);
-            for (const secret of secretsFromPriorAssistantText([
-              typeof result === "string" ? result : JSON.stringify(result ?? ""),
-              JSON.stringify(args ?? {}),
-            ])) {
+            for (const secret of harvestSecretsFromUnknown([result, args])) {
               if (!runSecrets.includes(secret)) runSecrets.push(secret);
             }
+            turnToolResults.push(result);
+            const artifact = bindOutcomeArtifact({
+              result,
+              toolName: name,
+              args,
+              intentId,
+              sourceMessageId: turnIntent.sourceMessageId ?? "",
+              runId,
+            });
+            if (artifact) turnLedger.artifacts.push(artifact);
             return (await persistEffectResult(result)) ? result : uncertainEffectResult(name, args);
           };
           const registerRunSecrets = (values: string[]) => {
@@ -7220,7 +7245,16 @@ export function createRunExecutor(deps: ExecutorDeps) {
               maxImages: modelImageBudget,
             })
           : history;
-        const runtimeHistory = [...historicalContext, ...historyWithImages];
+        for (const secret of harvestSecretsFromUnknown(
+          history.filter((message) => message.role === "assistant").map((message) => message.content),
+        )) {
+          if (!runSecrets.includes(secret)) runSecrets.push(secret);
+        }
+        const runtimeHistory = [...historicalContext, ...historyWithImages].map((message) =>
+          typeof message.content === "string"
+            ? { ...message, content: stripSecretEchoes(message.content, runSecrets).text }
+            : message,
+        );
         // Without a roster a bot only knows the bots it spawned itself.
         const botDirectory = thread.groupId
           ? undefined
@@ -7959,7 +7993,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
                 publishedMidTurnUserMessage || runAllowsSilentEmpty(run.trigger),
               ).map((block) => {
                 if (block.kind !== "text") return block;
-                const sanitized = sanitizeFinalText(block.text, evidence);
+                const sanitized = sanitizeFinalText(block.text, evidence, turnLedger);
                 return {
                   ...block,
                   text: stripSecretEchoes(sanitized, [...runSecrets, ...priorSecrets]).text,

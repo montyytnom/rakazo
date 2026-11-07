@@ -4,6 +4,7 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { beforeAll, describe, expect, it, vi } from "vitest";
+import { captureRunModel, startCaptureStub } from "./isolated-capture.js";
 
 const repo = path.resolve(import.meta.dirname, "../../..");
 const overlay =
@@ -16,6 +17,14 @@ const beforeExecutor = path.join(
 const afterExecutor = path.join(
   composeOut,
   "worker/after/packages/adapters/src/executor.ts",
+);
+const afterPiRuntime = path.join(
+  composeOut,
+  "worker/after/packages/adapters/src/pi-runtime.ts",
+);
+const beforePiRuntime = path.join(
+  composeOut,
+  "worker/before/packages/adapters/src/pi-runtime.ts",
 );
 const beforeFetch = path.join(
   composeOut,
@@ -160,6 +169,10 @@ function harness(
     effects?: Effect[];
     secretStore?: unknown;
     finalText?: string;
+    runtime?: {
+      describe: () => { capabilities: { scripted: boolean } };
+      run: (request: AgentRunRequest) => AsyncGenerator<unknown>;
+    };
     history?: Array<{
       id: string;
       role: "user" | "bot";
@@ -384,6 +397,13 @@ function harness(
       updateMany: vi.fn(async () => ({ count: 1 })),
       deleteMany: vi.fn(async () => ({ count: 0 })),
     },
+    usageRecord: {
+      createMany: vi.fn(async () => ({ count: 1 })),
+      create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => ({
+        id: "usage-1",
+        ...data,
+      })),
+    },
     externalEffect,
     $queryRaw: vi.fn(async () => [{ id: "computer-1", scope: "dedicated" }]),
     $executeRaw: vi.fn(async () => 1),
@@ -400,7 +420,10 @@ function harness(
   });
   const executor = createRunExecutor({
     prisma: prisma as never,
-    runtime: { describe: () => ({ capabilities: { scripted: false } }), run: runtimeRun },
+    runtime: options.runtime ?? {
+      describe: () => ({ capabilities: { scripted: false } }),
+      run: runtimeRun,
+    },
     connector: {
       discoverTools: async () => [],
       resolveCall: async () => undefined,
@@ -437,6 +460,7 @@ function harness(
     events: {
       append: vi.fn(async () => undefined),
       notify: vi.fn(async () => undefined),
+      claimSteering: vi.fn(async () => []),
       pauseRunForInput: vi.fn(async () => true),
       finalizeRun: vi.fn(async (input: { blocks?: unknown; outcome?: string }) => {
         finalized.push(input);
@@ -1195,4 +1219,137 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
     expect(dump(f.finalized)).not.toMatch(/\bDone\b/);
     expect(dump(f.finalized)).toMatch(/not verified/i);
   });
+
+  it("fail-before: PiRuntime stub HTTP after a generated secret still carries plaintext", async () => {
+    if (missing.length) return;
+    const visible = await captureSecretBoundary(beforeExecutor, "run-pi-secret-before");
+    expect(visible.captureCount, visible.debug).toBeGreaterThan(1);
+    expect(visible.http).toContain(STALE_SECRET_SENTINEL);
+    expect(visible.http).toContain(CURRENT_SECRET_SENTINEL);
+  });
+
+  it("pass-after: PiRuntime stub HTTP, persist, final, and handoff withhold current and stale sentinels", async () => {
+    if (missing.length) return;
+    const visible = await captureSecretBoundary(afterExecutor, "run-pi-secret-after");
+    expect(visible.captureCount, visible.debug).toBeGreaterThan(1);
+    expect(visible.http, visible.debug).not.toContain(CURRENT_SECRET_SENTINEL);
+    expect(visible.http).not.toContain(STALE_SECRET_SENTINEL);
+    expect(visible.persist.length, visible.persist).toBeGreaterThan(2);
+    expect(visible.persist).not.toContain(CURRENT_SECRET_SENTINEL);
+    expect(visible.persist).not.toContain(STALE_SECRET_SENTINEL);
+    expect(visible.final).not.toContain(CURRENT_SECRET_SENTINEL);
+    expect(visible.final).not.toContain(STALE_SECRET_SENTINEL);
+    expect(visible.http).toMatch(/Protected result|\[withheld\]|\[redacted\]/);
+  });
 });
+
+function sseToolCall(id: string, name: string, args: Record<string, unknown>) {
+  return [
+    {
+      tool_calls: [
+        { index: 0, id, type: "function", function: { name, arguments: "" } },
+      ],
+    },
+    { tool_calls: [{ index: 0, function: { arguments: JSON.stringify(args) } }] },
+  ];
+}
+
+async function captureSecretBoundary(executorFile: string, runId: string) {
+  const previous = process.env.RAKAZO_OPENAI_COMPAT_ALLOW_PUBLIC;
+  process.env.RAKAZO_OPENAI_COMPAT_ALLOW_PUBLIC = "1";
+  const piFile = executorFile.includes("/after/") ? afterPiRuntime : beforePiRuntime;
+  const { PiAgentRuntime } = await import(`${pathToFileURL(piFile).href}?t=${Date.now()}`);
+  const pi = new PiAgentRuntime();
+  const stub = await startCaptureStub({
+    modelId: captureRunModel("http://127.0.0.1/v1").id,
+    caseName: "candidate-secret-boundary",
+    replies: [
+      {
+        kind: "sse",
+        finish: "tool_calls",
+        events: sseToolCall("call-secret-1", "scratchpad_add", {
+          title: `New password: ${CURRENT_SECRET_SENTINEL}`,
+        }),
+      },
+      {
+        kind: "sse",
+        finish: "stop",
+        events: [
+          {
+            content: `Done. New password: ${CURRENT_SECRET_SENTINEL}. Old password: ${STALE_SECRET_SENTINEL}`,
+          },
+        ],
+      },
+      ...Array.from({ length: 6 }, (_, index) => ({
+        kind: "sse" as const,
+        finish: "stop" as const,
+        events: [{ content: `synthetic-stop-${index}` }],
+      })),
+    ],
+  });
+  try {
+    const piEvents: Array<{ type?: string }> = [];
+    const executeCalls: Array<{ name: string; args: unknown }> = [];
+    let hasExecute = false;
+    let piError: string | undefined;
+    const createRunExecutor = await loadExecutor(executorFile);
+    const f = harness(createRunExecutor, {
+      runId,
+      prompt: "Save the generated password",
+      sourceMessageId: "msg-1",
+      graphical: false,
+      secretStore: opaqueSecretStore(),
+      history: [
+        {
+          id: "msg-prior",
+          role: "bot",
+          seq: 1,
+          blocks: [{ kind: "text", text: `Old password: ${STALE_SECRET_SENTINEL}` }],
+        },
+      ],
+      runtime: {
+        describe: () => ({ capabilities: { scripted: false } }),
+        run: async function* (request: AgentRunRequest) {
+          request.model = captureRunModel(stub.baseUrl);
+          hasExecute = Boolean(request.executeTool);
+          const inner = request.executeTool;
+          request.executeTool = inner
+            ? async (name, args, executionId) => {
+                executeCalls.push({ name, args });
+                return inner(name, args, executionId);
+              }
+            : undefined;
+          try {
+            for await (const event of pi.run(request, {
+              operationId: runId,
+              traceId: runId,
+              spaceId: "space-1",
+              userId: "user-1",
+              signal: AbortSignal.timeout(90_000),
+            })) {
+              piEvents.push({ type: (event as { type?: string }).type });
+              yield event;
+            }
+          } catch (error) {
+            piError = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+            throw error;
+          }
+        },
+      },
+    });
+    await f.runTurn(runId);
+    const http = stub.rawBodies.map((body) => body.toString("utf8")).join("\n");
+    return {
+      http,
+      captureCount: stub.captures.length,
+      persist: dump(f.effects.map((effect) => effect.result)),
+      final: dump(f.finalized),
+      results: dump(f.results),
+      debug: dump({ events: piEvents, error: piError, executeCalls, hasExecute }),
+    };
+  } finally {
+    await stub.close();
+    if (previous === undefined) delete process.env.RAKAZO_OPENAI_COMPAT_ALLOW_PUBLIC;
+    else process.env.RAKAZO_OPENAI_COMPAT_ALLOW_PUBLIC = previous;
+  }
+}

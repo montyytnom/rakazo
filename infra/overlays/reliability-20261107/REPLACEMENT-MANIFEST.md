@@ -21,14 +21,14 @@ Thinking / Flash-Next files stay untouched.
 | # | Container path | Source | sha256 |
 |---|---|---|---|
 | 1 | `/app/packages/core/src/irreversible-effect.ts` | `packages/core/src/irreversible-effect.ts` | `910c0f3ec95c876b678054d85b2b02ceb4d200f6436c9ddd9ea6ce9d0b1092e1` |
-| 2 | `/app/packages/core/src/secret-result-handle.ts` | `packages/core/src/secret-result-handle.ts` | `404edf2b072f62338b8c15f18ee1966586fc19f15d1c275647b35cadfb021ac9` |
-| 3 | `/app/packages/core/src/completion-artifact.ts` | `packages/core/src/completion-artifact.ts` | `549bb8ea94761cde7796aa12914d339eb035109594e655c8ffeccbf509df766d` |
+| 2 | `/app/packages/core/src/secret-result-handle.ts` | `packages/core/src/secret-result-handle.ts` | `ecdffcc2ffd3de19a29479d59da8dddccb11adc14be6a107ab952fdc7be0532f` |
+| 3 | `/app/packages/core/src/completion-artifact.ts` | `packages/core/src/completion-artifact.ts` | `e38de06d878f90d3a7d6571859f1351b9878bfaad3eca67ee3a98b5236d59845` |
 | 4 | `/app/packages/core/src/compaction-provenance.ts` | `packages/core/src/compaction-provenance.ts` | `af1ca37ab04e39f5a64f15a5a1e2aa9c13304b1b3cebb4b0ebfcf58d10f8c696` |
 | 5 | `/app/packages/core/src/handoff-delivery.ts` | `packages/core/src/handoff-delivery.ts` | `d0490795391a38df1b5e2fa24bb99ce5786a67ba3eb4b1a8ff8e24ab762b5fae` |
 | 6 | `/app/packages/core/src/index.ts` | `packages/core/src/index.ts` | `15a9cceec41e55fa6c977a1eb96940da2314f0396dd350ac06e014a84cfedf62` |
 | 7 | `/app/packages/adapters/src/stale-element-recovery.ts` | `packages/adapters/src/stale-element-recovery.ts` | `98899f32520f6796f04061b11788f99ffaafd8a017f78eb8d2e7b6a80f6f3e22` |
 | 8 | `/app/packages/adapters/src/desktop-tool-contract.ts` | `packages/adapters/src/desktop-tool-contract.ts` | `42aa185f612934f1ba24d99d09cc78fa95550765eca83ece183f9f9a6cd65e0c` |
-| 9 | `/app/packages/adapters/src/protected-result.ts` | `packages/adapters/src/protected-result.ts` | `fe6a49432c8cff55f8738a990728502e1f8164b3bd8226570d1fb47cc97ac213` |
+| 9 | `/app/packages/adapters/src/protected-result.ts` | `packages/adapters/src/protected-result.ts` | `955fcb93ed1d80735f95ad0a455f07f49480fc1755f7e42b1a524c4d34784bec` |
 | 10 | `/app/packages/adapters/src/model-stream-error.ts` | `packages/adapters/src/model-stream-error.ts` | `7219e869341d3bff71893345061a08ce2691bcc4c6f12bd38729375e287364f7` |
 
 ### Offline dump only — 1 (hashed, not a production mount)
@@ -41,7 +41,7 @@ Thinking / Flash-Next files stay untouched.
 
 | # | Container path | This-branch sha256 | Per-service overlay status |
 |---|---|---|---|
-| 12 | `/app/packages/adapters/src/executor.ts` | `0cfd90c5a6aa273fb89ef77a6d1c344b0f45b3a891616f639950824e16f5a58b` | **SKEWED** (worker amazon-signin-verify ≠ api browserextract) |
+| 12 | `/app/packages/adapters/src/executor.ts` | `050fd5504de1433565012f1d40e9d3b4a994a0303b3098564bcf881451ee5a3d` | **SKEWED** (worker amazon-signin-verify ≠ api browserextract) |
 | 13 | `/app/packages/adapters/src/browser-tools.ts` | `f4b0d7d575e13c5dfc296d7e5c398abbae68e90992f9a385d0c178655e3cc2e7` | **SKEWED** (worker savedlogins ≠ api browserextract) |
 | 14 | `/app/packages/adapters/src/builtin-tools.ts` | `9ee95d483069d9943724c372a109d1ab8629ad07de68b63a2c66af716d12f5e3` | **SKEWED** (worker savedlogins ≠ api browserextract) |
 | 15 | `/app/packages/adapters/src/bot-messages.ts` | `7b436959e19f3409feb5fd5459e417322d0ebfc7aca3ce9311515052f3fe1b6c` | same overlay on api and worker |
