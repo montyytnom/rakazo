@@ -72,6 +72,23 @@ export const IDENTICAL_TOOL_ERROR = {
   error: "LOGIN_GUARD refused kind=password rule=default origin=https://capture.example.test",
 } as const;
 export const FIRST_TURN_REASONING = "synthetic-reasoning-first-turn";
+export const CREATE_SPACE_CLAUSE =
+  "create_space proposes a new privacy boundary inside the current organization";
+export const RENDER_PLOT_CLAUSE =
+  "For charts and data visualization, use the render_plot tool";
+export const FLEET_CLAUSE = "Fleet tools: call list_fleet before changing anything";
+export const SKIPPED_LOOP_GUARD =
+  "Skipped: stopped by the loop guard. Reply with what you found.";
+export const RUNTIDY_NOTICE = "Tools are now switched off";
+export const STALE_REF_ERROR = "stale-ref: element e1 is gone";
+export const CAPTURE_LOGIN_CLAIM = "logged in as capture-user@example.test";
+export const SHORT_CONTROL_TREE = "SHORT_CONTROL_TREE";
+export const ERROR_CONTROL_TEXT = "snapshot failed: control-error";
+export const OLDER_TOOL_RESULT_SHORTEN_BYTES = 1024;
+export const OLDER_TOOL_RESULT_TRUNCATION_NOTE =
+  "[Tool result truncated to fit context; inspect original evidence before claiming omitted details.]";
+export const HISTORICAL_CANDIDATE_WORDING =
+  "Deployed-code synthetic capture is a candidate baseline, pending review (run10: not accepted).";
 const CONTEXT_STRATEGIES = new Set(["current", "retrieval", "snapshots", "cache-aware"]);
 
 function captureCallLimits(env: NodeJS.ProcessEnv = process.env): {
@@ -278,6 +295,28 @@ export function captureTimeZone(service = process.env.ISOLATED_CAPTURE_SERVICE ?
   };
 }
 
+/** Chief bot.fleetManagement. Derived, not a hard-forced tool count. */
+export function captureFleetManagement(): {
+  value: boolean;
+  property: "bot.fleetManagement";
+  source: string;
+} {
+  return {
+    value: true,
+    property: "bot.fleetManagement",
+    source:
+      "Chief bot.fleetManagement (parent metadata asserted true on the serving bot row; shareable dump omits this field; selectBuiltinToolsForRun derives offered fleet tools from this flag; offered count is not hard-forced)",
+  };
+}
+
+export function olderToolResultFallbackLength(
+  size = OLDER_TOOL_RESULT_SHORTEN_BYTES,
+): number {
+  return (
+    Math.floor(size / 2) + 1 + OLDER_TOOL_RESULT_TRUNCATION_NOTE.length + 1 + Math.floor(size / 2)
+  );
+}
+
 export function captureDisabledBuiltinTools(): string[] {
   const botRow: string[] = [];
   const assist = (
@@ -430,7 +469,7 @@ export function deriveAssemblerInputs() {
     mediaVideoEnabled: false,
     messagingChannelRun: false,
     voiceCall: false,
-    fleetManagement: false,
+    fleetManagement: captureFleetManagement().value,
     followUpFromUser: true,
     disabledBuiltinTools: captureDisabledBuiltinTools(),
     connectorRegistry: "empty" as const,
@@ -589,6 +628,11 @@ export async function assembleCapturePrompt(): Promise<{
   botDirectory: string | undefined;
   skillsLine: string | undefined;
   longWork: string;
+  promptClauses: {
+    createSpace: boolean;
+    renderPlot: boolean;
+    fleet: boolean;
+  };
 }> {
   const toolInventory = await offeredToolsFromDeployedBuilder();
   const computerInstruction = persistentComputerInstruction({
@@ -623,6 +667,7 @@ export async function assembleCapturePrompt(): Promise<{
     agentSkillsLine: skillsLine,
     taughtSkillsLine: undefined as string | undefined,
     replyGuidance: longWork,
+    disabledBuiltinTools: new Set(captureDisabledBuiltinTools()),
     offeredFleetTools: offeredFleetTools(toolInventory.tools),
   };
   const userPrompt = syntheticUserPrompt();
@@ -723,6 +768,11 @@ export async function assembleCapturePrompt(): Promise<{
     botDirectory: botdir.text,
     skillsLine,
     longWork,
+    promptClauses: {
+      createSpace: instructions.includes(CREATE_SPACE_CLAUSE),
+      renderPlot: instructions.includes(RENDER_PLOT_CLAUSE),
+      fleet: instructions.includes(FLEET_CLAUSE),
+    },
   };
 }
 
@@ -759,7 +809,9 @@ function withholdRationale(
     if (fleet.has(name)) {
       rows.push({
         name,
-        reason: "selectBuiltinToolsForRun fleetManagement=false (FLEET_TOOL_NAMES)",
+        reason: inputs.fleetManagement
+          ? "selectBuiltinToolsForRun fleetManagement=true but tool still withheld (trigger/follow-up gate)"
+          : "selectBuiltinToolsForRun fleetManagement=false (FLEET_TOOL_NAMES)",
       });
       continue;
     }
@@ -869,7 +921,15 @@ export function classifyCapturePhase(
   seq: number,
   parsed: Record<string, unknown> | null,
 ): string {
-  if (caseName !== "phases" && caseName !== "guard-orchestration") return caseName;
+  if (
+    caseName !== "phases" &&
+    caseName !== "guard-orchestration" &&
+    caseName !== "guard-a" &&
+    caseName !== "guard-b" &&
+    caseName !== "guard-c"
+  ) {
+    return caseName;
+  }
   const tools = Array.isArray(parsed?.tools) ? parsed.tools : [];
   const hay = JSON.stringify(parsed ?? {});
   // Tool-free is the runtidy request only. Halt text can still advertise tools.
@@ -1081,11 +1141,31 @@ function executeSyntheticTool(
     };
   }
   if (name === "browser_snapshot") {
+    const maxControls = Number(args.max_controls ?? 0);
+    if (maxControls === 1) {
+      return {
+        url: "https://capture.example.test/short",
+        title: "short-control",
+        tree: SHORT_CONTROL_TREE,
+        elements: [],
+      };
+    }
+    if (maxControls === 999) {
+      return { error: ERROR_CONTROL_TEXT, isError: true };
+    }
+    if (maxControls >= 101 && maxControls <= 104) {
+      return oversizedPage(maxControls - 100);
+    }
     snapshotCount.value += 1;
     return oversizedPage(snapshotCount.value);
   }
   if (name === "browser_act") {
     return { ...IDENTICAL_TOOL_ERROR };
+  }
+  if (name === "browser_extract") {
+    // isError failure with stale-ref text (not LOGIN_GUARD refusal JSON). Overlay ERROR GUARD
+    // reads details.error; LOOP GUARD treats extract as observe and returns ok.
+    return { error: STALE_REF_ERROR, isError: true };
   }
   if (name === "web_fetch") {
     return {
@@ -1177,6 +1257,18 @@ export function loopGuardSignals(bodies: Array<Record<string, unknown> | null>):
   return { warning, halt, errorGuard };
 }
 
+export function toolsKeyPresent(body: Record<string, unknown> | null): boolean {
+  return Boolean(body && Object.prototype.hasOwnProperty.call(body, "tools"));
+}
+
+export function skippedLoopGuardPresent(bodies: Array<Record<string, unknown> | null>): boolean {
+  return bodies.some((body) => JSON.stringify(body ?? {}).includes(SKIPPED_LOOP_GUARD));
+}
+
+export function runtidyPromptPresent(bodies: Array<Record<string, unknown> | null>): boolean {
+  return bodies.some((body) => JSON.stringify(body ?? {}).includes(RUNTIDY_NOTICE));
+}
+
 function validBrowserActCallCount(bodies: Array<Record<string, unknown> | null>): number {
   const ids = new Set<string>();
   for (const body of bodies) {
@@ -1206,6 +1298,19 @@ export const GUARD_ORCHESTRATION_TOOL: ConnectorTool = {
   },
 };
 
+export const GUARD_EXTRACT_TOOL: ConnectorTool = {
+  name: "browser_extract",
+  description: "synthetic extract for error-guard orchestration",
+  inputSchema: {
+    type: "object",
+    properties: {
+      ref: { type: "string" },
+    },
+  },
+};
+
+export const VALID_BROWSER_EXTRACT_ARGS = { ref: "e1" } as const;
+
 export type GuardOrchestrationResult = {
   captures: CapturedHttp[];
   parsedBodies: Array<Record<string, unknown> | null>;
@@ -1216,33 +1321,35 @@ export type GuardOrchestrationResult = {
   errorGuardPresent: boolean;
   haltAdvertisesTools: boolean;
   guardFinalToolFree: boolean;
+  skippedPresent: boolean;
+  noToolsKey: boolean;
+  runtidyPrompt: boolean;
+  toolName: "browser_act" | "browser_extract";
 };
 
 export async function captureLoopGuardOrchestration(options: {
   runtime: PiAgentRuntime;
   runId: string;
   extraIgnoredHaltCall: boolean;
+  toolName?: "browser_act" | "browser_extract";
 }): Promise<GuardOrchestrationResult> {
   process.env.RAKAZO_GUARD_FINAL_SUMMARY ??= "1";
   const meta = loadCaptureModelMetadata();
+  const toolName = options.toolName ?? "browser_act";
+  const args =
+    toolName === "browser_extract"
+      ? (VALID_BROWSER_EXTRACT_ARGS as unknown as Record<string, unknown>)
+      : (VALID_BROWSER_ACT_ARGS as unknown as Record<string, unknown>);
   const actReplies: StubReply[] = [1, 2, 3, 4].map((index) => ({
     kind: "sse",
     finish: "tool_calls",
-    events: toolCallDelta(
-      `call_guard_act_${index}`,
-      "browser_act",
-      VALID_BROWSER_ACT_ARGS as unknown as Record<string, unknown>,
-    ),
+    events: toolCallDelta(`call_guard_${toolName}_${index}`, toolName, args),
   }));
   if (options.extraIgnoredHaltCall) {
     actReplies.push({
       kind: "sse",
       finish: "tool_calls",
-      events: toolCallDelta(
-        "call_guard_act_ignored_halt",
-        "browser_act",
-        VALID_BROWSER_ACT_ARGS as unknown as Record<string, unknown>,
-      ),
+      events: toolCallDelta(`call_guard_${toolName}_ignored_halt`, toolName, args),
     });
   }
   const stub = await startCaptureStub({
@@ -1266,15 +1373,19 @@ export async function captureLoopGuardOrchestration(options: {
       prompt: "Synthetic loop-guard orchestration. No live accounts or browsing.",
       instructions: "Follow tool results. Do not invent side effects.",
       history: [],
-      tools: [GUARD_ORCHESTRATION_TOOL],
+      tools: [toolName === "browser_extract" ? GUARD_EXTRACT_TOOL : GUARD_ORCHESTRATION_TOOL],
       contextStrategy: "retrieval",
       allowSilentEmpty: true,
       model: captureRunModel(stub.baseUrl),
-      executeTool: async (name, args) =>
-        executeSyntheticTool(name, args as Record<string, unknown>, { value: 0 }),
+      executeTool: async (name, toolArgs) =>
+        executeSyntheticTool(name, toolArgs as Record<string, unknown>, { value: 0 }),
     });
     const signals = loopGuardSignals(stub.parsedBodies);
     const haltCapture = stub.captures.find((row) => row.phase === "guard-halt");
+    const toolFree = stub.captures.find(
+      (capture) => capture.phase === "guard-final" && capture.toolNames.length === 0,
+    );
+    const toolFreeBody = toolFree ? stub.parsedBodies[toolFree.seq] ?? null : null;
     return {
       captures: stub.captures,
       parsedBodies: stub.parsedBodies,
@@ -1284,9 +1395,11 @@ export async function captureLoopGuardOrchestration(options: {
       guardHalt: signals.halt,
       errorGuardPresent: signals.errorGuard,
       haltAdvertisesTools: Boolean(haltCapture && haltCapture.toolNames.length > 0),
-      guardFinalToolFree: stub.captures.some(
-        (capture) => capture.phase === "guard-final" && capture.toolNames.length === 0,
-      ),
+      guardFinalToolFree: Boolean(toolFree),
+      skippedPresent: skippedLoopGuardPresent(stub.parsedBodies),
+      noToolsKey: Boolean(toolFree && !toolsKeyPresent(toolFreeBody)),
+      runtidyPrompt: runtidyPromptPresent(stub.parsedBodies),
+      toolName,
     };
   } finally {
     await stub.close();
@@ -1313,6 +1426,16 @@ export async function capturePhaseTurn(service: string): Promise<{
   guardWarning: boolean;
   guardHalt: boolean;
   guardFinalToolFree: boolean;
+  haltAdvertisesTools: boolean;
+  skippedPresent: boolean;
+  runtidyPrompt: boolean;
+  errorGuardPresent: boolean;
+  promptClauses: {
+    createSpace: boolean;
+    renderPlot: boolean;
+    fleet: boolean;
+  };
+  path: "A";
 }> {
   const meta = loadCaptureModelMetadata();
   const assembled = await assembleCapturePrompt();
@@ -1394,6 +1517,7 @@ export async function capturePhaseTurn(service: string): Promise<{
     const signals = loopGuardSignals(stub.parsedBodies);
     const guardWarning = signals.warning;
     const guardHalt = signals.halt;
+    const haltCapture = stub.captures.find((row) => row.phase === "guard-halt");
     const guardFinalToolFree = stub.captures.some(
       (capture) => capture.phase === "guard-final" && capture.toolNames.length === 0,
     );
@@ -1417,11 +1541,155 @@ export async function capturePhaseTurn(service: string): Promise<{
       guardWarning,
       guardHalt,
       guardFinalToolFree,
+      haltAdvertisesTools: Boolean(haltCapture && haltCapture.toolNames.length > 0),
+      skippedPresent: skippedLoopGuardPresent(stub.parsedBodies),
+      runtidyPrompt: runtidyPromptPresent(stub.parsedBodies),
+      errorGuardPresent: signals.errorGuard,
+      promptClauses: assembled.promptClauses,
+      path: "A",
     };
   } finally {
     await stub.close();
   }
 }
+
+export type GuardPathCapture = {
+  service: string;
+  path: "B" | "C";
+  caseName: "guard-b" | "guard-c";
+  captures: CapturedHttp[];
+  rawBodies: Buffer[];
+  parsedBodies: Array<Record<string, unknown> | null>;
+  guardWarning: boolean;
+  guardHalt: boolean;
+  errorGuardPresent: boolean;
+  skippedPresent: boolean;
+  guardFinalToolFree: boolean;
+  noToolsKey: boolean;
+  runtidyPrompt: boolean;
+  haltAdvertisesTools: boolean;
+  validBrowserActCalls: number;
+  identicalToolErrors: number;
+};
+
+async function captureGuardPath(
+  service: string,
+  path: "B" | "C",
+): Promise<GuardPathCapture> {
+  process.env.RAKAZO_GUARD_FINAL_SUMMARY ??= "1";
+  const meta = loadCaptureModelMetadata();
+  const assembled = await assembleCapturePrompt();
+  const toolName = path === "C" ? "browser_extract" : "browser_act";
+  const args =
+    path === "C"
+      ? (VALID_BROWSER_EXTRACT_ARGS as unknown as Record<string, unknown>)
+      : (VALID_BROWSER_ACT_ARGS as unknown as Record<string, unknown>);
+  const caseName = path === "C" ? "guard-c" : "guard-b";
+  const replies: StubReply[] = [1, 2, 3, 4, 5].map((index) => ({
+    kind: "sse" as const,
+    finish: "tool_calls",
+    events: toolCallDelta(`call_capture_${caseName}_${index}`, toolName, args),
+  }));
+  replies.push({
+    kind: "sse",
+    finish: "stop",
+    events: [{ content: `${caseName}-stop` }],
+  });
+  replies.push(...extraStopReplies(8));
+  const stub = await startCaptureStub({ modelId: meta.id, caseName, replies });
+  try {
+    await drainRuntime(new PiAgentRuntime(), {
+      botId: "bot-synthetic-capture",
+      threadId: "thread-synthetic-capture",
+      runId: `run-synthetic-${caseName}-${service}`,
+      prompt: assembled.prompt,
+      instructions: assembled.instructions,
+      history: [],
+      tools: assembled.tools,
+      contextStrategy: captureContextStrategy().value,
+      allowSilentEmpty: true,
+      model: captureRunModel(stub.baseUrl),
+      executeTool: async (name, toolArgs) =>
+        executeSyntheticTool(name, toolArgs, { value: 0 }),
+    });
+    const signals = loopGuardSignals(stub.parsedBodies);
+    const haltCapture = stub.captures.find((row) => row.phase === "guard-halt");
+    const toolFree = stub.captures.find(
+      (capture) => capture.phase === "guard-final" && capture.toolNames.length === 0,
+    );
+    const toolFreeBody = toolFree ? stub.parsedBodies[toolFree.seq] ?? null : null;
+    return {
+      service,
+      path,
+      caseName,
+      captures: stub.captures,
+      rawBodies: stub.rawBodies,
+      parsedBodies: stub.parsedBodies,
+      guardWarning: signals.warning,
+      guardHalt: signals.halt,
+      errorGuardPresent: signals.errorGuard,
+      skippedPresent: skippedLoopGuardPresent(stub.parsedBodies),
+      guardFinalToolFree: Boolean(toolFree),
+      noToolsKey: Boolean(toolFree && !toolsKeyPresent(toolFreeBody)),
+      runtidyPrompt: runtidyPromptPresent(stub.parsedBodies),
+      haltAdvertisesTools: Boolean(haltCapture && haltCapture.toolNames.length > 0),
+      validBrowserActCalls: validBrowserActCallCount(stub.parsedBodies),
+      identicalToolErrors: identicalToolErrorCount(stub.parsedBodies),
+    };
+  } finally {
+    await stub.close();
+  }
+}
+
+export async function captureGuardPathB(service: string): Promise<GuardPathCapture> {
+  return captureGuardPath(service, "B");
+}
+
+export async function captureGuardPathC(service: string): Promise<GuardPathCapture> {
+  return captureGuardPath(service, "C");
+}
+
+function toolMessageTexts(body: Record<string, unknown> | null): string[] {
+  if (!body || !Array.isArray(body.messages)) return [];
+  const texts: string[] = [];
+  for (const message of body.messages) {
+    if (!message || typeof message !== "object") continue;
+    if ((message as { role?: string }).role !== "tool") continue;
+    const content = (message as { content?: unknown }).content;
+    if (typeof content === "string") texts.push(content);
+    else if (content != null) texts.push(JSON.stringify(content));
+  }
+  return texts;
+}
+
+function snapshotMaxControls(bodies: Array<Record<string, unknown> | null>): number[] {
+  const seen = new Set<number>();
+  for (const body of bodies) {
+    const messages = Array.isArray(body?.messages) ? body.messages : [];
+    for (const message of messages) {
+      if (!message || typeof message !== "object") continue;
+      if ((message as { role?: string }).role !== "assistant") continue;
+      for (const call of messageToolCalls(message as Record<string, unknown>)) {
+        if (call.name !== "browser_snapshot") continue;
+        const args = call.args as { max_controls?: unknown } | null;
+        const value = Number(args?.max_controls);
+        if (Number.isInteger(value)) seen.add(value);
+      }
+    }
+  }
+  return [...seen].sort((left, right) => left - right);
+}
+
+export const OLDER_RESULT_SHORTENING = {
+  function: "createRuntimeContextPolicy",
+  file: "packages/adapters/src/runtime-context.ts",
+  call: "shortenToolResultText(source, 1024, { name: message.toolName })",
+  fallback: "512-char head + truncation note + 512-char tail when structured shorteners return null",
+  sizeHardcoded: OLDER_TOOL_RESULT_SHORTEN_BYTES,
+  fallbackLength: olderToolResultFallbackLength(),
+  independentOfContextWindow: true,
+  contextWindowNotRead: true,
+} as const;
 
 export async function capturePageTrim(service: string): Promise<{
   service: string;
@@ -1429,33 +1697,46 @@ export async function capturePageTrim(service: string): Promise<{
   rawBodies: Buffer[];
   parsedBodies: Array<Record<string, unknown> | null>;
   lastRequestText: string;
+  request5Text: string;
   keptPageMarkers: string[];
+  distinctSnapshotArgs: number[];
+  distinctLargeSnapshotArgs: number[];
   distinctNavigateUrls: string[];
   trimmedNotePresent: boolean;
+  page1Trimmed: boolean;
+  page2Length: number | null;
+  page3Length: number | null;
+  page4Length: number | null;
+  page4Full: boolean;
+  shortControlUntouched: boolean;
+  errorControlUntouched: boolean;
   clipped12k: boolean;
+  olderResultShortening: typeof OLDER_RESULT_SHORTENING;
 }> {
   const meta = loadCaptureModelMetadata();
   const assembled = await assembleCapturePrompt();
   const snapshots = { value: 0 };
-  const replies: StubReply[] = [];
-  for (const index of [1, 2, 3, 4]) {
-    replies.push({
-      kind: "sse",
-      finish: "tool_calls",
-      events: toolCallDelta(`call_capture_nav_${index}`, "browser_navigate", {
-        url: `https://capture.example.test/page-${index}`,
-      }),
-    });
-    replies.push({
-      kind: "sse",
-      finish: "tool_calls",
-      events: toolCallDelta(`call_capture_page_${index}`, "browser_snapshot", {}),
-    });
-  }
+  const replies: StubReply[] = [101, 102, 103, 104].map((maxControls) => ({
+    kind: "sse" as const,
+    finish: "tool_calls",
+    events: toolCallDelta(`call_capture_page_${maxControls}`, "browser_snapshot", {
+      max_controls: maxControls,
+    }),
+  }));
+  replies.push({
+    kind: "sse",
+    finish: "tool_calls",
+    events: toolCallDelta("call_capture_page_short", "browser_snapshot", { max_controls: 1 }),
+  });
+  replies.push({
+    kind: "sse",
+    finish: "tool_calls",
+    events: toolCallDelta("call_capture_page_error", "browser_snapshot", { max_controls: 999 }),
+  });
   replies.push({
     kind: "sse",
     finish: "stop",
-    events: [{ content: "page-trim: last-3 kept." }],
+    events: [{ content: "page-trim: request-5 note + older 1024 shorten + controls." }],
   });
   replies.push(...extraStopReplies(2));
   const stub = await startCaptureStub({ modelId: meta.id, caseName: "page-trim", replies });
@@ -1472,28 +1753,52 @@ export async function capturePageTrim(service: string): Promise<{
       model: captureRunModel(stub.baseUrl),
       executeTool: async (name, args) => executeSyntheticTool(name, args, snapshots),
     });
-    const last = stub.parsedBodies.at(-1);
+    const request5 = stub.parsedBodies[4] ?? null;
+    const last = stub.parsedBodies.at(-1) ?? null;
+    const request5Text = JSON.stringify(request5 ?? {});
     const lastRequestText = JSON.stringify(last ?? {});
+    const request5Tools = toolMessageTexts(request5);
+    const lastTools = toolMessageTexts(last);
+    const pageText = (tools: string[], marker: string) =>
+      tools.find((text) => text.includes(marker)) ?? null;
+    const page2 = pageText(request5Tools, "BEGIN_PAGE_2_");
+    const page3 = pageText(request5Tools, "BEGIN_PAGE_3_");
+    const page4 = pageText(request5Tools, "BEGIN_PAGE_4_");
+    const page1Trimmed =
+      request5Text.includes(STALE_PAGE_STATE_NOTE) && !request5Text.includes("BEGIN_PAGE_1_");
     const keptPageMarkers = ["BEGIN_PAGE_2_", "BEGIN_PAGE_3_", "BEGIN_PAGE_4_"].filter((marker) =>
-      lastRequestText.includes(marker),
+      request5Text.includes(marker),
     );
-    const firstKept = lastRequestText.includes("BEGIN_PAGE_1_");
-    const distinctNavigateUrls = [1, 2, 3, 4]
-      .map((index) => `https://capture.example.test/page-${index}`)
-      .filter((url) => stub.parsedBodies.some((body) => JSON.stringify(body ?? {}).includes(url)));
     return {
       service,
       captures: stub.captures,
       rawBodies: stub.rawBodies,
       parsedBodies: stub.parsedBodies,
       lastRequestText,
+      request5Text,
       keptPageMarkers,
-      distinctNavigateUrls,
-      trimmedNotePresent: lastRequestText.includes(STALE_PAGE_STATE_NOTE) && !firstKept,
-      clipped12k:
-        lastRequestText.includes("…") &&
-        lastRequestText.includes("x".repeat(32)) &&
-        !lastRequestText.includes("x".repeat(OVERSIZED_PAGE_CHARS - 50)),
+      distinctSnapshotArgs: snapshotMaxControls(stub.parsedBodies),
+      distinctLargeSnapshotArgs: snapshotMaxControls(stub.parsedBodies).filter(
+        (value) => value >= 101 && value <= 104,
+      ),
+      distinctNavigateUrls: [],
+      trimmedNotePresent: page1Trimmed,
+      page1Trimmed,
+      page2Length: page2?.length ?? null,
+      page3Length: page3?.length ?? null,
+      page4Length: page4?.length ?? null,
+      page4Full: Boolean(page4 && page4.includes("BEGIN_PAGE_4_") && page4.length <= 12_001),
+      shortControlUntouched: lastTools.some((text) => text.includes(SHORT_CONTROL_TREE)),
+      errorControlUntouched: lastTools.some((text) => text.includes(ERROR_CONTROL_TEXT)),
+      clipped12k: Boolean(
+        page4 &&
+          page4.length <= 12_001 &&
+          page4.length < OVERSIZED_PAGE_CHARS &&
+          (page4.includes("…") ||
+            page4.includes("truncated") ||
+            page4.includes("contextTruncated")),
+      ),
+      olderResultShortening: OLDER_RESULT_SHORTENING,
     };
   } finally {
     await stub.close();
@@ -1513,14 +1818,83 @@ export type CompactionCaptureResult = {
   stubBodies: string[];
   writeback: { summary: string | null; historyCompactedUpToSeq: number | null };
   usageRecorded: boolean;
+  clockPinned: boolean;
+  clockIso: string;
+  priorSummaryInRequest: boolean;
+  loginClaimInRequest: boolean;
+  mixedToolRows: boolean;
+  stubOutput: string | null;
 };
 
-function syntheticCompactionMessages(count: number) {
-  return Array.from({ length: count }, (_, seq) => ({
-    seq,
-    role: seq % 2 === 0 ? "user" : "bot",
-    blocks: [{ kind: "text", text: `synthetic compact row ${seq}` }],
-  }));
+const COMPACTION_PRIOR_SUMMARY =
+  "Prior synthetic summary covering seq 0-3. User asked about billing.";
+
+function syntheticCompactionMessages(count: number, startSeq = 0) {
+  return Array.from({ length: count }, (_, offset) => {
+    const seq = startSeq + offset;
+    const kind = offset % 4;
+    if (kind === 0) {
+      return {
+        seq,
+        role: "user" as const,
+        blocks: [{ kind: "text" as const, text: `Check the billing page (row ${seq}).` }],
+      };
+    }
+    if (kind === 1) {
+      return {
+        seq,
+        role: "bot" as const,
+        blocks: [
+          {
+            kind: "progress" as const,
+            text: "browser_snapshot",
+            activity: true as const,
+            pendingToolNames: ["browser_snapshot"],
+          },
+          {
+            kind: "text" as const,
+            text: `tool call browser_snapshot max_controls=${101 + (offset % 4)} then tool result BEGIN_TOOL_RESULT_${seq}_`,
+          },
+        ],
+      };
+    }
+    if (kind === 3) {
+      return {
+        seq,
+        role: "bot" as const,
+        blocks: [{ kind: "text" as const, text: CAPTURE_LOGIN_CLAIM }],
+      };
+    }
+    return {
+      seq,
+      role: "user" as const,
+      blocks: [{ kind: "text" as const, text: `continue after tool result ${seq}` }],
+    };
+  });
+}
+
+async function withPinnedCaptureClock<T>(fn: () => Promise<T>): Promise<T> {
+  const pinnedMs = captureClock().getTime();
+  const OriginalDate = Date;
+  const PinnedDate = function PinnedDate(
+    this: Date | void,
+    ...args: ConstructorParameters<typeof Date>
+  ) {
+    if (args.length === 0) return new OriginalDate(pinnedMs);
+    return new OriginalDate(...args);
+  } as unknown as DateConstructor;
+  PinnedDate.now = () => pinnedMs;
+  PinnedDate.parse = OriginalDate.parse.bind(OriginalDate);
+  PinnedDate.UTC = OriginalDate.UTC.bind(OriginalDate);
+  PinnedDate.prototype = OriginalDate.prototype;
+  Object.setPrototypeOf(PinnedDate, OriginalDate);
+  const previous = globalThis.Date;
+  globalThis.Date = PinnedDate;
+  try {
+    return await fn();
+  } finally {
+    globalThis.Date = previous;
+  }
 }
 
 function mockCompactionPrisma(state: {
@@ -1583,18 +1957,19 @@ function mockCompactionPrisma(state: {
 export async function captureCompactionPass(service: string): Promise<CompactionCaptureResult> {
   const meta = loadCaptureModelMetadata();
   const threadId = "thread-synthetic-compact";
+  const clockIso = captureClock().toISOString();
   const state = {
     thread: {
       id: threadId,
       botId: SYNTHETIC_BOTDIR_SELF_ID,
       userId: "user-synthetic-capture",
       spaceId: "space-synthetic-capture",
-      historyCompactedUpToSeq: null,
+      historyCompactedUpToSeq: 3,
       historyCompactionGeneration: 1,
-      historyCompactionSummary: null,
-      nextMessageSeq: 32,
+      historyCompactionSummary: COMPACTION_PRIOR_SUMMARY,
+      nextMessageSeq: 36,
     } as Record<string, unknown>,
-    messages: syntheticCompactionMessages(32),
+    messages: syntheticCompactionMessages(32, 4),
     usage: 0,
   };
   const stub = await startCaptureStub({
@@ -1604,7 +1979,7 @@ export async function captureCompactionPass(service: string): Promise<Compaction
       {
         kind: "sse",
         finish: "stop",
-        events: [{ content: "synthetic compacted summary of 32 rows." }],
+        events: [{ content: "synthetic compacted summary of mixed tool rows." }],
       },
       ...extraStopReplies(2),
     ],
@@ -1617,22 +1992,45 @@ export async function captureCompactionPass(service: string): Promise<Compaction
   const memoryProviders: MemoryProviderResolver = {
     resolve: async () => null,
   };
+  const unmet = (reason: string): CompactionCaptureResult => ({
+    service,
+    gate: "unmet",
+    matched: false,
+    invoked: false,
+    deployedBoundary: "compactHistory",
+    reason,
+    captures: stub.captures,
+    rawBodies: stub.rawBodies,
+    parsedBodies: stub.parsedBodies,
+    stubBodies: stub.stubBodies,
+    writeback: { summary: null, historyCompactedUpToSeq: null },
+    usageRecorded: false,
+    clockPinned: true,
+    clockIso,
+    priorSummaryInRequest: false,
+    loginClaimInRequest: false,
+    mixedToolRows: true,
+    stubOutput: stub.stubBodies[0] ?? null,
+  });
   try {
-    await compactHistory(
-      {
-        prisma: mockCompactionPrisma(state) as unknown as PrismaClient,
-        runtime: new PiAgentRuntime(),
-        jobs,
-        memoryProviders,
-        resolveModel: async () => captureRunModel(stub.baseUrl),
-      },
-      threadId,
+    await withPinnedCaptureClock(() =>
+      compactHistory(
+        {
+          prisma: mockCompactionPrisma(state) as unknown as PrismaClient,
+          runtime: new PiAgentRuntime(),
+          jobs,
+          memoryProviders,
+          resolveModel: async () => captureRunModel(stub.baseUrl),
+        },
+        threadId,
+      ),
     );
     const summary =
       typeof state.thread.historyCompactionSummary === "string"
         ? state.thread.historyCompactionSummary
         : null;
     const invoked = stub.captures.length > 0 && Boolean(summary);
+    const requestText = stub.parsedBodies.map((body) => JSON.stringify(body ?? {})).join("\n");
     return {
       service,
       gate: invoked ? "invoked" : "unmet",
@@ -1654,23 +2052,16 @@ export async function captureCompactionPass(service: string): Promise<Compaction
             : null,
       },
       usageRecorded: state.usage > 0,
+      clockPinned: requestText.includes(clockIso.replace(/\.\d{3}Z$/, "Z")) || requestText.includes(clockIso.slice(0, 10)),
+      clockIso,
+      priorSummaryInRequest: requestText.includes("previous_compacted_summary"),
+      loginClaimInRequest: requestText.includes(CAPTURE_LOGIN_CLAIM),
+      mixedToolRows: requestText.includes("browser_snapshot") && requestText.includes("BEGIN_TOOL_RESULT_"),
+      stubOutput: stub.stubBodies[0] ?? null,
     };
   } catch (error) {
     const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
-    return {
-      service,
-      gate: "unmet",
-      matched: false,
-      invoked: false,
-      deployedBoundary: "compactHistory",
-      reason: `compactHistory dependency-closure or runtime blocker: ${message}`,
-      captures: stub.captures,
-      rawBodies: stub.rawBodies,
-      parsedBodies: stub.parsedBodies,
-      stubBodies: stub.stubBodies,
-      writeback: { summary: null, historyCompactedUpToSeq: null },
-      usageRecorded: false,
-    };
+    return unmet(`compactHistory dependency-closure or runtime blocker: ${message}`);
   } finally {
     await stub.close();
   }
@@ -1933,7 +2324,10 @@ export function collectProvenance(service: string): Record<string, unknown> {
       envDefault: CAPTURE_DEFAULT_DISABLED_TOOLS.split(","),
       effective: captureDisabledBuiltinTools(),
       caller: "overlay assistDisabledTools(bot.disabledBuiltinTools) or HEAD env split",
+      promptBuilder: "assistSplitInstructions/userTurnInstructions parts.disabledBuiltinTools",
     },
+    fleetManagement: captureFleetManagement(),
+    olderToolResultShortening: OLDER_RESULT_SHORTENING,
     modelResolution: {
       ...model,
       spaceDefault: {
@@ -1981,7 +2375,7 @@ export function collectProvenance(service: string): Record<string, unknown> {
     gx10Calls: 0,
     network: "127.0.0.1-stub-only",
     volatileFields: VOLATILE_FIELDS,
-    historicalExactRequests: "unavailable-unverified-not-a-baseline-blocker",
+    historicalExactRequests: HISTORICAL_CANDIDATE_WORDING,
     unobserved: [
       "encrypted openai-compatible secret.maxTokens/contextWindow/reasoning",
       "API docker-inspect values for timezone/schedule/dedupe/steering (names present)",
@@ -2044,6 +2438,8 @@ export async function runIsolatedCapture(options: {
   const outDir = options.outDir;
   mkdirSync(outDir, { recursive: true });
   const phases = await capturePhaseTurn(options.service);
+  const guardB = await captureGuardPathB(options.service);
+  const guardC = await captureGuardPathC(options.service);
   const pageTrim = await capturePageTrim(options.service);
   const compaction = await captureCompactionPass(options.service);
   const parserGuard = await captureParserGuardCases(options.service);
@@ -2057,6 +2453,41 @@ export async function runIsolatedCapture(options: {
       capture,
       phases.rawBodies[index]!,
       phases.parsedBodies[index] ?? null,
+    );
+  }
+
+  for (const [label, guard] of [
+    ["guard-b", guardB],
+    ["guard-c", guardC],
+  ] as const) {
+    const dir = join(outDir, label);
+    mkdirSync(dir, { recursive: true });
+    for (const [index, capture] of guard.captures.entries()) {
+      writeBinAndJson(
+        dir,
+        `${capture.phase}-${index}`,
+        capture,
+        guard.rawBodies[index]!,
+        guard.parsedBodies[index] ?? null,
+      );
+    }
+    writeFileSync(
+      join(dir, "summary.json"),
+      `${JSON.stringify(
+        {
+          path: guard.path,
+          guardWarning: guard.guardWarning,
+          guardHalt: guard.guardHalt,
+          errorGuardPresent: guard.errorGuardPresent,
+          skippedPresent: guard.skippedPresent,
+          guardFinalToolFree: guard.guardFinalToolFree,
+          noToolsKey: guard.noToolsKey,
+          runtidyPrompt: guard.runtidyPrompt,
+          haltAdvertisesTools: guard.haltAdvertisesTools,
+        },
+        null,
+        2,
+      )}\n`,
     );
   }
 
@@ -2076,11 +2507,22 @@ export async function runIsolatedCapture(options: {
     `${JSON.stringify(
       {
         keptPageMarkers: pageTrim.keptPageMarkers,
+        distinctSnapshotArgs: pageTrim.distinctSnapshotArgs,
+        distinctLargeSnapshotArgs: pageTrim.distinctLargeSnapshotArgs,
         distinctNavigateUrls: pageTrim.distinctNavigateUrls,
         trimmedNotePresent: pageTrim.trimmedNotePresent,
+        page1Trimmed: pageTrim.page1Trimmed,
+        page2Length: pageTrim.page2Length,
+        page3Length: pageTrim.page3Length,
+        page4Length: pageTrim.page4Length,
+        page4Full: pageTrim.page4Full,
+        shortControlUntouched: pageTrim.shortControlUntouched,
+        errorControlUntouched: pageTrim.errorControlUntouched,
         clipped12k: pageTrim.clipped12k,
+        olderResultShortening: pageTrim.olderResultShortening,
         toolResultTextLimit: TOOL_RESULT_TEXT_LIMIT,
         oversizedPageChars: OVERSIZED_PAGE_CHARS,
+        requestCount: pageTrim.captures.length,
       },
       null,
       2,
@@ -2111,6 +2553,12 @@ export async function runIsolatedCapture(options: {
         reason: compaction.reason,
         writeback: compaction.writeback,
         usageRecorded: compaction.usageRecorded,
+        clockPinned: compaction.clockPinned,
+        clockIso: compaction.clockIso,
+        priorSummaryInRequest: compaction.priorSummaryInRequest,
+        loginClaimInRequest: compaction.loginClaimInRequest,
+        mixedToolRows: compaction.mixedToolRows,
+        stubOutputPresent: Boolean(compaction.stubOutput),
       },
       null,
       2,
@@ -2124,14 +2572,47 @@ export async function runIsolatedCapture(options: {
         guardWarning: phases.guardWarning,
         guardHalt: phases.guardHalt,
         guardFinalToolFree: phases.guardFinalToolFree,
+        pathA: {
+          haltAdvertisesTools: phases.haltAdvertisesTools,
+          skippedPresent: phases.skippedPresent,
+          runtidyPrompt: phases.runtidyPrompt,
+          errorGuardPresent: phases.errorGuardPresent,
+          guardFinalToolFree: phases.guardFinalToolFree,
+        },
+        pathB: {
+          guardWarning: guardB.guardWarning,
+          guardHalt: guardB.guardHalt,
+          skippedPresent: guardB.skippedPresent,
+          guardFinalToolFree: guardB.guardFinalToolFree,
+          noToolsKey: guardB.noToolsKey,
+          runtidyPrompt: guardB.runtidyPrompt,
+          errorGuardPresent: guardB.errorGuardPresent,
+        },
+        pathC: {
+          guardWarning: guardC.guardWarning,
+          guardHalt: guardC.guardHalt,
+          skippedPresent: guardC.skippedPresent,
+          guardFinalToolFree: guardC.guardFinalToolFree,
+          noToolsKey: guardC.noToolsKey,
+          runtidyPrompt: guardC.runtidyPrompt,
+          errorGuardPresent: guardC.errorGuardPresent,
+        },
         validBrowserActCalls: phases.validBrowserActCalls,
         identicalToolErrors: phases.identicalToolErrors,
         reasoningInspected: phases.reasoningInspected,
         thinkingReenabled: phases.thinkingReenabled,
+        promptClauses: phases.promptClauses,
+        pruningDistinctSnapshotArgs: pageTrim.distinctLargeSnapshotArgs.length,
         pruningDistinctNavigate: pageTrim.distinctNavigateUrls.length,
         pruningKeptPageMarkers: pageTrim.keptPageMarkers,
         pruningStaleNote: pageTrim.trimmedNotePresent,
+        pruningPage1Trimmed: pageTrim.page1Trimmed,
+        pruningControlsUntouched:
+          pageTrim.shortControlUntouched && pageTrim.errorControlUntouched,
         compactionInvoked: compaction.invoked,
+        compactionClockPinned: compaction.clockPinned,
+        compactionPriorSummary: compaction.priorSummaryInRequest,
+        compactionLoginClaim: compaction.loginClaimInRequest,
         servingChief: "worker",
         gateMet: false,
       },
@@ -2170,6 +2651,8 @@ export async function runIsolatedCapture(options: {
         missingConnectors: phases.toolInventory.missingConnectors,
         missingDynamicResolution: phases.toolInventory.missingDynamicResolution,
         connectorToolNames: phases.toolInventory.connectorTools.map((tool) => tool.name),
+        fleetManagement: captureFleetManagement(),
+        offeredFleetTools: offeredFleetTools(phases.toolInventory.tools),
         schemasFrom: "selectBuiltinToolsForRun + ConnectorRegistry.discoverTools (empty registry)",
         handwrittenSchemas: false,
       },
@@ -2210,10 +2693,29 @@ export async function runIsolatedCapture(options: {
           deployedBoundary: compaction.deployedBoundary,
           reason: compaction.reason,
         },
+        promptClauses: phases.promptClauses,
         pathsTaken: {
           guardWarning: phases.guardWarning,
           guardHalt: phases.guardHalt,
           guardFinalToolFree: phases.guardFinalToolFree,
+          pathA: {
+            haltAdvertisesTools: phases.haltAdvertisesTools,
+            skippedPresent: phases.skippedPresent,
+            runtidyPrompt: phases.runtidyPrompt,
+          },
+          pathB: {
+            skippedPresent: guardB.skippedPresent,
+            guardFinalToolFree: guardB.guardFinalToolFree,
+            noToolsKey: guardB.noToolsKey,
+            runtidyPrompt: guardB.runtidyPrompt,
+          },
+          pathC: {
+            errorGuardPresent: guardC.errorGuardPresent,
+            skippedPresent: guardC.skippedPresent,
+            guardFinalToolFree: guardC.guardFinalToolFree,
+            noToolsKey: guardC.noToolsKey,
+            runtidyPrompt: guardC.runtidyPrompt,
+          },
           validBrowserActCalls: phases.validBrowserActCalls,
           identicalToolErrors: phases.identicalToolErrors,
           reasoningInspected: phases.reasoningInspected,
@@ -2251,6 +2753,10 @@ export async function runIsolatedCapture(options: {
   writeFileSync(
     join(outDir, "volatile-fields.json"),
     `${JSON.stringify({ fields: VOLATILE_FIELDS }, null, 2)}\n`,
+  );
+  writeFileSync(
+    join(outDir, "historical-unverified.md"),
+    `${HISTORICAL_CANDIDATE_WORDING}\n`,
   );
   const hashManifest: Record<string, string> = {};
   hashTree(outDir, outDir, hashManifest);

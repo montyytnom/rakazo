@@ -3,17 +3,29 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { FLEET_TOOL_NAMES } from "@rakazo/contracts";
 import { formatSkillsCatalogInstruction } from "@rakazo/core";
 import { describe, expect, it } from "vitest";
 import { longWorkProgressGuidance, persistentComputerInstruction } from "./executor.js";
 import {
   CAPTURE_CLOCK_DEFAULT,
   CAPTURE_DEFAULT_DISABLED_TOOLS,
+  CAPTURE_LOGIN_CLAIM,
   CAPTURE_MODEL_ID,
+  CREATE_SPACE_CLAUSE,
+  FLEET_CLAUSE,
+  HISTORICAL_CANDIDATE_WORDING,
+  OLDER_RESULT_SHORTENING,
+  OLDER_TOOL_RESULT_SHORTEN_BYTES,
+  RENDER_PLOT_CLAUSE,
+  SKIPPED_LOOP_GUARD,
   classifyCapturePhase,
   captureCompactionPass,
   captureContextStrategy,
   captureDisabledBuiltinTools,
+  captureFleetManagement,
+  captureGuardPathB,
+  captureGuardPathC,
   capturePageTrim,
   captureParserGuardCases,
   capturePhaseTurn,
@@ -28,6 +40,7 @@ import {
   LOOP_GUARD_WARN_MARK,
   loopGuardSignals,
   offeredToolsFromDeployedBuilder,
+  olderToolResultFallbackLength,
   pinPiAiVersion,
   pinToolCallGuardHash,
   REVIEWER_EXPECTED_WORKER_BUILTINS,
@@ -108,6 +121,15 @@ describe("isolated capture harness", () => {
     expect(inventory.assemblerInputs.disabledBuiltinTools).toEqual(
       CAPTURE_DEFAULT_DISABLED_TOOLS.split(","),
     );
+    expect(captureFleetManagement().property).toBe("bot.fleetManagement");
+    expect(inventory.assemblerInputs.fleetManagement).toBe(captureFleetManagement().value);
+    expect(inventory.assemblerInputs.fleetManagement).toBe(true);
+    for (const name of FLEET_TOOL_NAMES) {
+      expect(inventory.offeredBuiltinNames).toContain(name);
+    }
+    expect(inventory.withheldBuiltinNames.some((name) =>
+      (FLEET_TOOL_NAMES as readonly string[]).includes(name),
+    )).toBe(false);
     const disabled = new Set(CAPTURE_DEFAULT_DISABLED_TOOLS.split(","));
     for (const name of disabled) {
       expect(inventory.offeredBuiltinNames).not.toContain(name);
@@ -181,28 +203,90 @@ describe("isolated capture harness", () => {
       }
     }
     expect(firstText).toContain(CAPTURE_CLOCK_DEFAULT.slice(0, 10));
+    expect(firstText).not.toContain(CREATE_SPACE_CLAUSE);
+    expect(firstText).not.toContain(RENDER_PLOT_CLAUSE);
+    expect(firstText).toContain(FLEET_CLAUSE);
+    expect(result.promptClauses.createSpace).toBe(false);
+    expect(result.promptClauses.renderPlot).toBe(false);
+    expect(result.promptClauses.fleet).toBe(true);
+    expect(result.path).toBe("A");
+    expect(result.skippedPresent).toBe(false);
+    expect(result.runtidyPrompt).toBe(false);
+    if (hay.includes(LOOP_GUARD_PREFIX)) {
+      expect(result.haltAdvertisesTools).toBe(true);
+      expect(result.guardFinalToolFree).toBe(false);
+    }
     expect(JSON.stringify(result)).not.toMatch(/sk-|BEGIN PRIVATE|password=/i);
   }, 90_000);
 
-  it("prunes four distinct oversized navigate/snapshot pages on the actual path", async () => {
+  it("prunes four distinct max_controls snapshots in one turn on the actual path", async () => {
     const result = await capturePageTrim("this-tree");
-    expect(result.distinctNavigateUrls).toHaveLength(4);
+    expect(result.captures.length).toBeGreaterThanOrEqual(5);
+    expect(result.distinctLargeSnapshotArgs).toEqual([101, 102, 103, 104]);
+    expect(result.distinctSnapshotArgs).toEqual(expect.arrayContaining([101, 102, 103, 104, 1, 999]));
+    expect(result.page1Trimmed).toBe(true);
     expect(result.trimmedNotePresent).toBe(true);
-    expect(result.lastRequestText).toContain(STALE_PAGE_STATE_NOTE);
+    expect(result.request5Text).toContain(STALE_PAGE_STATE_NOTE);
+    expect(result.request5Text).not.toContain("BEGIN_PAGE_1_");
     expect(result.keptPageMarkers).toEqual(["BEGIN_PAGE_2_", "BEGIN_PAGE_3_", "BEGIN_PAGE_4_"]);
-    expect(result.lastRequestText).not.toContain("BEGIN_PAGE_1_");
-    expect(result.clipped12k).toBe(true);
+    const fallback = olderToolResultFallbackLength();
+    for (const length of [result.page2Length, result.page3Length]) {
+      expect(length).toBeTruthy();
+      expect(
+        length === fallback ||
+          (length !== null && length <= OLDER_TOOL_RESULT_SHORTEN_BYTES + 200),
+      ).toBe(true);
+    }
+    expect(result.page4Full).toBe(true);
+    expect(result.shortControlUntouched).toBe(true);
+    expect(result.errorControlUntouched).toBe(true);
+    expect(result.olderResultShortening).toEqual(OLDER_RESULT_SHORTENING);
+    expect(result.olderResultShortening.independentOfContextWindow).toBe(true);
+    expect(result.olderResultShortening.function).toBe("createRuntimeContextPolicy");
+    expect(result.olderResultShortening.sizeHardcoded).toBe(1024);
   }, 90_000);
 
-  it("invokes deployed compactHistory with mocked job/db adapters", async () => {
+  it("invokes deployed compactHistory with pinned clock, mixed rows, and prior summary", async () => {
     const result = await captureCompactionPass("this-tree");
     expect(result.deployedBoundary).toBe("compactHistory");
     expect(result.invoked).toBe(true);
     expect(result.gate).toBe("invoked");
     expect(result.captures.length).toBeGreaterThan(0);
     expect(result.writeback.summary).toMatch(/synthetic compacted summary/);
+    expect(result.writeback.historyCompactedUpToSeq).not.toBeNull();
+    expect(result.clockPinned).toBe(true);
+    expect(result.priorSummaryInRequest).toBe(true);
+    expect(result.loginClaimInRequest).toBe(true);
+    expect(result.mixedToolRows).toBe(true);
+    expect(result.stubOutput).toBeTruthy();
+    expect(JSON.stringify(result.parsedBodies[0] ?? {})).toContain(CAPTURE_LOGIN_CLAIM);
     expect(result.matched).toBe(false);
   }, 90_000);
+
+  it("records guard path B (5th act skipped/runtidy) and C (ERROR GUARD isError) when overlay is present", async () => {
+    const pathB = await captureGuardPathB("this-tree");
+    const pathC = await captureGuardPathC("this-tree");
+    const hayB = pathB.parsedBodies.map((body) => JSON.stringify(body ?? {})).join("\n");
+    const hayC = pathC.parsedBodies.map((body) => JSON.stringify(body ?? {})).join("\n");
+    if (hayB.includes(LOOP_GUARD_PREFIX)) {
+      expect(pathB.guardWarning).toBe(true);
+      expect(pathB.guardHalt).toBe(true);
+      expect(pathB.skippedPresent).toBe(true);
+      expect(hayB).toContain(SKIPPED_LOOP_GUARD);
+      expect(pathB.guardFinalToolFree).toBe(true);
+      expect(pathB.runtidyPrompt).toBe(true);
+      expect(pathB.errorGuardPresent).toBe(false);
+    }
+    if (hayC.includes(ERROR_GUARD_PREFIX)) {
+      expect(pathC.errorGuardPresent).toBe(true);
+      expect(pathC.guardWarning).toBe(true);
+      expect(pathC.guardHalt).toBe(true);
+      expect(pathC.skippedPresent).toBe(true);
+      expect(pathC.guardFinalToolFree).toBe(true);
+      expect(pathC.runtidyPrompt).toBe(true);
+      expect(hayC).not.toContain(LOOP_GUARD_PREFIX);
+    }
+  }, 120_000);
 
   it("feeds full prompt/tools through the parser and identical tool errors, not HTTP 500s", async () => {
     const result = await captureParserGuardCases("this-tree");
@@ -255,20 +339,35 @@ describe("isolated capture harness", () => {
     const paths = JSON.parse(readFileSync(join(outDir, "paths-taken.json"), "utf8")) as {
       validBrowserActCalls: number;
       identicalToolErrors: number;
-      pruningDistinctNavigate: number;
+      pruningDistinctSnapshotArgs: number;
       pruningStaleNote: boolean;
+      pruningPage1Trimmed: boolean;
       compactionInvoked: boolean;
+      compactionClockPinned: boolean;
+      promptClauses: { createSpace: boolean; renderPlot: boolean; fleet: boolean };
+      pathA: { skippedPresent: boolean; haltAdvertisesTools: boolean };
       guardWarning: boolean;
       guardHalt: boolean;
       guardFinalToolFree: boolean;
     };
     expect(paths.validBrowserActCalls).toBeGreaterThanOrEqual(4);
     expect(paths.identicalToolErrors).toBeGreaterThanOrEqual(4);
-    expect(paths.pruningDistinctNavigate).toBe(4);
+    expect(paths.pruningDistinctSnapshotArgs).toBe(4);
     expect(paths.pruningStaleNote).toBe(true);
+    expect(paths.pruningPage1Trimmed).toBe(true);
     expect(paths.compactionInvoked).toBe(true);
-    expect(manifest).not.toContain("historical-unverified.md");
+    expect(paths.compactionClockPinned).toBe(true);
+    expect(paths.promptClauses.createSpace).toBe(false);
+    expect(paths.promptClauses.renderPlot).toBe(false);
+    expect(paths.promptClauses.fleet).toBe(true);
+    expect(paths.pathA.skippedPresent).toBe(false);
+    expect(manifest).toContain("historical-unverified.md");
+    expect(readFileSync(join(outDir, "historical-unverified.md"), "utf8")).toContain(
+      HISTORICAL_CANDIDATE_WORDING,
+    );
     expect(manifest).toContain("compaction/invoked.json");
+    expect(manifest).toContain("guard-b/summary.json");
+    expect(manifest).toContain("guard-c/summary.json");
     expect(summary.blocks.map((block) => block.name)).toEqual([
       "baseComputerInstruction",
       "renderBotCapabilityDirectory",
@@ -291,7 +390,7 @@ describe("isolated capture harness", () => {
     expect(inventoryFile.withheldRationale.length).toBeGreaterThan(0);
     expect(manifest).toContain("named-blocks.json");
     expect(manifest).toContain("tools-inventory.json");
-  }, 180_000);
+  }, 300_000);
 
   it("keeps overlay source mounts and forwards typed assist switches", () => {
     const overlay = join(

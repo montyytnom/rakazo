@@ -5,8 +5,11 @@ import { pathToFileURL } from "node:url";
 import { beforeAll, describe, expect, it } from "vitest";
 import {
   captureLoopGuardOrchestration,
+  ERROR_GUARD_PREFIX,
   IDENTICAL_TOOL_ERROR,
   LOOP_GUARD_PREFIX,
+  SKIPPED_LOOP_GUARD,
+  STALE_REF_ERROR,
 } from "./isolated-capture.js";
 import { PiAgentRuntime as HeadPiAgentRuntime } from "./pi-runtime.js";
 
@@ -198,6 +201,36 @@ describe("overlay guard-final orchestration boundary", () => {
     expect(result.guardHalt).toBe(true);
     expect(result.errorGuardPresent).toBe(false);
     expect(result.guardFinalToolFree).toBe(true);
+    expect(result.skippedPresent).toBe(true);
+    expect(result.runtidyPrompt).toBe(true);
+    const hay = result.parsedBodies.map((body) => JSON.stringify(body ?? {})).join("\n");
+    expect(hay).toContain(SKIPPED_LOOP_GUARD);
+    const toolFree = result.captures.find((row) => row.phase === "guard-final");
+    expect(toolFree?.toolNames ?? ["x"]).toEqual([]);
+  }, 90_000);
+
+  it("pass-after: overlay ERROR GUARD isError extract + 5th skipped/runtidy", async () => {
+    if (missing.length) return;
+    process.env.RAKAZO_GUARD_FINAL_SUMMARY = "1";
+    const { PiAgentRuntime } = await import(`${pathToFileURL(afterPi).href}?t=${Date.now()}`);
+    const result = await captureLoopGuardOrchestration({
+      runtime: new PiAgentRuntime(),
+      runId: "run-guard-overlay-error-runtidy",
+      extraIgnoredHaltCall: true,
+      toolName: "browser_extract",
+    });
+    expect(result.errorGuardPresent).toBe(true);
+    expect(result.guardWarning).toBe(true);
+    expect(result.guardHalt).toBe(true);
+    expect(result.skippedPresent).toBe(true);
+    expect(result.guardFinalToolFree).toBe(true);
+    expect(result.runtidyPrompt).toBe(true);
+    expect(result.identicalToolErrors).toBe(0);
+    const hay = result.parsedBodies.map((body) => JSON.stringify(body ?? {})).join("\n");
+    expect(hay).toContain(ERROR_GUARD_PREFIX);
+    expect(hay).toContain(STALE_REF_ERROR);
+    expect(hay).toContain(SKIPPED_LOOP_GUARD);
+    expect(hay).not.toContain(`${LOOP_GUARD_PREFIX}:`);
     const toolFree = result.captures.find((row) => row.phase === "guard-final");
     expect(toolFree?.toolNames ?? ["x"]).toEqual([]);
   }, 90_000);
