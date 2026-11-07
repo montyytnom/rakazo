@@ -149,6 +149,40 @@ function asyncFn<T>(impl: (...args: never[]) => Promise<T> | T) {
   return impl as never;
 }
 
+/** Synthetic rows for composed compactHistory when RAKAZO_CTXMEM=1 (production-forwarded). */
+function ctxmemPrisma() {
+  return {
+    memoryDocument: {
+      findFirst: async () => ({
+        content: "synthetic FACTS.md for capture. No generated passwords.",
+      }),
+    },
+    botMcpServer: {
+      findMany: async () => [
+        { server: { name: "synthetic-mcp", slug: "synthetic-mcp" } },
+      ],
+      findFirst: async () => ({
+        server: { name: "synthetic-mcp", slug: "synthetic-mcp" },
+      }),
+    },
+    botSecret: {
+      findMany: async () => [
+        { name: "synthetic-cred", origin: "https://capture.example.test" },
+      ],
+    },
+  };
+}
+
+function missingPrismaGuard<T extends object>(base: T, label: string): T {
+  return new Proxy(base, {
+    get(target, prop, receiver) {
+      if (typeof prop === "symbol") return Reflect.get(target, prop, receiver);
+      if (prop in target) return Reflect.get(target, prop, receiver);
+      throw new Error(`${label} synthetic prisma missing ${String(prop)}`);
+    },
+  }) as T;
+}
+
 function harness(options: {
   runId: string;
   prompt: string;
@@ -372,13 +406,15 @@ function harness(options: {
       createMany: async () => ({ count: 1 }),
       create: async ({ data }: { data: Record<string, unknown> }) => ({ id: "usage-1", ...data }),
     },
+    ...ctxmemPrisma(),
     externalEffect,
     $queryRaw: async () => [{ id: "computer-1", scope: "dedicated" }],
     $executeRaw: async () => 1,
     $transaction: async (work: (tx: never) => Promise<unknown>) => work(prisma as never),
   };
+  const guarded = missingPrismaGuard(prisma, "executor");
   const executor = createRunExecutor({
-    prisma: prisma as never,
+    prisma: guarded as never,
     runtime: options.runtime,
     connector: {
       discoverTools: async () => [],
@@ -567,19 +603,23 @@ async function runCompactionScenario(summaryText: string) {
     historyCompactionSummary: null as string | null,
     historyCompactionGeneration: 0,
   };
-  const prisma = {
-    thread: {
-      findUniqueOrThrow: async () => thread,
-      updateMany: async (args: { data: { historyCompactionSummary: string } }) => {
-        thread.historyCompactionSummary = args.data.historyCompactionSummary;
-        return { count: 1 };
+  const prisma = missingPrismaGuard(
+    {
+      thread: {
+        findUniqueOrThrow: async () => thread,
+        updateMany: async (args: { data: { historyCompactionSummary: string } }) => {
+          thread.historyCompactionSummary = args.data.historyCompactionSummary;
+          return { count: 1 };
+        },
       },
+      event: { findFirst: async () => null },
+      message: { findMany: async () => messages },
+      deploymentSettings: { findUnique: async () => null },
+      usageRecord: { createMany: async () => ({ count: 0 }), create: async () => undefined },
+      ...ctxmemPrisma(),
     },
-    event: { findFirst: async () => null },
-    message: { findMany: async () => messages },
-    deploymentSettings: { findUnique: async () => null },
-    usageRecord: { createMany: async () => ({ count: 0 }), create: async () => undefined },
-  };
+    "compaction",
+  );
   await compactHistory(
     {
       prisma,
@@ -605,48 +645,105 @@ async function runCompactionScenario(summaryText: string) {
   };
 }
 
+function writeJson(path: string, value: unknown) {
+  writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function errorRecord(error: unknown) {
+  return {
+    ok: false as const,
+    error:
+      error instanceof Error
+        ? { name: error.name, message: error.message, stack: error.stack }
+        : { name: "Error", message: String(error) },
+  };
+}
+
 export async function runCandidateCapture(options: { service: string; outDir: string }) {
   const previous = process.env.RAKAZO_OPENAI_COMPAT_ALLOW_PUBLIC;
   process.env.RAKAZO_OPENAI_COMPAT_ALLOW_PUBLIC = "1";
   mkdirSync(options.outDir, { recursive: true });
+  const scenarios: Record<string, unknown> = {};
+  let failed = false;
+  const persist = (name: string, value: unknown) => {
+    scenarios[name] = value;
+    writeJson(join(options.outDir, `scenario-${name}.json`), value);
+    writeJson(join(options.outDir, "phases-partial.json"), {
+      kind: CANDIDATE_CAPTURE_KIND,
+      service: options.service,
+      ctxmem: process.env.RAKAZO_CTXMEM ?? "",
+      ctxmemFacts: process.env.RAKAZO_CTXMEM_FACTS ?? "",
+      scenarios,
+    });
+  };
+  const runNamed = async (name: string, work: () => Promise<unknown>, extra: Record<string, unknown> = {}) => {
+    try {
+      const value = await work();
+      persist(name, { ok: true, ...extra, ...(value as object) });
+    } catch (error) {
+      failed = true;
+      persist(name, { ...extra, ...errorRecord(error) });
+    }
+  };
   try {
-    const generated = await runPiRuntimeScenario({
-      runId: `${options.service}-generated-secret`,
-      prompt: "Save the generated password",
-      includeStaleHistory: false,
-      toolTitle: `New password: ${CURRENT_SECRET_SENTINEL}`,
-      finalText: `Done. New password: ${CURRENT_SECRET_SENTINEL}`,
-      invokeHandoff: false,
-    });
-    const stale = await runPiRuntimeScenario({
-      runId: `${options.service}-stale-secret`,
-      prompt: "Save the generated password",
-      includeStaleHistory: true,
-      toolTitle: `New password: ${CURRENT_SECRET_SENTINEL}`,
-      finalText: `Done. New password: ${CURRENT_SECRET_SENTINEL}. Old password: ${STALE_SECRET_SENTINEL}`,
-      invokeHandoff: false,
-    });
-    const handoff = await runPiRuntimeScenario({
-      runId: `${options.service}-protected-handoff`,
-      prompt: "Save the generated password",
-      includeStaleHistory: true,
-      toolTitle: `New password: ${CURRENT_SECRET_SENTINEL}`,
-      finalText: `Done. New password: ${CURRENT_SECRET_SENTINEL}. Old password: ${STALE_SECRET_SENTINEL}`,
-      invokeHandoff: true,
-    });
-    const falseSuccess = await runPiRuntimeScenario({
-      runId: `${options.service}-false-success-done`,
-      prompt: "Finish the reset",
-      includeStaleHistory: false,
-      toolTitle: "status note",
-      finalText: "Done",
-      invokeHandoff: false,
-    });
-    const compactionCurrent = await runCompactionScenario(
-      `All set. New password: ${CURRENT_SECRET_SENTINEL}`,
+    await runNamed("generated-secret", () =>
+      runPiRuntimeScenario({
+        runId: `${options.service}-generated-secret`,
+        prompt: "Save the generated password",
+        includeStaleHistory: false,
+        toolTitle: `New password: ${CURRENT_SECRET_SENTINEL}`,
+        finalText: `Done. New password: ${CURRENT_SECRET_SENTINEL}`,
+        invokeHandoff: false,
+      }),
     );
-    const compactionStale = await runCompactionScenario(
-      `All set. Old password: ${STALE_SECRET_SENTINEL}`,
+    await runNamed("stale-secret", () =>
+      runPiRuntimeScenario({
+        runId: `${options.service}-stale-secret`,
+        prompt: "Save the generated password",
+        includeStaleHistory: true,
+        toolTitle: `New password: ${CURRENT_SECRET_SENTINEL}`,
+        finalText: `Done. New password: ${CURRENT_SECRET_SENTINEL}. Old password: ${STALE_SECRET_SENTINEL}`,
+        invokeHandoff: false,
+      }),
+    );
+    await runNamed(
+      "protected-handoff-repaired-path",
+      () =>
+        runPiRuntimeScenario({
+          runId: `${options.service}-protected-handoff`,
+          prompt: "Save the generated password",
+          includeStaleHistory: true,
+          toolTitle: `New password: ${CURRENT_SECRET_SENTINEL}`,
+          finalText: `Done. New password: ${CURRENT_SECRET_SENTINEL}. Old password: ${STALE_SECRET_SENTINEL}`,
+          invokeHandoff: true,
+        }),
+      {
+        kind: "repaired-path",
+        notFailBeforeCausalProof: true,
+        note:
+          "Preimage has no protected handle; empty fail-before handoff is an invariant, not leak proof. This AFTER call is the repaired path.",
+      },
+    );
+    await runNamed("false-success-done", async () => {
+      const falseSuccess = await runPiRuntimeScenario({
+        runId: `${options.service}-false-success-done`,
+        prompt: "Finish the reset",
+        includeStaleHistory: false,
+        toolTitle: "status note",
+        finalText: "Done",
+        invokeHandoff: false,
+      });
+      return {
+        ...falseSuccess,
+        finalHasDoneWord: /\bDone\b/.test(falseSuccess.final),
+        finalHasNotVerified: /not verified/i.test(falseSuccess.final),
+      };
+    });
+    await runNamed("compaction-current-secret", () =>
+      runCompactionScenario(`All set. New password: ${CURRENT_SECRET_SENTINEL}`),
+    );
+    await runNamed("compaction-stale-secret", () =>
+      runCompactionScenario(`All set. Old password: ${STALE_SECRET_SENTINEL}`),
     );
     const phases = {
       kind: CANDIDATE_CAPTURE_KIND,
@@ -654,52 +751,26 @@ export async function runCandidateCapture(options: { service: string; outDir: st
       service: options.service,
       packSha256: process.env.CANDIDATE_PACK_SHA256 ?? "",
       gitHead: process.env.CANDIDATE_GIT_HEAD ?? "",
+      ctxmem: process.env.RAKAZO_CTXMEM ?? "",
+      ctxmemFacts: process.env.RAKAZO_CTXMEM_FACTS ?? "",
+      failed,
       imageId:
         process.env[`RAKAZO_${options.service.toUpperCase()}_IMAGE_ID` as keyof NodeJS.ProcessEnv] ??
         "",
-      scenarios: {
-        "generated-secret": {
-          ...generated,
-          expected: "HTTP/persist/final withhold current sentinel",
-        },
-        "stale-secret": {
-          ...stale,
-          expected: "HTTP/persist/final withhold current and stale sentinels",
-        },
-        "protected-handoff-repaired-path": {
-          ...handoff,
-          kind: "repaired-path",
-          notFailBeforeCausalProof: true,
-          note:
-            "Preimage has no protected handle; empty fail-before handoff is an invariant, not leak proof. This AFTER call is the repaired path.",
-        },
-        "false-success-done": {
-          ...falseSuccess,
-          expected: "Done without a current-intent ledger becomes Outcome was not verified.",
-          finalHasDoneWord: /\bDone\b/.test(falseSuccess.final),
-          finalHasNotVerified: /not verified/i.test(falseSuccess.final),
-        },
-        "compaction-current-secret": compactionCurrent,
-        "compaction-stale-secret": compactionStale,
-      },
+      scenarios,
       gateMet: false,
     };
-    writeFileSync(join(options.outDir, "phases-summary.json"), `${JSON.stringify(phases, null, 2)}\n`);
-    writeFileSync(
-      join(options.outDir, "hashes.json"),
-      `${JSON.stringify(
-        {
-          packSha256: process.env.CANDIDATE_PACK_SHA256 ?? "",
-          gitHead: process.env.CANDIDATE_GIT_HEAD ?? "",
-          service: options.service,
-          phasesSha256: createHash("sha256")
-            .update(JSON.stringify(phases))
-            .digest("hex"),
-        },
-        null,
-        2,
-      )}\n`,
-    );
+    writeJson(join(options.outDir, "phases-summary.json"), phases);
+    writeJson(join(options.outDir, "hashes.json"), {
+      packSha256: process.env.CANDIDATE_PACK_SHA256 ?? "",
+      gitHead: process.env.CANDIDATE_GIT_HEAD ?? "",
+      service: options.service,
+      failed,
+      phasesSha256: createHash("sha256").update(JSON.stringify(phases)).digest("hex"),
+    });
+    if (failed) {
+      throw new Error(`candidate capture scenarios failed for ${options.service}`);
+    }
     return phases;
   } finally {
     if (previous === undefined) delete process.env.RAKAZO_OPENAI_COMPAT_ALLOW_PUBLIC;

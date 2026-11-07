@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -211,7 +212,7 @@ class CandidateLaunchTests(unittest.TestCase):
             "envPrivacy": {"observed": []},
         }
 
-    def run_main(self, **env: str) -> int:
+    def run_main(self, *, execute: bool = False, **env: str) -> int:
         previous = os.environ.copy()
         os.environ["RAKAZO_WORKER_IMAGE"] = candidate_launch.PINNED_WORKER_IMAGE
         os.environ["RAKAZO_API_IMAGE"] = candidate_launch.PINNED_API_IMAGE
@@ -226,24 +227,23 @@ class CandidateLaunchTests(unittest.TestCase):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+        argv = [
+            "--bundle",
+            str(self.bundle),
+            "--candidate-overlay",
+            str(self.overlay),
+            "--stage",
+            str(self.stage),
+            "--out",
+            str(self.out),
+            "--pack-sha256",
+            "e342a560deadbeef",
+            "--git-head",
+            "b44665b26",
+        ]
+        argv.append("--execute" if execute else "--dry-run")
         try:
-            return candidate_launch.main(
-                [
-                    "--bundle",
-                    str(self.bundle),
-                    "--candidate-overlay",
-                    str(self.overlay),
-                    "--stage",
-                    str(self.stage),
-                    "--out",
-                    str(self.out),
-                    "--dry-run",
-                    "--pack-sha256",
-                    "e342a560deadbeef",
-                    "--git-head",
-                    "b44665b26",
-                ]
-            )
+            return candidate_launch.main(argv)
         finally:
             os.environ.clear()
             os.environ.update(previous)
@@ -414,6 +414,44 @@ class CandidateLaunchTests(unittest.TestCase):
         help_text = (HERE / "host-launch.sh").read_text()
         self.assertIn("rakazo-worker-1", help_text)
         self.assertIn("rakazo-api-1", help_text)
+
+    def test_execute_runs_api_after_worker_failure(self) -> None:
+        lives = {"worker": self.fake_live("worker"), "api": self.fake_live("api")}
+        docker_runs: list[str] = []
+
+        def fake_inspect(name: str, policy: dict[str, str]) -> dict:
+            if name == candidate_launch.AUTHORED_WORKER_CONTAINER:
+                return lives["worker"]
+            if name == candidate_launch.AUTHORED_API_CONTAINER:
+                return lives["api"]
+            return {"name": name, "error": "inspect failed (no exec was attempted)"}
+
+        def fake_image(ref: str) -> dict:
+            return {"local": True, "id": "sha256:deadbeef", "ref": ref}
+
+        def fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+            if cmd[:2] == ["docker", "run"]:
+                name = cmd[cmd.index("--name") + 1]
+                docker_runs.append(name)
+                return subprocess.CompletedProcess(cmd, 1 if "worker" in name else 0)
+            return subprocess.CompletedProcess(cmd, 0)
+
+        original_inspect = candidate_launch.inspect_container
+        original_image = candidate_launch.inspect_image
+        original_run = candidate_launch.subprocess.run
+        candidate_launch.inspect_container = fake_inspect  # type: ignore[method-assign]
+        candidate_launch.inspect_image = fake_image  # type: ignore[method-assign]
+        candidate_launch.subprocess.run = fake_run  # type: ignore[method-assign]
+        try:
+            rc = self.run_main(execute=True)
+        finally:
+            candidate_launch.inspect_container = original_inspect
+            candidate_launch.inspect_image = original_image
+            candidate_launch.subprocess.run = original_run
+        self.assertEqual(rc, 1)
+        self.assertEqual(len(docker_runs), 2)
+        self.assertTrue(any("worker" in name for name in docker_runs))
+        self.assertTrue(any("api" in name for name in docker_runs))
 
     def test_cleanup_refuses_production_roots(self) -> None:
         with self.assertRaises(SystemExit):

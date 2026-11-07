@@ -950,7 +950,13 @@ def main(argv: list[str]) -> int:
     if not worker["image"].get("local") or not api["image"].get("local"):
         print("refusing execute: both images must exist locally (no pull)", file=sys.stderr)
         return 1
-    started = []
+    return execute_capture_services(worker, api)
+
+
+def execute_capture_services(worker: dict, api: dict) -> int:
+    """Run both capture containers. A worker failure still starts api when safe."""
+    started: list[str] = []
+    failed: list[str] = []
     try:
         for plan in (worker, api):
             cmd = plan["dockerRunRawForExecute"]
@@ -958,10 +964,17 @@ def main(argv: list[str]) -> int:
             proc = subprocess.run(cmd)
             started.append(plan["containerName"])
             if proc.returncode != 0:
-                return proc.returncode
+                failed.append(f"{plan['service']} rc={proc.returncode}")
+                print(
+                    f"{plan['service']} execute failed rc={proc.returncode}; continuing other service",
+                    file=sys.stderr,
+                )
     finally:
         for name in started:
             subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+    if failed:
+        print("execute failed: " + "; ".join(failed), file=sys.stderr)
+        return 1
     return 0
 
 

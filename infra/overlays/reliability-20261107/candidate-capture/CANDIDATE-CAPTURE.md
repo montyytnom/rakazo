@@ -1,6 +1,6 @@
 # Exact candidate-capture commands
 
-Sat Nov 7, 2026, 6:54 AM EST. Not production. Parent runs these on the connected Mac after unpacking the pack. This VM does not execute them against live. No pull, no build, no model network.
+Sat Nov 7, 2026. Not production. Parent runs these on the connected Mac after unpacking the pack. This VM does not execute them against live. No pull, no build, no model network. Request only one rerun after the cloud harness smoke proof below.
 
 Pinned local images (unchanged):
 
@@ -18,12 +18,16 @@ export RAKAZO_API_CONTAINER=rakazo-api-1
 
 Do not use `rakazo-worker` / `rakazo-api`. Those names do not exist. Dry-run and execute both fail-closed when `docker inspect` fails or when a `replace-existing-bind` dest is not on the inspected container. Unset container env resolves unique `com.docker.compose.service=worker|api` labels from live metadata; it does not retry a guessed `-1` suffix.
 
+Keep `/tmp/46fee0-pack` and `/tmp/9427b1-pack` on .67 as evidence. Unpack this pack to a new directory.
+
+Cloud smoke (this VM, not Docker image 47d34235/c500071f): actual `candidate-capture-harness.ts` copied into composed AFTER trees so relative imports hit composed executor/pi-runtime/history-compaction. `RAKAZO_CTXMEM=1` with `RAKAZO_CTXMEM_FACTS=1` and `=0` on both worker and api. Fake DB supplies `memoryDocument.findFirst`, `botMcpServer.findMany`, `botSecret.findMany`. Overlay-orchestration tests do not exercise this harness. `@rakazo/core` package resolution is workspace HEAD.
+
 Unpack, then dry-run, then execute, then cleanup. Replace `PACK.tgz` / hashes with the transferred artifact.
 
 ```
-mkdir -p /tmp/46fee0-pack
-tar -C /tmp/46fee0-pack -xzf candidate-overlay-secret-completion.tgz
-PACK=/tmp/46fee0-pack/candidate-overlay-secret-completion
+mkdir -p /tmp/NEWPACK-pack
+tar -C /tmp/NEWPACK-pack -xzf candidate-overlay-secret-completion.tgz
+PACK=/tmp/NEWPACK-pack/candidate-overlay-secret-completion
 STAGE=/tmp/rakazo-candidate-capture-stage
 OUT=/tmp/rakazo-candidate-capture-out
 LAUNCH="$PACK/candidate-capture/host-launch.sh"
@@ -39,7 +43,9 @@ LAUNCH="$PACK/candidate-capture/host-launch.sh"
   --git-head GIT_HEAD \
   --dry-run
 
-# 2. Execute — parent only, after auditing dry-run-manifest.json inspectGateOk
+# 2. Execute — parent only, after auditing dry-run-manifest.json inspectGateOk.
+#    Production-forwarded RAKAZO_CTXMEM stays on. Worker failure still starts api.
+#    /out/scenario-*.json and phases-partial.json are written before the next scenario.
 "$LAUNCH" \
   --candidate-overlay "$PACK" \
   --stage "$STAGE" \

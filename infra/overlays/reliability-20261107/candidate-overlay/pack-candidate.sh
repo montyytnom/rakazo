@@ -240,10 +240,12 @@ CAPTURE="$ROOT/infra/overlays/reliability-20261107/candidate-capture"
 mkdir -p "$STAGE/candidate-capture"
 cp -a "$CAPTURE/host-launch.sh" "$CAPTURE/candidate_launch.py" "$CAPTURE/run.sh" \
   "$CAPTURE/allowlisted-env.txt" "$CAPTURE/README.md" "$CAPTURE/CANDIDATE-CAPTURE.md" \
-  "$CAPTURE/candidate_launch_test.py" "$STAGE/candidate-capture/"
+  "$CAPTURE/candidate_launch_test.py" "$CAPTURE/smoke-harness.sh" \
+  "$STAGE/candidate-capture/"
 cp -a "$ROOT/packages/adapters/src/candidate-capture-harness.ts" \
   "$STAGE/candidate-capture/candidate-capture-harness.ts"
-chmod +x "$STAGE/candidate-capture/host-launch.sh" "$STAGE/candidate-capture/run.sh"
+chmod +x "$STAGE/candidate-capture/host-launch.sh" "$STAGE/candidate-capture/run.sh" \
+  "$STAGE/candidate-capture/smoke-harness.sh"
 git -C "$ROOT" rev-parse HEAD > "$STAGE/HEAD.txt"
 cp -a "$ROOT/infra/overlays/reliability-20261107/ROLLBACK.sh" "$STAGE/ROLLBACK.sh"
 chmod +x "$STAGE/ROLLBACK.sh"
@@ -290,7 +292,8 @@ for log in \
   candidate-isolated-core.log \
   candidate-apply-rollback-selftest.log \
   candidate-capture-launcher-tests.log \
-  candidate-capture-dry-run.log
+  candidate-capture-dry-run.log \
+  candidate-harness-smoke.log
 do
   if [[ -f "/opt/cursor/artifacts/$log" ]]; then
     cp -a "/opt/cursor/artifacts/$log" "$STAGE/logs/$log"
@@ -316,6 +319,7 @@ Live hash-only 6:36 AM EST closed c7e5 preimages (22 match, 18 absent, images 47
 HEAD vitest adapters/core suites label HEAD workspace, not composed trees.
 PiRuntime stub JSON measures HTTP/persist/final; named tests cover in-run handoff (repaired path vs preimage invariant) and composed compaction including secret strip.
 candidate-capture/ is the composed executor→PiRuntime→stub SSE launcher; run13 assembler harness is not used.
+Harness fake DB includes memoryDocument/botMcpServer/botSecret for production-forwarded RAKAZO_CTXMEM=1. Overlay-orchestration tests do not exercise candidate-capture-harness.ts. Cloud smoke is composed AFTER trees + workspace @rakazo/core, not Docker image 47d34235.
 HISTORICAL_PLAINTEXT_CLEANUP_LOCKED=true
 isolated-capture baseline fixtures unchanged
 no production calls, no model calls, no heldout inspection
@@ -326,6 +330,15 @@ if [[ -z "$REPO_TSX" && -x "$ROOT/node_modules/.bin/tsx" ]]; then
   REPO_TSX="$ROOT/node_modules/.bin/tsx"
 fi
 export REPO_TSX
+SMOKE_OUT="/opt/cursor/artifacts/candidate-harness-smoke"
+mkdir -p "$SMOKE_OUT"
+echo "running actual candidate-capture harness smoke under production-forwarded ctxmem (facts on and off) on both composed AFTER trees"
+bash "$CAPTURE/smoke-harness.sh" "$SMOKE_OUT"
+cp -a "$SMOKE_OUT/smoke.log" "$STAGE/logs/candidate-harness-smoke.log"
+if [[ -d "$SMOKE_OUT/worker" ]]; then
+  mkdir -p "$STAGE/logs/candidate-harness-smoke"
+  cp -a "$SMOKE_OUT/worker" "$SMOKE_OUT/api" "$STAGE/logs/candidate-harness-smoke/" 2>/dev/null || true
+fi
 "$STAGE/prove-isolated-core.sh" "$STAGE" | tee "$STAGE/logs/candidate-isolated-core.log"
 "$STAGE/apply-to-scratch.sh" --self-test --from "$STAGE" | tee "$STAGE/logs/candidate-apply-rollback-selftest.log"
 
@@ -349,6 +362,7 @@ index = [
     "- `RUNTIME-LOADING.txt` — tsx + `@rakazo/core` default `./src/index.ts`",
     "- `candidate-capture/` — composed executor→PiRuntime→stub SSE launcher; dry-run lists 37 binds",
     "- `CANDIDATE-CAPTURE.md` — authored dry-run / execute / cleanup commands",
+    "- `logs/candidate-harness-smoke.log` — actual harness on composed AFTER trees, CTXMEM=1 facts on/off, both services",
     "",
     "## Labels",
     "",
