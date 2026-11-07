@@ -1347,6 +1347,16 @@ describe("overlay compose + orchestration entry path", { timeout: 180_000 }, () 
     expect(src).not.toContain("harvestSecretsFromUnknown(messages)");
   });
 
+  it("composed AFTER executor finalizes via deliverAssistantFinal, not a parallel unused helper", () => {
+    if (missing.length) return;
+    const src = readFileSync(afterExecutor, "utf8");
+    expect(src).toContain("deliverAssistantFinal");
+    expect(src).toContain("rawText: block.text");
+    expect(src).toContain("rawText: silentReply.assembled");
+    expect(src).toContain("classification: irreversible");
+    expect(src).not.toMatch(/sanitizeFinalText\(block\.text/);
+  });
+
   it("composed AFTER pi-runtime has the exact pinned-image bare-done nudge", () => {
     if (missing.length) return;
     const previous = process.env.RAKAZO_ASSIST_HARNESS;

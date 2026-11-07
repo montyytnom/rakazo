@@ -65,7 +65,6 @@ import {
   callIdFromClientNonce,
   classifyBrowserMutation,
   classifyIrreversibleTool,
-  collectToolEvidence,
   connectorKindFromToolName,
   containsSecret,
   createStreamingRedactor,
@@ -97,7 +96,7 @@ import {
   resolveTurnIntent,
   sameThreadIrreversibleOwner,
   sandboxCommandTimeoutMs,
-  sanitizeFinalText,
+  deliverAssistantFinal,
   secretsFromPriorAssistantText,
   stripSecretEchoes,
   bindOutcomeArtifact,
@@ -5219,6 +5218,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
                   intentId,
                   sourceMessageId: turnIntent.sourceMessageId ?? "",
                   runId,
+                  classification: irreversible,
                 });
                 if (artifact) turnLedger.artifacts.push(artifact);
                 return replayed;
@@ -5281,6 +5281,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
               intentId,
               sourceMessageId: turnIntent.sourceMessageId ?? "",
               runId,
+              classification: irreversible,
             });
             if (artifact) turnLedger.artifacts.push(artifact);
             return (await persistEffectResult(result)) ? result : uncertainEffectResult(name, args);
@@ -7990,7 +7991,6 @@ export function createRunExecutor(deps: ExecutorDeps) {
               .map((message) => message.content),
             silentReply.assembled,
           ]);
-          const evidence = collectToolEvidence(turnToolResults);
           const blocks = handedOff
             ? []
             : finalBlocksAfterMidTurnProgress(
@@ -7998,15 +7998,30 @@ export function createRunExecutor(deps: ExecutorDeps) {
                 publishedMidTurnUserMessage || runAllowsSilentEmpty(run.trigger),
               ).map((block) => {
                 if (block.kind !== "text") return block;
-                const sanitized = sanitizeFinalText(block.text, evidence, turnLedger);
                 return {
                   ...block,
-                  text: stripSecretEchoes(sanitized, [...runSecrets, ...priorSecrets]).text,
+                  text: deliverAssistantFinal({
+                    rawText: block.text,
+                    toolResults: turnToolResults,
+                    ledger: turnLedger,
+                    secrets: [...runSecrets, ...priorSecrets],
+                  }).deliveredFinal,
                 };
               });
           const text = handedOff
             ? ""
-            : redactSecrets(completionNotificationBody(silentReply.assembled, blocks), runSecrets);
+            : redactSecrets(
+                completionNotificationBody(
+                  deliverAssistantFinal({
+                    rawText: silentReply.assembled,
+                    toolResults: turnToolResults,
+                    ledger: turnLedger,
+                    secrets: [...runSecrets, ...priorSecrets],
+                  }).deliveredFinal,
+                  blocks,
+                ),
+                runSecrets,
+              );
           if (containsSecret(text, runSecrets)) {
             throw new Error("refusing to persist a secret in the thread");
           }

@@ -3,12 +3,10 @@ import { historyCompactJob } from "@rakazo/adapter-kit";
 import type { MessageBlock } from "@rakazo/contracts";
 import {
   blocksToAgentHistoryText,
-  collectToolEvidence,
+  deliverAssistantFinal,
   escapePromptData,
   rewriteUnverifiedClaims,
-  sanitizeFinalText,
   secretsFromPriorAssistantText,
-  stripSecretEchoes,
 } from "@rakazo/core";
 import type { PrismaClient } from "@rakazo/db";
 import { recordUsage } from "@rakazo/db";
@@ -439,13 +437,11 @@ export async function compactHistory(deps: CompactHistoryDeps, threadId: string)
     logHistoryCompactPermanentFailure(threadId, "summary_too_large");
     return;
   }
-  summary = stripSecretEchoes(
-    sanitizeFinalText(
-      rewriteUnverifiedClaims(summary, transcript),
-      collectToolEvidence([transcript]),
-    ),
-    secretsFromPriorAssistantText([summary, transcript]),
-  ).text;
+  summary = deliverAssistantFinal({
+    rawText: rewriteUnverifiedClaims(summary, transcript),
+    toolResults: [transcript],
+    secrets: secretsFromPriorAssistantText([summary, transcript]),
+  }).deliveredFinal;
 
   const lastSeq = batch[batch.length - 1]!.seq;
   const advanced = await deps.prisma.thread.updateMany({

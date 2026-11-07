@@ -249,7 +249,7 @@ def patch_executor(path: Path) -> None:
         "  threadIrreversibleEffectKey,\n"
         "  UNAUTHORIZED_IRREVERSIBLE,\n"
         "  collectToolEvidence,\n"
-        "  sanitizeFinalText,\n"
+        "  deliverAssistantFinal,\n"
         "  secretsFromPriorAssistantText,\n"
         "  stripSecretEchoes,\n"
         "  bindOutcomeArtifact,\n"
@@ -351,6 +351,7 @@ def patch_executor(path: Path) -> None:
         "                  intentId,\n"
         "                  sourceMessageId: turnIntent.sourceMessageId ?? \"\",\n"
         "                  runId,\n"
+        "                  classification: irreversible,\n"
         "                });\n"
         "                if (artifact) turnLedger.artifacts.push(artifact);\n"
         "                return replayed;\n"
@@ -387,6 +388,7 @@ def patch_executor(path: Path) -> None:
         "              intentId,\n"
         "              sourceMessageId: turnIntent.sourceMessageId ?? \"\",\n"
         "              runId,\n"
+        "              classification: irreversible,\n"
         "            });\n"
         "            if (artifact) turnLedger.artifacts.push(artifact);\n"
         "            return (await persistEffectResult(protectedPage.stored))\n"
@@ -539,7 +541,6 @@ def patch_executor(path: Path) -> None:
         "              .map((message) => message.content),\n"
         "            silentReply.assembled,\n"
         "          ]);\n"
-        "          const evidence = collectToolEvidence(turnToolResults);\n"
         "          const blocks = handedOff\n"
         "            ? []\n"
         "            : runtidyDropRepeatedFinalText(\n"
@@ -550,20 +551,26 @@ def patch_executor(path: Path) -> None:
         "                midTurnUserTexts,\n"
         "              ).map((block) => {\n"
         "                if (block.kind !== \"text\") return block;\n"
-        "                const sanitized = sanitizeFinalText(block.text, evidence, turnLedger);\n"
         "                return {\n"
         "                  ...block,\n"
-        "                  text: stripSecretEchoes(sanitized, [...runSecrets, ...priorSecrets]).text,\n"
+        "                  text: deliverAssistantFinal({\n"
+        "                    rawText: block.text,\n"
+        "                    toolResults: turnToolResults,\n"
+        "                    ledger: turnLedger,\n"
+        "                    secrets: [...runSecrets, ...priorSecrets],\n"
+        "                  }).deliveredFinal,\n"
         "                };\n"
         "              });\n"
         "          const text = handedOff\n"
         "            ? \"\"\n"
         "            : redactSecrets(\n"
         "                completionNotificationBody(\n"
-        "                  stripSecretEchoes(sanitizeFinalText(silentReply.assembled, evidence, turnLedger), [\n"
-        "                    ...runSecrets,\n"
-        "                    ...priorSecrets,\n"
-        "                  ]).text,\n"
+        "                  deliverAssistantFinal({\n"
+        "                    rawText: silentReply.assembled,\n"
+        "                    toolResults: turnToolResults,\n"
+        "                    ledger: turnLedger,\n"
+        "                    secrets: [...runSecrets, ...priorSecrets],\n"
+        "                  }).deliveredFinal,\n"
         "                  blocks,\n"
         "                ),\n"
         "                runSecrets,\n"
@@ -672,7 +679,7 @@ def patch_history_compaction(path: Path) -> None:
     replace_once(
         path,
         "import { blocksToAgentHistoryText, escapePromptData } from \"@rakazo/core\";\n",
-        "import { blocksToAgentHistoryText, collectToolEvidence, escapePromptData, rewriteUnverifiedClaims, sanitizeFinalText, secretsFromPriorAssistantText, stripSecretEchoes } from \"@rakazo/core\";\n",
+        "import { blocksToAgentHistoryText, deliverAssistantFinal, escapePromptData, rewriteUnverifiedClaims, secretsFromPriorAssistantText } from \"@rakazo/core\";\n",
         "rewriteUnverifiedClaims import",
     )
     replace_once(
@@ -686,13 +693,11 @@ def patch_history_compaction(path: Path) -> None:
         "    logHistoryCompactPermanentFailure(threadId, \"summary_too_large\");\n"
         "    return;\n"
         "  }\n"
-        "  summary = stripSecretEchoes(\n"
-        "    sanitizeFinalText(\n"
-        "      rewriteUnverifiedClaims(summary, transcript),\n"
-        "      collectToolEvidence([transcript]),\n"
-        "    ),\n"
-        "    secretsFromPriorAssistantText([summary, transcript]),\n"
-        "  ).text;\n\n"
+        "  summary = deliverAssistantFinal({\n"
+        "    rawText: rewriteUnverifiedClaims(summary, transcript),\n"
+        "    toolResults: [transcript],\n"
+        "    secrets: secretsFromPriorAssistantText([summary, transcript]),\n"
+        "  }).deliveredFinal;\n\n"
         "  const lastSeq = batch[batch.length - 1]!.seq;",
         "compaction transcript evidence",
     )

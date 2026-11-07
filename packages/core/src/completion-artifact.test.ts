@@ -134,6 +134,8 @@ describe("completion artifacts", () => {
     const current = emptyCompletionLedger(INTENT);
     current.artifacts.push({
       class: "delivered-send",
+      action: "send",
+      subject: "+15550100",
       intentId: INTENT.intentId,
       sourceMessageId: "msg-old",
       runId: "run-old",
@@ -242,6 +244,55 @@ describe("completion artifacts", () => {
     });
     ledger.artifacts.push(artifact!);
     expect(sanitizeFinalText("Text sent", blobSent, ledger)).toBe("Text sent");
+  });
+
+  it("verified-read of resource A does not license verified B", () => {
+    const ledger = emptyCompletionLedger(INTENT);
+    const artifact = bindOutcomeArtifact({
+      result: { verified: true, tree: "Reset password successful.", url: "https://admin.example/reset" },
+      toolName: "browser_extract",
+      ...INTENT,
+    });
+    ledger.artifacts.push(artifact!);
+    const evidence = collectToolEvidence([{ verified: true }]);
+    expect(sanitizeFinalText("Reset is verified.", evidence, ledger)).toBe("Reset is verified.");
+    expect(sanitizeFinalText("License is verified.", evidence, ledger)).toBe(
+      "Outcome was not verified.",
+    );
+    expect(sanitizeFinalText("Billing is verified.", evidence, ledger)).toBe(
+      "Outcome was not verified.",
+    );
+  });
+
+  it("send and reset claims require matching action proof on this intent", () => {
+    const sendLedger = emptyCompletionLedger(INTENT);
+    sendLedger.artifacts.push({
+      class: "delivered-send",
+      action: "send",
+      subject: "+15550100",
+      ...INTENT,
+    });
+    const evidence = collectToolEvidence([{ sent: true }]);
+    expect(sanitizeFinalText("Text sent", evidence, sendLedger)).toBe("Text sent");
+    expect(sanitizeFinalText("It is reset.", evidence, sendLedger)).toBe(
+      "Outcome was not verified.",
+    );
+    expect(sanitizeFinalText("sent to +19998887777", evidence, sendLedger)).toBe(
+      "Delivery was not verified.",
+    );
+    const resetLedger = emptyCompletionLedger(INTENT);
+    resetLedger.artifacts.push({
+      class: "task-proof",
+      action: "reset",
+      subject: "https://admin.example/reset",
+      ...INTENT,
+    });
+    expect(sanitizeFinalText("It is reset.", collectToolEvidence([]), resetLedger)).toBe(
+      "It is reset.",
+    );
+    expect(sanitizeFinalText("Text sent", collectToolEvidence([]), resetLedger)).toBe(
+      "Delivery was not verified.",
+    );
   });
 
   it("does not match grader amount or license-phrase literals in production source", () => {

@@ -55,14 +55,19 @@ describe("runtime eval contract", () => {
     expect(delivered.deliveredFinal).toContain("[withheld]");
   });
 
-  it("names the sanctioned call order and adapter entrypoints", () => {
-    expect(RUNTIME_EVAL_CALL_ORDER).toContain("sanitizeFinalText");
-    expect(RUNTIME_EVAL_CALL_ORDER).toContain("stripSecretRequestContext");
+  it("names the production finalization call order and adapter entrypoints", () => {
+    expect(RUNTIME_EVAL_CALL_ORDER).toContain("assistBareDone");
+    expect(RUNTIME_EVAL_CALL_ORDER).toContain("deliverAssistantFinal");
+    expect(RUNTIME_EVAL_CALL_ORDER).toContain("finalizeRun");
+    expect(RUNTIME_EVAL_CALL_ORDER).toContain("compactHistory");
     expect(RUNTIME_EVAL_CALL_ORDER.indexOf("bindOutcomeArtifact")).toBeLessThan(
-      RUNTIME_EVAL_CALL_ORDER.indexOf("sanitizeFinalText"),
+      RUNTIME_EVAL_CALL_ORDER.indexOf("deliverAssistantFinal"),
+    );
+    expect(RUNTIME_EVAL_CALL_ORDER.indexOf("deliverAssistantFinal")).toBeLessThan(
+      RUNTIME_EVAL_CALL_ORDER.indexOf("finalizeRun"),
     );
     expect(ADAPTER_RUNTIME_EVAL_ENTRYPOINTS).toContain("protectPersistedEffectResult");
-    expect(ADAPTER_RUNTIME_EVAL_ENTRYPOINTS).toContain("redactReplayResult");
+    expect(ADAPTER_RUNTIME_EVAL_ENTRYPOINTS).toContain("assistBareDone");
   });
 
   it("documents G2/G4/G5/G7 without claiming freeze or live attestation", () => {
@@ -71,6 +76,7 @@ describe("runtime eval contract", () => {
     expect(EVAL_SCOPE.protectedResultHandoff).toMatch(/not-on-37-bind/);
     expect(EVAL_SCOPE.liveEval).toMatch(/blocked/);
     expect(EVAL_SCOPE.heldout).toBe("sealed");
+    expect(EVAL_SCOPE.historicalPinnedImage).toMatch(/does-not-validate/);
     expect(EVAL_SCOPE.tuningExposed).toEqual(["L1", "M1", "V1"]);
     expect(EVAL_SCOPE.window).toMatch(/synthetic/);
   });

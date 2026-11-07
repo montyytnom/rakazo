@@ -2,6 +2,7 @@ export {
   ADAPTER_RUNTIME_EVAL_ENTRYPOINTS,
   deliverAssistantFinal,
   EVAL_SCOPE,
+  PRODUCTION_FINALIZATION_CALL_GRAPH,
   RUNTIME_EVAL_CALL_ORDER,
   bindOutcomeArtifact,
   collectToolEvidence,

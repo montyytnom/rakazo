@@ -16,21 +16,23 @@ export type HarvestSecretsOptions = {
   skipSystemRole?: boolean;
 };
 
-const PASSWORD_KEY = /^(password|passwd|pwd|temporaryPassword|newPassword|secret|otp)$/i;
-const LABEL_SOURCE =
-  String.raw`(?:temporary\s+password|new\s+password|generated\s+password|old\s+password|current\s+password|password|passwd|pwd|secret|otp|pin)`;
+/** Tool-declared / JSON secret fields. Values are withheld regardless of shape. */
+export const STRUCTURED_SECRET_KEY =
+  /^(password|passwd|pwd|secret|otp|pin|temporaryPassword|newPassword|oldPassword|currentPassword|generatedPassword)$/i;
+
+const PASSWORD_KEY = STRUCTURED_SECRET_KEY;
+const GENERATED_PASSWORD_SOURCE =
+  String.raw`\b(?:temporary password|new password|generated password|old password|current password)\s*[:=]\s*["']{0,2}([^\s"'*<>]+)`;
 /**
- * Labeled harvest needs an explicit delimiter (`:`, `=`, `is`, `was`).
- * Bare whitespace after a trigger ("password through", "secret values") is not a secret.
+ * History fallback only. Bare `password through` is not a secret. `pin:` / `otp:`
+ * in untrusted page text is not metadata and must not harvest.
  */
-const LABELED_VALUE = new RegExp(
-  String.raw`\b${LABEL_SOURCE}(?:\s*\*\*)?(?:\s*[:|=*]+\s*|\s+is\s+|\s+was\s+)\s*["']{0,2}([^\s"'*<>]+)`,
+const HISTORY_LABELED_VALUE = new RegExp(
+  String.raw`\b(?:password|passwd|pwd)(?:\s*\*\*)?(?:\s*[:|=*]+\s*|\s+is\s+|\s+was\s+)\s*["']{0,2}([^\s"'*<>]+)`,
   "gi",
 );
 const JSON_LABELED =
   /"(?:password|passwd|pwd|secret|otp|pin|temporaryPassword|newPassword|oldPassword|currentPassword)"\s*:\s*"([^"]+)"/gi;
-const GENERATED_PASSWORD_SOURCE =
-  String.raw`\b(?:temporary password|new password|generated password|old password|current password)\s*[:=]\s*(\S+)`;
 const STOP_WORDS = new Set(
   [
     "password",
@@ -38,6 +40,7 @@ const STOP_WORDS = new Set(
     "successful",
     "required",
     "field",
+    "fields",
     "complete",
     "completed",
     "true",
@@ -50,6 +53,18 @@ const STOP_WORDS = new Set(
     "result",
     "handle",
     "status",
+    "through",
+    "values",
+    "placeholders",
+    "change",
+    "again",
+    "using",
+    "never",
+    "only",
+    "saved",
+    "generate",
+    "request",
+    "login",
   ].map((word) => word.toLowerCase()),
 );
 
@@ -86,11 +101,28 @@ export function protectedResultNote(handle: ProtectedResultHandle): string {
   return `Protected result ${handle.handle} at ${handle.createdAt}, ${handle.hash}, status ${handle.status} — value withheld.`;
 }
 
+export function isStructuredSecretKey(key: string): boolean {
+  return STRUCTURED_SECRET_KEY.test(key);
+}
+
+export function isWithheldMarker(value: string): boolean {
+  return /^\[(withheld|redacted)/i.test(value.trim());
+}
+
+/** Any nonempty structured-field value is a secret, including hunter / 1234 / item-1. */
+export function isStructuredSecretValue(value: string): boolean {
+  const trimmed = value.trim();
+  return trimmed.length > 0 && !isWithheldMarker(trimmed);
+}
+
+/**
+ * Shape heuristic for GLOBAL replace of labeled-history values only.
+ * Not an authority to mark refs/SKUs as secrets, and not required for
+ * structured fields or SecretStore known values.
+ */
 export function looksLikeSecretValue(value: string): boolean {
   const trimmed = value.trim();
   if (!looksLikeLabeledSecret(trimmed)) return false;
-  // Hyphenated ids (item-1, SKU-A1b2) share mixed case + digits with generated
-  // passwords. Unlabeled withhold requires a special that is not hyphen/underscore.
   if (isStructuredIdentifier(trimmed)) return false;
   const hasLower = /[a-z]/.test(trimmed);
   const hasUpper = /[A-Z]/.test(trimmed);
@@ -99,73 +131,81 @@ export function looksLikeSecretValue(value: string): boolean {
   return hasLower && hasUpper && hasDigit && hasSpecial;
 }
 
-/** Prose harvest: a letter plus a digit or special. Dictionary words are not secrets. */
 export function hasSecretValueShape(value: string): boolean {
   const trimmed = value.trim();
   if (!trimmed) return false;
   const hasLetter = /[A-Za-z]/.test(trimmed);
   const hasDigit = /\d/.test(trimmed);
-  const hasSpecial = /[^A-Za-z0-9]/.test(trimmed);
+  const hasSpecial = /[^A-Za-z0-9_-]/.test(trimmed);
   return hasLetter && (hasDigit || hasSpecial);
 }
 
-/** Run/thread/group/tool ids: lowercase tokens joined by hyphens, optional trailing digits. */
 function isStructuredIdentifier(value: string): boolean {
   return /^(?:[a-z][a-z0-9]*-)+[a-z0-9]+$/.test(value);
 }
 
 export function looksLikeLabeledSecret(value: string): boolean {
   const trimmed = value.trim().replace(/[.,;)}>\]]+$/, "");
-  if (trimmed.length < 6 || trimmed.length > 128) return false;
+  if (trimmed.length < 1 || trimmed.length > 128) return false;
   if (/\s/.test(trimmed)) return false;
   if (/^op-[a-f0-9]{8}$/i.test(trimmed)) return false;
   if (/^sha256:[a-f0-9]{64}$/i.test(trimmed)) return false;
   if (trimmed.startsWith("v2:")) return false;
   if (/^https?:/i.test(trimmed)) return false;
-  // Trailing-`]` trim used to turn `[withheld]` into `[withheld` and reharvest.
   if (/^\[(withheld|redacted)/i.test(trimmed)) return false;
   if (/^(withheld|redacted)\]?$/i.test(trimmed)) return false;
   if (STOP_WORDS.has(trimmed.toLowerCase())) return false;
   return true;
 }
 
+/** Global-replace only unique-looking values, never common words or hyphenated ids. */
+export function shouldGlobalReplaceSecret(value: string): boolean {
+  const trimmed = value.trim().replace(/[.,;)}>\]]+$/, "");
+  if (!looksLikeLabeledSecret(trimmed)) return false;
+  if (trimmed.length < 6) return false;
+  if (isStructuredIdentifier(trimmed)) return false;
+  if (STOP_WORDS.has(trimmed.toLowerCase())) return false;
+  return hasSecretValueShape(trimmed);
+}
+
 export function redactProtectedTree(value: unknown, extras: readonly string[] = []): unknown {
   const banned = new Set(extras.filter(Boolean));
-  return walk(value, banned);
+  return walk(value, banned, undefined);
 }
 
 export function extractGeneratedPasswords(text: string): string[] {
-  return harvestSecretsFromText(text);
+  return harvestLabeledValuesFromText(text);
 }
 
 export function extractGeneratedPassword(text: string): string | undefined {
   return extractGeneratedPasswords(text)[0];
 }
 
-export function harvestSecretsFromText(text: string): string[] {
+function addCandidate(found: string[], raw: string | undefined, globalOnly: boolean): void {
+  if (!raw) return;
+  const candidate = raw.replace(/^["']+|["']+$/g, "").replace(/[.,;)}>\]]+$/, "");
+  if (!looksLikeLabeledSecret(candidate)) return;
+  if (globalOnly && !shouldGlobalReplaceSecret(candidate)) return;
+  if (!found.includes(candidate)) found.push(candidate);
+}
+
+function harvestLabeledValuesFromText(text: string, globalOnly = false): string[] {
   const found: string[] = [];
-  const add = (raw: string | undefined, requireShape: boolean) => {
-    if (!raw) return;
-    const candidate = raw.replace(/[.,;)}>\]]+$/, "");
-    if (!looksLikeLabeledSecret(candidate)) return;
-    if (requireShape && !hasSecretValueShape(candidate)) return;
-    if (!found.includes(candidate)) found.push(candidate);
-  };
-  const labeled = new RegExp(LABELED_VALUE.source, "gi");
-  for (const match of text.matchAll(labeled)) add(match[1], true);
+  const generated = new RegExp(GENERATED_PASSWORD_SOURCE, "gi");
+  for (const match of text.matchAll(generated)) addCandidate(found, match[1], globalOnly);
+  const labeled = new RegExp(HISTORY_LABELED_VALUE.source, "gi");
+  for (const match of text.matchAll(labeled)) addCandidate(found, match[1], globalOnly);
   const markdown = new RegExp(
-    String.raw`\b${LABEL_SOURCE}(?:\s*\*\*)?(?:\s*[:|=*]+\s*|\s+)\s*\x60([^\x60]+)\x60`,
+    String.raw`\b(?:temporary password|new password|generated password|old password|current password|password)(?:\s*\*\*)?(?:\s*[:|=*]+\s*|\s+)\s*\x60([^\x60]+)\x60`,
     "gi",
   );
-  for (const match of text.matchAll(markdown)) add(match[1], true);
+  for (const match of text.matchAll(markdown)) addCandidate(found, match[1], globalOnly);
   const jsonLabeled = new RegExp(JSON_LABELED.source, "gi");
-  for (const match of text.matchAll(jsonLabeled)) add(match[1], false);
-  const generated = new RegExp(GENERATED_PASSWORD_SOURCE, "gi");
-  for (const match of text.matchAll(generated)) add(match[1], true);
+  for (const match of text.matchAll(jsonLabeled)) addCandidate(found, match[1], globalOnly);
   const trimmed = text.trim();
   if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
     try {
-      harvestSecretsFromUnknown(JSON.parse(trimmed), found);
+      harvestSecretsFromUnknown(JSON.parse(trimmed), found, undefined, globalOnly);
     } catch {
       // not JSON
     }
@@ -174,7 +214,7 @@ export function harvestSecretsFromText(text: string): string[] {
     const body = fence[1]?.trim() ?? "";
     if (!body.startsWith("{") && !body.startsWith("[")) continue;
     try {
-      harvestSecretsFromUnknown(JSON.parse(body), found);
+      harvestSecretsFromUnknown(JSON.parse(body), found, undefined, globalOnly);
     } catch {
       // not JSON
     }
@@ -182,19 +222,43 @@ export function harvestSecretsFromText(text: string): string[] {
   return found;
 }
 
+/** Global-replace harvest. Dictionary/numeric/hyphenated structured values are not listed. */
+export function harvestSecretsFromText(text: string): string[] {
+  return harvestLabeledValuesFromText(text, true);
+}
+
+export function redactLabeledSecretSpans(text: string): string {
+  let next = text;
+  const replaceSpan = (pattern: RegExp) => {
+    next = next.replace(new RegExp(pattern.source, "gi"), (full, value: string) => {
+      const candidate = value.replace(/[.,;)}>\]]+$/, "");
+      if (STOP_WORDS.has(candidate.toLowerCase())) return full;
+      if (isWithheldMarker(candidate)) return full;
+      if (candidate.length < 4 && !/\d/.test(candidate)) return full;
+      if (!looksLikeLabeledSecret(candidate) && !isStructuredSecretValue(candidate)) return full;
+      return full.replace(value, "[withheld]");
+    });
+  };
+  replaceSpan(new RegExp(GENERATED_PASSWORD_SOURCE, "gi"));
+  replaceSpan(new RegExp(HISTORY_LABELED_VALUE.source, "gi"));
+  replaceSpan(JSON_LABELED);
+  return next;
+}
+
 export function harvestSecretsFromUnknown(
   value: unknown,
   into: string[] = [],
   options?: HarvestSecretsOptions,
+  globalOnly = true,
 ): string[] {
   if (typeof value === "string") {
-    for (const secret of harvestSecretsFromText(value)) {
+    for (const secret of harvestLabeledValuesFromText(value, globalOnly)) {
       if (!into.includes(secret)) into.push(secret);
     }
     return into;
   }
   if (Array.isArray(value)) {
-    for (const item of value) harvestSecretsFromUnknown(item, into, options);
+    for (const item of value) harvestSecretsFromUnknown(item, into, options, globalOnly);
     return into;
   }
   if (value && typeof value === "object") {
@@ -202,17 +266,18 @@ export function harvestSecretsFromUnknown(
     if (options?.skipSystemRole && record.role === "system") return into;
     for (const [key, item] of Object.entries(record)) {
       if (options?.skipKeys?.has(key)) continue;
-      if (PASSWORD_KEY.test(key) && typeof item === "string") {
-        if (looksLikeLabeledSecret(item) && !into.includes(item)) into.push(item);
+      if (isStructuredSecretKey(key) && typeof item === "string") {
+        if (isStructuredSecretValue(item) && shouldGlobalReplaceSecret(item) && !into.includes(item)) {
+          into.push(item);
+        }
         continue;
       }
-      harvestSecretsFromUnknown(item, into, options);
+      harvestSecretsFromUnknown(item, into, options, globalOnly);
     }
   }
   return into;
 }
 
-/** Harvest only from transcript/tool results, never from system, tool defs, or turn context. */
 export function harvestSecretsFromRequestContext(value: unknown, into: string[] = []): string[] {
   return harvestSecretsFromUnknown(value, into, {
     skipKeys: REQUEST_HARVEST_SKIP_KEYS,
@@ -220,6 +285,10 @@ export function harvestSecretsFromRequestContext(value: unknown, into: string[] 
   });
 }
 
+/**
+ * Global replace of caller-supplied known secrets (SecretStore / runSecrets).
+ * Dictionary known values ARE replaced because they arrived as structured provenance.
+ */
 export function stripSecretEchoes(
   text: string,
   secrets: readonly string[],
@@ -234,36 +303,25 @@ export function stripSecretEchoes(
   return { text: next, echoed };
 }
 
-/** Deep copy used to withhold harvested secrets from model-bound transcripts. */
 export function stripSecretsFromUnknown(value: unknown, secrets: readonly string[]): unknown {
-  if (typeof value === "string") return stripSecretEchoes(value, secrets).text;
-  if (Array.isArray(value)) return value.map((item) => stripSecretsFromUnknown(item, secrets));
-  if (value && typeof value === "object") {
-    if (value instanceof Date) return value;
-    return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>).map(([key, item]) => [
-        key,
-        stripSecretsFromUnknown(item, secrets),
-      ]),
-    );
-  }
-  return value;
+  return walk(value, new Set(secrets.filter(Boolean)), undefined, "echo-and-label");
 }
 
-/**
- * Production request strip. Identity (same reference) when no structured secrets
- * were harvested. Callers must not harvest system/tools/turn_context.
- */
 export function stripSecretRequestContext<T>(ctx: T): T {
   const secrets = harvestSecretsFromRequestContext(ctx);
-  if (secrets.length === 0) return ctx;
-  return stripSecretsFromUnknown(ctx, secrets) as T;
+  const redacted = walk(ctx, new Set(secrets), {
+    skipKeys: REQUEST_HARVEST_SKIP_KEYS,
+    skipSystemRole: true,
+  }, "request");
+  if (redacted === ctx) return ctx;
+  return redacted as T;
 }
 
 export function stripSecretTranscriptMessages<T>(messages: T[]): T[] {
   const secrets = harvestSecretsFromUnknown(messages, [], { skipSystemRole: true });
-  if (secrets.length === 0) return messages;
-  return stripSecretsFromUnknown(messages, secrets) as T[];
+  const redacted = walk(messages, new Set(secrets), { skipSystemRole: true }, "echo-and-label");
+  if (redacted === messages) return messages;
+  return redacted as T[];
 }
 
 export function secretsFromPriorAssistantText(texts: readonly string[]): string[] {
@@ -281,25 +339,67 @@ export function redactThrown(error: unknown, secrets: readonly string[]): Error 
   return next;
 }
 
-function walk(value: unknown, banned: Set<string>): unknown {
+type WalkMode = "echo-only" | "echo-and-label" | "request";
+
+function walk(
+  value: unknown,
+  banned: Set<string>,
+  options: HarvestSecretsOptions | undefined,
+  mode: WalkMode = "echo-and-label",
+): unknown {
   if (typeof value === "string") {
-    if (banned.has(value) || looksLikeSecretValue(value)) return "[withheld]";
+    if (banned.has(value)) return "[withheld]";
     let next = value;
     for (const secret of banned) {
       if (secret && next.includes(secret)) next = next.split(secret).join("[withheld]");
     }
-    for (const generated of harvestSecretsFromText(next)) {
-      next = next.split(generated).join("[withheld]");
+    if (mode !== "echo-only") {
+      next = redactLabeledSecretSpans(next);
+      for (const generated of harvestSecretsFromText(next)) {
+        next = next.split(generated).join("[withheld]");
+      }
     }
     return next;
   }
-  if (Array.isArray(value)) return value.map((item) => walk(item, banned));
-  if (value && typeof value === "object") {
-    const entries = Object.entries(value as Record<string, unknown>).map(([key, item]) => {
-      if (PASSWORD_KEY.test(key) && typeof item === "string") return [key, "[withheld]"];
-      return [key, walk(item, banned)];
+  if (Array.isArray(value)) {
+    let changed = false;
+    const items = value.map((item) => {
+      const next = walk(item, banned, options, mode);
+      if (next !== item) changed = true;
+      return next;
     });
-    return Object.fromEntries(entries);
+    return changed ? items : value;
+  }
+  if (value && typeof value === "object") {
+    if (value instanceof Date) return value;
+    const record = value as Record<string, unknown>;
+    if (options?.skipSystemRole && record.role === "system") {
+      return walkObject(record, banned, options, "echo-only");
+    }
+    return walkObject(record, banned, options, mode);
   }
   return value;
+}
+
+function walkObject(
+  record: Record<string, unknown>,
+  banned: Set<string>,
+  options: HarvestSecretsOptions | undefined,
+  mode: WalkMode,
+): unknown {
+  let changed = false;
+  const entries = Object.entries(record).map(([key, item]) => {
+    if (isStructuredSecretKey(key) && typeof item === "string" && isStructuredSecretValue(item)) {
+      changed = true;
+      return [key, "[withheld]"];
+    }
+    const childMode =
+      options?.skipKeys?.has(key) || (mode === "request" && REQUEST_HARVEST_SKIP_KEYS.has(key))
+        ? "echo-only"
+        : mode;
+    const next = walk(item, banned, options, childMode);
+    if (next !== item) changed = true;
+    return [key, next];
+  });
+  return changed ? Object.fromEntries(entries) : record;
 }

@@ -7,6 +7,7 @@ import {
 } from "./completion-artifact.js";
 import { resolveTurnIntent } from "./irreversible-effect.js";
 import {
+  redactLabeledSecretSpans,
   redactProtectedTree,
   stripSecretEchoes,
   stripSecretRequestContext,
@@ -14,31 +15,85 @@ import {
 } from "./secret-result-handle.js";
 
 /**
- * Sanctioned node post-process order for runtime-in-loop eval.
- * Record `rawFinal` before this pipeline; `deliveredFinal` is what the user sees.
+ * Production overlay finalization, in call order. Each step names the overlay
+ * function that actually runs — not a parallel helper.
  *
- * Adapter-owned steps (not imported here to keep core free of adapter deps):
- * `protectPersistedEffectResult`, `redactReplayResult`, `recoverStaleBrowserAct`.
- * Import those from `@rakazo/adapters` via `runtime-eval-backend.ts`.
+ * Eval must record `rawFinal` at assistBareDone / model `done` (before
+ * sanitize). `deliveredFinal` is finalizeRun blocks + notification body.
  */
-export const RUNTIME_EVAL_CALL_ORDER = [
-  "resolveTurnIntent",
-  "protectPersistedEffectResult",
-  "redactProtectedTree",
-  "redactReplayResult",
-  "recoverStaleBrowserAct",
-  "bindOutcomeArtifact",
-  "collectToolEvidence",
-  "sanitizeFinalText",
-  "stripSecretEchoes",
-  "stripSecretTranscriptMessages",
-  "stripSecretRequestContext",
+export const PRODUCTION_FINALIZATION_CALL_GRAPH = [
+  {
+    id: "resolveTurnIntent",
+    site: "packages/adapters/src/executor.ts continueRun",
+    records: "intentId+sourceMessageId+authorized",
+  },
+  {
+    id: "recoverStaleBrowserAct",
+    site: "packages/adapters/src/browser-tools.ts browserAct",
+    records: "model-visible remap note",
+  },
+  {
+    id: "protectPersistedEffectResult",
+    site: "executor finish() after overlay patch",
+    records: "model tool result + stored vault ref",
+  },
+  {
+    id: "redactReplayResult",
+    site: "executor duplicate-effect replay",
+    records: "model-visible replay body",
+  },
+  {
+    id: "bindOutcomeArtifact",
+    site: "executor finish() and replay",
+    records: "turnLedger identity/subject/action",
+  },
+  {
+    id: "assistBareDone",
+    site: "packages/adapters/src/pi-runtime.ts overlay local patch",
+    records: "follow-up user turn; not a delivered final",
+  },
+  {
+    id: "gluedConcat",
+    site: "sanitizeFinalText stripGluedSuccessPrefix",
+    records: "Done glued onto the next assembled final",
+  },
+  {
+    id: "deliverAssistantFinal",
+    site: "executor completionBlocks map + notification body",
+    records: "rawFinal vs deliveredFinal",
+  },
+  {
+    id: "finalizeRun",
+    site: "deps.events.finalizeRun",
+    records: "persisted blocks",
+  },
+  {
+    id: "completionNotification",
+    site: "executor completionNotificationPreview",
+    records: "notify body from delivered text",
+  },
+  {
+    id: "compactHistory",
+    site: "packages/adapters/src/history-compaction.ts",
+    records: "summary after deliverAssistantFinal",
+  },
+  {
+    id: "protected_result_handoff",
+    site: "executor tool name protected_result_handoff",
+    records: "only if the bind offered the schema; 37-scratch does not",
+  },
 ] as const;
+
+export const RUNTIME_EVAL_CALL_ORDER = PRODUCTION_FINALIZATION_CALL_GRAPH.map(
+  (step) => step.id,
+);
 
 export const ADAPTER_RUNTIME_EVAL_ENTRYPOINTS = [
   "protectPersistedEffectResult",
   "redactReplayResult",
   "recoverStaleBrowserAct",
+  "assistBareDone",
+  "handoffProtectedResult",
 ] as const;
 
 export type DeliveredAssistantFinal = {
@@ -47,6 +102,10 @@ export type DeliveredAssistantFinal = {
   evidence: ToolEvidence;
 };
 
+/**
+ * Exact text transform used by overlay finalizeRun blocks and compaction.
+ * Nudge/persist/notification/handoff wrap this; they are not a second sanitizer.
+ */
 export function deliverAssistantFinal(input: {
   rawText: string;
   toolResults: readonly unknown[];
@@ -55,6 +114,7 @@ export function deliverAssistantFinal(input: {
 }): DeliveredAssistantFinal {
   const evidence = collectToolEvidence(input.toolResults);
   let deliveredFinal = sanitizeFinalText(input.rawText, evidence, input.ledger);
+  deliveredFinal = redactLabeledSecretSpans(deliveredFinal);
   if (input.secrets?.length) {
     deliveredFinal = stripSecretEchoes(deliveredFinal, input.secrets).text;
   }
@@ -63,43 +123,20 @@ export function deliverAssistantFinal(input: {
 }
 
 export const EVAL_SCOPE = {
-  /**
-   * G2: the 37-tool scratch capture is not the run13 fleet (52+ builtins +
-   * connectors, computer attached). Matched-config capture and a volatile-field
-   * manifest are required before freeze. No recapture in this slice. Private
-   * request bodies stay off cloud.
-   */
   matchedConfigCapture: "not-this-slice",
   toolBind: "37-scratch-not-run13-fleet",
-  /**
-   * G4 model-visible tool-result shapes the sim must emit from shipped code:
-   * protected note + protectedResult, [withheld], UNAUTHORIZED_IRREVERSIBLE +
-   * uncertain:true, redactReplayResult, DESKTOP_LAUNCH_UNSUPPORTED,
-   * recoverStaleBrowserAct remaps.
-   *
-   * N1: Continue after a completed irr:v1 row reuses that key; no second execute.
-   * N2: a new authorized sourceMessageId mints a new irr:v1 and is not suppressed.
-   * Unauthorized nudge: UNAUTHORIZED_IRREVERSIBLE + uncertain:true.
-   */
+  historicalPinnedImage: "12/12-does-not-validate-this-runtime",
   n1: "continue-reuses-completed-irr-v1",
   n2: "new-sourceMessageId-new-irr-v1",
   unauthorizedNudge: "UNAUTHORIZED_IRREVERSIBLE+uncertain",
-  /**
-   * G5: HEAD builtin-tools offers protected_result_handoff. The 37-tool scratch
-   * capture does not mount it. Do not auto-add unoffered tools. "delivered" on
-   * that capture is scripted-only; drop the model-reachable delivered claim
-   * until a matched bind recapture offers the schema.
-   */
   protectedResultHandoff: "offered-on-HEAD-not-on-37-bind-capture",
-  /**
-   * G7: capture window 131072 / maxTokens 32768 is synthetic. Live eval needs
-   * a live contextWindow/maxTokens attestation (hash, not printed) first.
-   * L1/M1/V1 are tuning-exposed. Held-out 12 stays sealed. No assumed approval.
-   */
   window: "synthetic-131072-32768-not-live-attested",
-  liveEval: "blocked-until-live-window-attestation",
+  liveEval: "blocked-until-offline-contract-and-live-window-attestation",
   tuningExposed: ["L1", "M1", "V1"],
   heldout: "sealed",
+  g1Provenance:
+    "structured-field+SecretStore known values withhold regardless of shape; unlabeled SKU/pin English is not a secret; labeled history does not mine system/tools/context; common words are not globally replaced",
+  g6Proof: "identity+subject+action; verified-read A does not license verified B",
 } as const;
 
 export {

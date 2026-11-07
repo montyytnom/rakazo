@@ -88,9 +88,9 @@ describe("protected result handles", () => {
       });
     }
     expect(looksLikeSecretValue(FIXTURE_NEW)).toBe(true);
-    expect(redactProtectedTree({ item: FIXTURE_NEW })).toEqual({ item: "[withheld]" });
+    expect(redactProtectedTree({ item: FIXTURE_NEW })).toEqual({ item: FIXTURE_NEW });
     expect(redactProtectedTree({ password: "item-1" })).toEqual({ password: "[withheld]" });
-    expect(harvestSecretsFromUnknown({ password: "item-1" })).toContain("item-1");
+    expect(harvestSecretsFromUnknown({ password: "item-1" })).toEqual([]);
     for (const sku of ["REF-A1b2", "SkuA12B"]) {
       expect(looksLikeSecretValue(sku), sku).toBe(false);
       expect(redactProtectedTree({ item: sku })).toEqual({ item: sku });
@@ -190,6 +190,48 @@ describe("protected result handles", () => {
     const twice = stripSecretRequestContext(stripped);
     expect(JSON.stringify(twice)).toBe(JSON.stringify(stripped));
     expect(JSON.stringify(twice)).not.toMatch(/withheld\]\]/);
+  });
+
+  it("structured fields and known values withhold regardless of shape", () => {
+    for (const value of ["hunter", "aaaaaa", "123456", "item-1"]) {
+      expect(redactProtectedTree({ password: value })).toEqual({ password: "[withheld]" });
+      expect(redactProtectedTree({ otp: value })).toEqual({ otp: "[withheld]" });
+      expect(redactProtectedTree({ pin: value })).toEqual({ pin: "[withheld]" });
+    }
+    expect(harvestSecretsFromUnknown({ password: "hunter" })).toEqual([]);
+    expect(harvestSecretsFromUnknown({ otp: "123456" })).toEqual([]);
+    const known = stripSecretEchoes("signed in as hunter on the page", ["hunter"]);
+    expect(known.text).toContain("[withheld]");
+    expect(known.text).not.toContain("hunter");
+  });
+
+  it("untrusted page/result/args without secret metadata keep SKU, pin English, and mixed refs", () => {
+    const page = {
+      tree: "Enter pin 123456. SKU REF-A1b2. Confirmation SkuA12B.",
+      header: "pin English help",
+    };
+    expect(redactProtectedTree(page)).toEqual(page);
+    expect(harvestSecretsFromText("pin: 123456")).toEqual([]);
+    expect(harvestSecretsFromText("otp is 999999")).toEqual([]);
+    const args = { title: "REF-A1b2", quantity: 12, note: "pin reminder" };
+    expect(harvestSecretsFromUnknown(args)).toEqual([]);
+    expect(redactProtectedTree(args)).toEqual(args);
+    const result = { ok: true, json: { sku: "REF-A1b2", pinLabel: "pin" } };
+    expect(JSON.stringify(redactProtectedTree(result))).toContain("REF-A1b2");
+    expect(JSON.stringify(redactProtectedTree(result))).toContain("pin");
+  });
+
+  it("labeled history redacts dictionary generated passwords in-place without global-replacing common words", () => {
+    const page = redactProtectedTree({
+      tree: "New password: hunter. Later through values stay.",
+    });
+    expect(JSON.stringify(page)).toContain("[withheld]");
+    expect(JSON.stringify(page)).not.toContain("New password: hunter");
+    expect(JSON.stringify(page)).toContain("through values stay");
+    expect(harvestSecretsFromText("New password: hunter")).toEqual([]);
+    const echoed = stripSecretEchoes("through the saved-login", harvestSecretsFromText("password is through"));
+    expect(echoed.echoed).toBe(false);
+    expect(echoed.text).toBe("through the saved-login");
   });
 
   it("transcript strip is identity when no secrets and skips system-role harvest", () => {

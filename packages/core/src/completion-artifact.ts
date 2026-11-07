@@ -1,4 +1,7 @@
-import { classifyIrreversibleTool } from "./irreversible-effect.js";
+import {
+  classifyIrreversibleTool,
+  type IrreversibleClassification,
+} from "./irreversible-effect.js";
 
 const CLAIM_SPLIT = /(?:\. (?=[A-Z])|[;!?\n]| — | – |, but | but )/g;
 /**
@@ -14,6 +17,7 @@ const SEND_DENY = /\b(not (yet )?sent|hasn.t been sent|not delivered)\b/i;
  * Bound to a current-intent ledger the same way as Done/All set.
  */
 const COMPLETED_ACTION = /\b(reassigned|posted|paid)\b/i;
+const RESET_CLAIM = /\b(it is reset|reset (?:is |was )?done)\b/i;
 const SUCCESS_CLAIM =
   /\b(done|complete|completed|finished|success(?:ful(?:ly)?)?|all set|successfully changed|it is reset|reset (?:is |was )?done)\b/i;
 /** Fallback Done concatenated onto the next assistant turn has no separator or word boundary. */
@@ -30,13 +34,15 @@ export type ToolEvidence = {
 };
 
 export type OutcomeArtifactClass = "verified-read" | "delivered-send" | "task-proof";
+export type OutcomeAction = "read" | "send" | "reset" | "change";
 
 export type OutcomeArtifact = {
   class: OutcomeArtifactClass;
+  action: OutcomeAction;
   intentId: string;
   sourceMessageId: string;
   runId: string;
-  subject?: string;
+  subject: string;
 };
 
 export type CompletionLedger = {
@@ -70,9 +76,7 @@ export function ledgerAllowsSuccess(ledger: CompletionLedger | undefined): boole
   if (!ledger?.intentId || !ledger.sourceMessageId || !ledger.runId) return false;
   return ledger.artifacts.some(
     (artifact) =>
-      artifact.intentId === ledger.intentId &&
-      artifact.sourceMessageId === ledger.sourceMessageId &&
-      artifact.runId === ledger.runId &&
+      sameIdentity(artifact, ledger) &&
       (artifact.class === "verified-read" ||
         artifact.class === "delivered-send" ||
         artifact.class === "task-proof"),
@@ -90,11 +94,18 @@ export function ledgerHasClass(
 ): boolean {
   if (!ledger?.intentId || !ledger.sourceMessageId || !ledger.runId) return false;
   return ledger.artifacts.some(
-    (artifact) =>
-      artifact.class === className &&
-      artifact.intentId === ledger.intentId &&
-      artifact.sourceMessageId === ledger.sourceMessageId &&
-      artifact.runId === ledger.runId,
+    (artifact) => artifact.class === className && sameIdentity(artifact, ledger),
+  );
+}
+
+function sameIdentity(
+  artifact: OutcomeArtifact,
+  ledger: CompletionLedger,
+): boolean {
+  return (
+    artifact.intentId === ledger.intentId &&
+    artifact.sourceMessageId === ledger.sourceMessageId &&
+    artifact.runId === ledger.runId
   );
 }
 
@@ -114,16 +125,23 @@ export function ledgerHasBoundClass(
   const hint = claimSubject?.trim();
   if (!hint) return true;
   return ledger!.artifacts.some((artifact) => {
-    if (
-      artifact.class !== className ||
-      artifact.intentId !== ledger!.intentId ||
-      artifact.sourceMessageId !== ledger!.sourceMessageId ||
-      artifact.runId !== ledger!.runId
-    ) {
-      return false;
-    }
+    if (artifact.class !== className || !sameIdentity(artifact, ledger!)) return false;
     if (!artifact.subject) return false;
     return subjectsOverlap(artifact.subject, hint);
+  });
+}
+
+export function ledgerHasBoundAction(
+  ledger: CompletionLedger | undefined,
+  action: OutcomeAction,
+  claimSubject?: string,
+): boolean {
+  if (!ledger?.intentId || !ledger.sourceMessageId || !ledger.runId) return false;
+  const hint = claimSubject?.trim();
+  return ledger.artifacts.some((artifact) => {
+    if (artifact.action !== action || !sameIdentity(artifact, ledger)) return false;
+    if (!hint) return true;
+    return Boolean(artifact.subject) && subjectsOverlap(artifact.subject, hint);
   });
 }
 
@@ -139,27 +157,44 @@ export function bindOutcomeArtifact(input: {
   intentId: string;
   sourceMessageId: string;
   runId: string;
+  classification?: IrreversibleClassification | null;
 }): OutcomeArtifact | null {
   const { result, toolName, intentId, sourceMessageId, runId } = input;
   if (!intentId || !sourceMessageId || !runId) return null;
   if (!result || typeof result !== "object" || Array.isArray(result)) return null;
   const record = result as Record<string, unknown>;
   const args = input.args ?? {};
-  const irreversible = classifyIrreversibleTool(toolName, args);
+  const irreversible = input.classification ?? classifyIrreversibleTool(toolName, args);
   if (record.outcomeProof === true) {
     if (record.intentId !== intentId || record.sourceMessageId !== sourceMessageId) return null;
     if (typeof record.runId === "string" && record.runId !== runId) return null;
+    const subject =
+      (typeof record.subject === "string" && record.subject.trim()) ||
+      irreversible?.subject ||
+      toolName;
     return {
       class: "task-proof",
+      action: irreversible?.class === "password-reset" ? "reset" : "change",
       intentId,
       sourceMessageId,
       runId,
-      subject: typeof record.subject === "string" ? record.subject : undefined,
+      subject,
     };
   }
   if (record.sent === true && irreversible?.class === "send") {
     return {
       class: "delivered-send",
+      action: "send",
+      intentId,
+      sourceMessageId,
+      runId,
+      subject: irreversible.subject,
+    };
+  }
+  if (irreversible?.class === "password-reset" && record.ok === true && !isInsufficientRead(record)) {
+    return {
+      class: "task-proof",
+      action: "reset",
       intentId,
       sourceMessageId,
       runId,
@@ -167,12 +202,15 @@ export function bindOutcomeArtifact(input: {
     };
   }
   if (record.verified === true && !isInsufficientRead(record)) {
+    const subject = pageSubject(record) || pageBlob(record).trim();
+    if (!subject || subject.replace(/\s+/g, "").length < 4) return null;
     return {
       class: "verified-read",
+      action: "read",
       intentId,
       sourceMessageId,
       runId,
-      subject: pageSubject(record),
+      subject,
     };
   }
   return null;
@@ -251,28 +289,69 @@ export function unsupportedClaims(
       break;
     }
   }
-  if (
-    positiveClaims(finalText, VERIFIED_CLAIM).length > 0 &&
-    !ledgerHasClass(ledger, "verified-read") &&
-    !ledgerHasClass(ledger, "task-proof")
-  ) {
-    violations.push("verified");
+  const verifiedClaims = positiveClaims(finalText, VERIFIED_CLAIM);
+  if (verifiedClaims.length > 0) {
+    const licensed = verifiedClaims.every((claim) => {
+      const subject = claimResourceSubject(claim);
+      if (ledgerHasClass(ledger, "task-proof") && !subject) return true;
+      if (!subject) return false;
+      return (
+        ledgerHasBoundClass(ledger, "verified-read", subject) ||
+        ledgerHasBoundAction(ledger, "reset", subject) ||
+        ledgerHasBoundAction(ledger, "change", subject)
+      );
+    });
+    if (!licensed) violations.push("verified");
   }
-  const sendYes = positiveClaims(finalText, SEND_CLAIM).length > 0;
+  const sendYes = positiveClaims(finalText, SEND_CLAIM);
   const sendNo = SEND_DENY.test(finalText);
-  if (sendYes && sendNo) violations.push("send-contradiction");
-  if (sendYes && evidence.sent === false) violations.push("send-contradiction");
-  if (sendYes && !ledgerHasClass(ledger, "delivered-send") && evidence.sent !== false) {
-    violations.push("send-without-artifact");
+  if (sendYes.length > 0 && sendNo) violations.push("send-contradiction");
+  if (sendYes.length > 0 && evidence.sent === false) violations.push("send-contradiction");
+  if (sendYes.length > 0 && evidence.sent !== false) {
+    const sendLicensed = sendYes.every((claim) => {
+      const subject = sendClaimSubject(claim);
+      return ledgerHasBoundAction(ledger, "send", subject);
+    });
+    if (!sendLicensed) violations.push("send-without-artifact");
   }
-  const successLike =
-    positiveClaims(finalText, SUCCESS_CLAIM).length > 0 ||
-    positiveClaims(finalText, COMPLETED_ACTION).length > 0 ||
-    hasGluedUnsupportedCompletion(finalText);
-  if (!ledgerAllowsGenericSuccess(ledger) && successLike) {
+  const resetClaims = positiveClaims(finalText, RESET_CLAIM);
+  const completedClaims = positiveClaims(finalText, COMPLETED_ACTION);
+  const genericSuccess =
+    positiveClaims(finalText, SUCCESS_CLAIM).length > 0 || hasGluedUnsupportedCompletion(finalText);
+  if (resetClaims.length > 0 && !ledgerHasBoundAction(ledger, "reset")) {
+    violations.push("success-without-artifact");
+  } else if (
+    completedClaims.length > 0 &&
+    !ledgerHasClass(ledger, "task-proof") &&
+    !ledgerHasBoundAction(ledger, "change")
+  ) {
+    violations.push("success-without-artifact");
+  } else if (genericSuccess && !ledgerAllowsGenericSuccess(ledger)) {
     violations.push("success-without-artifact");
   }
   return [...new Set(violations)];
+}
+
+function claimResourceSubject(claim: string): string | undefined {
+  const match = claim.match(/(.{0,48}?)\b(verified|confirmed)\b/i);
+  const before = match?.[1]?.trim() ?? "";
+  const tokens = before
+    .split(/[\s:/?#]+/)
+    .map((token) => token.replace(/[^A-Za-z0-9-]/g, ""))
+    .filter(
+      (token) =>
+        token.length >= 4 &&
+        !/^(this|that|been|have|from|with|page|result|outcome|status|been)$/i.test(token),
+    );
+  return tokens.at(-1);
+}
+
+function sendClaimSubject(claim: string): string | undefined {
+  const phone = claim.match(/\+?\d{7,}/);
+  if (phone?.[0]) return phone[0];
+  const email = claim.match(EMAIL)?.[0];
+  if (email) return email;
+  return undefined;
 }
 
 function claimedIdentitySubject(claim: string): string | undefined {
